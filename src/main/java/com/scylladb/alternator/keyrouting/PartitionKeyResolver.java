@@ -6,6 +6,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
@@ -81,6 +82,7 @@ public class PartitionKeyResolver implements AutoCloseable {
   private final Set<String> discoveryInProgress;
   private final ConcurrentHashMap<String, FailureRecord> failedTables;
   private final ExecutorService discoveryExecutor;
+  private final KeyRouteAffinityMetricsListener metricsListener;
 
   /** Records information about a failed discovery attempt. */
   private static class FailureRecord {
@@ -107,12 +109,25 @@ public class PartitionKeyResolver implements AutoCloseable {
    * @param preConfigured map of table name to partition key attribute name
    */
   public PartitionKeyResolver(Map<String, String> preConfigured) {
+    this(preConfigured, null);
+  }
+
+  /**
+   * Creates a new resolver with pre-configured partition key info and an optional metrics listener.
+   *
+   * @param preConfigured map of table name to partition key attribute name
+   * @param metricsListener the optional metrics listener
+   * @since 2.0.5
+   */
+  public PartitionKeyResolver(
+      Map<String, String> preConfigured, KeyRouteAffinityMetricsListener metricsListener) {
     this.cache = new ConcurrentHashMap<>();
     if (preConfigured != null) {
       this.cache.putAll(preConfigured);
     }
     this.discoveryInProgress = ConcurrentHashMap.newKeySet();
     this.failedTables = new ConcurrentHashMap<>();
+    this.metricsListener = metricsListener;
     this.discoveryExecutor =
         Executors.newSingleThreadExecutor(
             r -> {
@@ -120,6 +135,8 @@ public class PartitionKeyResolver implements AutoCloseable {
               t.setDaemon(true);
               return t;
             });
+    notifyCacheSizeChanged();
+    notifyFailureCooldownSizeChanged();
   }
 
   /**
@@ -129,7 +146,13 @@ public class PartitionKeyResolver implements AutoCloseable {
    * @return the partition key attribute name, or null if not yet known
    */
   public String getPartitionKeyName(String tableName) {
-    return cache.get(tableName);
+    String partitionKeyName = cache.get(tableName);
+    if (partitionKeyName != null) {
+      notifyListener(listener -> listener.onPartitionKeyCacheHit(tableName), "cache hit");
+    } else {
+      notifyListener(listener -> listener.onPartitionKeyCacheMiss(tableName), "cache miss");
+    }
+    return partitionKeyName;
   }
 
   /**
@@ -146,31 +169,50 @@ public class PartitionKeyResolver implements AutoCloseable {
    * @param client the DynamoDB client to use for DescribeTable
    */
   public void triggerDiscovery(String tableName, DynamoDbClient client) {
+    triggerDiscoveryIfNeeded(tableName, client);
+  }
+
+  /**
+   * Triggers async discovery of partition key for a table and reports whether a new attempt was
+   * submitted.
+   *
+   * @param tableName the table name
+   * @param client the DynamoDB client to use for DescribeTable
+   * @return {@code true} if a new discovery task was submitted, {@code false} otherwise
+   * @since 2.0.5
+   */
+  public boolean triggerDiscoveryIfNeeded(String tableName, DynamoDbClient client) {
     if (cache.containsKey(tableName)) {
-      return; // Already cached
+      return false; // Already cached
     }
 
     // Check if this table previously failed and is still in cooldown
     FailureRecord failureRecord = failedTables.get(tableName);
     if (failureRecord != null && !failureRecord.canRetry()) {
-      return; // Still in cooldown period after permanent failure
+      return false; // Still in cooldown period after permanent failure
     }
 
     if (!discoveryInProgress.add(tableName)) {
-      return; // Discovery already in progress
+      return false; // Discovery already in progress
     }
     // Double-check after acquiring the discovery lock to avoid race condition
     // where another thread may have populated the cache between our first check
     // and acquiring the lock
     if (cache.containsKey(tableName)) {
       discoveryInProgress.remove(tableName);
-      return; // Another thread cached it while we were waiting
+      return false; // Another thread cached it while we were waiting
     }
 
     // Clear any previous failure record since we're retrying
-    failedTables.remove(tableName);
+    if (failedTables.remove(tableName) != null) {
+      notifyFailureCooldownSizeChanged();
+    }
+
+    notifyListener(
+        listener -> listener.onPartitionKeyDiscoveryTriggered(tableName), "discovery triggered");
 
     discoveryExecutor.submit(() -> discoverWithRetry(tableName, client));
+    return true;
   }
 
   /**
@@ -193,48 +235,60 @@ public class PartitionKeyResolver implements AutoCloseable {
             if (element.keyType() == KeyType.HASH) {
               String pkName = element.attributeName();
               cache.put(tableName, pkName);
+              notifyListener(
+                  listener -> listener.onPartitionKeyDiscoverySucceeded(tableName, pkName),
+                  "discovery succeeded");
+              notifyCacheSizeChanged();
               logger.log(
-                  Level.FINE,
-                  "Discovered partition key for table {0}: {1}",
+                  Level.INFO,
+                  "PK discovery completed: table={0}, pk_attribute={1}",
                   new Object[] {tableName, pkName});
               return; // Success
             }
           }
           // No HASH key found - this shouldn't happen for valid tables
+          recordFailure(tableName, PartitionKeyDiscoveryFailureReason.NO_HASH_KEY);
           logger.log(
-              Level.WARNING, "Table {0} has no HASH key in schema", new Object[] {tableName});
-          failedTables.put(tableName, new FailureRecord(true));
+              Level.INFO,
+              "PK discovery failed: table={0}, reason={1}",
+              new Object[] {
+                tableName, PartitionKeyDiscoveryFailureReason.NO_HASH_KEY.metricValue()
+              });
           return;
 
         } catch (ResourceNotFoundException e) {
           // Table doesn't exist - permanent failure, don't retry
+          recordFailure(tableName, PartitionKeyDiscoveryFailureReason.RESOURCE_NOT_FOUND);
           logger.log(
-              Level.FINE,
-              "Table {0} not found during partition key discovery: {1}",
-              new Object[] {tableName, e.getMessage()});
-          failedTables.put(tableName, new FailureRecord(true));
+              Level.INFO,
+              "PK discovery failed: table={0}, reason={1}",
+              new Object[] {
+                tableName, PartitionKeyDiscoveryFailureReason.RESOURCE_NOT_FOUND.metricValue()
+              });
           return;
 
         } catch (DynamoDbException e) {
           if (isPermanentFailure(e)) {
             // Access denied or other permanent error - don't retry
+            PartitionKeyDiscoveryFailureReason reason = mapPermanentFailureReason(e);
+            recordFailure(tableName, reason);
             logger.log(
-                Level.WARNING,
-                "Access denied when discovering partition key for table {0}. "
-                    + "Ensure the client has DescribeTable permission: {1}",
-                new Object[] {tableName, e.getMessage()});
-            failedTables.put(tableName, new FailureRecord(true));
+                Level.INFO,
+                "PK discovery failed: table={0}, reason={1}",
+                new Object[] {tableName, reason.metricValue()});
             return;
           }
 
           // Transient error - retry with backoff
           attempt++;
           if (attempt > MAX_RETRIES) {
+            recordFailure(tableName, PartitionKeyDiscoveryFailureReason.TRANSIENT_FAILURE);
             logger.log(
-                Level.WARNING,
-                "Failed to discover partition key for table {0} after {1} attempts: {2}",
-                new Object[] {tableName, MAX_RETRIES + 1, e.getMessage()});
-            failedTables.put(tableName, new FailureRecord(false));
+                Level.INFO,
+                "PK discovery failed: table={0}, reason={1}",
+                new Object[] {
+                  tableName, PartitionKeyDiscoveryFailureReason.TRANSIENT_FAILURE.metricValue()
+                });
             return;
           }
 
@@ -251,15 +305,13 @@ public class PartitionKeyResolver implements AutoCloseable {
           // Network errors or other transient issues - retry with backoff
           attempt++;
           if (attempt > MAX_RETRIES) {
+            recordFailure(tableName, PartitionKeyDiscoveryFailureReason.TRANSIENT_FAILURE);
             logger.log(
-                Level.WARNING,
-                "Failed to discover partition key for table "
-                    + tableName
-                    + " after "
-                    + (MAX_RETRIES + 1)
-                    + " attempts",
-                e);
-            failedTables.put(tableName, new FailureRecord(false));
+                Level.INFO,
+                "PK discovery failed: table={0}, reason={1}",
+                new Object[] {
+                  tableName, PartitionKeyDiscoveryFailureReason.TRANSIENT_FAILURE.metricValue()
+                });
             return;
           }
 
@@ -343,6 +395,7 @@ public class PartitionKeyResolver implements AutoCloseable {
    */
   public void register(String tableName, String pkAttributeName) {
     cache.put(tableName, pkAttributeName);
+    notifyCacheSizeChanged();
   }
 
   /**
@@ -375,7 +428,9 @@ public class PartitionKeyResolver implements AutoCloseable {
    * @param tableName the table name
    */
   public void clearFailure(String tableName) {
-    failedTables.remove(tableName);
+    if (failedTables.remove(tableName) != null) {
+      notifyFailureCooldownSizeChanged();
+    }
   }
 
   /**
@@ -385,6 +440,60 @@ public class PartitionKeyResolver implements AutoCloseable {
    */
   public int getFailedTableCount() {
     return failedTables.size();
+  }
+
+  private PartitionKeyDiscoveryFailureReason mapPermanentFailureReason(DynamoDbException e) {
+    if (e.statusCode() == 403
+        || (e.awsErrorDetails() != null
+            && "AccessDeniedException".equals(e.awsErrorDetails().errorCode()))) {
+      return PartitionKeyDiscoveryFailureReason.ACCESS_DENIED;
+    }
+    return PartitionKeyDiscoveryFailureReason.PERMANENT_ERROR;
+  }
+
+  private void recordFailure(String tableName, PartitionKeyDiscoveryFailureReason reason) {
+    boolean permanent = reason != PartitionKeyDiscoveryFailureReason.TRANSIENT_FAILURE;
+    failedTables.put(tableName, new FailureRecord(permanent));
+    notifyListener(
+        listener -> listener.onPartitionKeyDiscoveryFailed(tableName, reason), "discovery failed");
+    notifyFailureCooldownSizeChanged();
+  }
+
+  private int getFailureCooldownTableCount() {
+    int count = 0;
+    for (FailureRecord record : failedTables.values()) {
+      if (!record.canRetry()) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  private void notifyCacheSizeChanged() {
+    notifyListener(
+        listener -> listener.onPartitionKeyCacheSizeChanged(cache.size()), "cache size changed");
+  }
+
+  private void notifyFailureCooldownSizeChanged() {
+    notifyListener(
+        listener ->
+            listener.onPartitionKeyFailureCooldownSizeChanged(getFailureCooldownTableCount()),
+        "failure cooldown size changed");
+  }
+
+  private void notifyListener(
+      Consumer<KeyRouteAffinityMetricsListener> consumer, String eventDescription) {
+    if (metricsListener == null) {
+      return;
+    }
+    try {
+      consumer.accept(metricsListener);
+    } catch (RuntimeException e) {
+      logger.log(
+          Level.FINE,
+          "Key route affinity metrics listener failed during " + eventDescription,
+          e);
+    }
   }
 
   /**
