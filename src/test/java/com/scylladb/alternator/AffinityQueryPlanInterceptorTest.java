@@ -4,15 +4,23 @@ import static org.junit.Assert.*;
 
 import com.scylladb.alternator.internal.AlternatorLiveNodes;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinity;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityFallbackReason;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinityConfig;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetricsCollector;
 import com.scylladb.alternator.queryplan.AffinityQueryPlanInterceptor;
 import com.scylladb.alternator.queryplan.BasicQueryPlanInterceptor;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.text.MessageFormat;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -1734,7 +1742,170 @@ public class AffinityQueryPlanInterceptorTest {
     }
   }
 
+  @Test
+  public void testMetricsCollectorRecordsAffinityApplied() {
+    RecordingMetricsCollector collector = new RecordingMetricsCollector();
+    KeyRouteAffinityConfig config =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.ANY_WRITE)
+            .withPkInfo(TABLE_NAME, PK_NAME)
+            .withMetricsCollector(collector)
+            .build();
+
+    DynamoDbClient client = createClient(config);
+    try {
+      client.putItem(PutItemRequest.builder().tableName(TABLE_NAME).item(makeItem()).build());
+
+      assertEquals(1, collector.requests.get());
+      assertEquals(1, collector.affinityApplied.get());
+      assertEquals(0, collector.roundRobinFallbacks.get());
+      assertEquals(1, collector.cacheHits.get());
+      assertEquals(TABLE_NAME, collector.tables.get(0));
+      assertEquals(1, collector.targets.size());
+    } finally {
+      client.close();
+    }
+  }
+
+  @Test
+  public void testMetricsCollectorRecordsFallbackReason() {
+    RecordingMetricsCollector collector = new RecordingMetricsCollector();
+    KeyRouteAffinityConfig config =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.RMW)
+            .withPkInfo(TABLE_NAME, PK_NAME)
+            .withMetricsCollector(collector)
+            .build();
+
+    DynamoDbClient client = createClient(config);
+    try {
+      client.putItem(PutItemRequest.builder().tableName(TABLE_NAME).item(makeItem()).build());
+
+      assertEquals(1, collector.requests.get());
+      assertEquals(0, collector.affinityApplied.get());
+      assertEquals(1, collector.roundRobinFallbacks.get());
+      assertEquals(KeyRouteAffinityFallbackReason.REQUEST_NOT_QUALIFYING, collector.fallbackReasons.get(0));
+    } finally {
+      client.close();
+    }
+  }
+
+  @Test
+  public void testFineLoggingIncludesAppliedDecision() {
+    Logger logger = Logger.getLogger(AffinityQueryPlanInterceptor.class.getName());
+    TestLogHandler handler = new TestLogHandler();
+    Level previousLevel = logger.getLevel();
+    boolean previousUseParentHandlers = logger.getUseParentHandlers();
+    logger.setLevel(Level.FINE);
+    logger.setUseParentHandlers(false);
+    logger.addHandler(handler);
+
+    DynamoDbClient client = createClient(buildConfig(KeyRouteAffinity.ANY_WRITE));
+    try {
+      client.putItem(PutItemRequest.builder().tableName(TABLE_NAME).item(makeItem()).build());
+
+      assertTrue(handler.contains(Level.FINE, "Key affinity applied: table=" + TABLE_NAME));
+      assertTrue(handler.contains(Level.FINE, "target=http://127.0.0."));
+    } finally {
+      client.close();
+      logger.removeHandler(handler);
+      logger.setLevel(previousLevel);
+      logger.setUseParentHandlers(previousUseParentHandlers);
+    }
+  }
+
+  @Test
+  public void testFineLoggingIncludesSkippedDecision() {
+    Logger logger = Logger.getLogger(AffinityQueryPlanInterceptor.class.getName());
+    TestLogHandler handler = new TestLogHandler();
+    Level previousLevel = logger.getLevel();
+    boolean previousUseParentHandlers = logger.getUseParentHandlers();
+    logger.setLevel(Level.FINE);
+    logger.setUseParentHandlers(false);
+    logger.addHandler(handler);
+
+    DynamoDbClient client = createClient(buildConfig(KeyRouteAffinity.RMW));
+    try {
+      client.putItem(PutItemRequest.builder().tableName(TABLE_NAME).item(makeItem()).build());
+
+      assertTrue(handler.contains(Level.FINE, "Key affinity skipped: table=" + TABLE_NAME));
+      assertTrue(handler.contains(Level.FINE, "reason=request_not_qualifying"));
+    } finally {
+      client.close();
+      logger.removeHandler(handler);
+      logger.setLevel(previousLevel);
+      logger.setUseParentHandlers(previousUseParentHandlers);
+    }
+  }
+
   // ========== Mock implementations ==========
+
+  private static class RecordingMetricsCollector implements KeyRouteAffinityMetricsCollector {
+    final AtomicInteger requests = new AtomicInteger();
+    final AtomicInteger affinityApplied = new AtomicInteger();
+    final AtomicInteger roundRobinFallbacks = new AtomicInteger();
+    final AtomicInteger cacheHits = new AtomicInteger();
+    final List<String> tables = new CopyOnWriteArrayList<>();
+    final List<URI> targets = new CopyOnWriteArrayList<>();
+    final List<KeyRouteAffinityFallbackReason> fallbackReasons = new CopyOnWriteArrayList<>();
+
+    @Override
+    public void onRequest(String tableName, KeyRouteAffinity mode) {
+      requests.incrementAndGet();
+      tables.add(tableName);
+    }
+
+    @Override
+    public void onAffinityApplied(
+        String tableName,
+        KeyRouteAffinity mode,
+        String partitionKeyName,
+        AttributeValue partitionKeyValue,
+        URI targetNode) {
+      affinityApplied.incrementAndGet();
+      targets.add(targetNode);
+    }
+
+    @Override
+    public void onRoundRobinFallback(
+        String tableName, KeyRouteAffinity mode, KeyRouteAffinityFallbackReason reason) {
+      roundRobinFallbacks.incrementAndGet();
+      fallbackReasons.add(reason);
+    }
+
+    @Override
+    public void onPartitionKeyCacheHit(String tableName) {
+      cacheHits.incrementAndGet();
+    }
+  }
+
+  private static class TestLogHandler extends Handler {
+    private final List<LogRecord> records = new CopyOnWriteArrayList<>();
+
+    @Override
+    public void publish(LogRecord record) {
+      records.add(record);
+    }
+
+    @Override
+    public void flush() {}
+
+    @Override
+    public void close() {}
+
+    boolean contains(Level level, String fragment) {
+      for (LogRecord record : records) {
+        String message = record.getMessage();
+        if (record.getParameters() != null) {
+          message = MessageFormat.format(message, record.getParameters());
+        }
+        if (record.getLevel().equals(level) && message.contains(fragment)) {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
 
   /**
    * Mock AlternatorLiveNodes that provides a fixed list of nodes without network calls.

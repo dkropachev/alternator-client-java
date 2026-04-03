@@ -19,6 +19,7 @@ public class KeyRouteAffinityConfigTest {
 
     assertEquals(KeyRouteAffinity.NONE, config.getType());
     assertTrue(config.getPkInfoPerTable().isEmpty());
+    assertSame(KeyRouteAffinityMetricsCollector.NO_OP, config.getMetricsCollector());
     assertFalse(config.isEnabled());
   }
 
@@ -70,6 +71,30 @@ public class KeyRouteAffinityConfigTest {
     assertEquals(2, pkInfo.size());
     assertEquals("user_id", pkInfo.get("users"));
     assertEquals("order_id", pkInfo.get("orders"));
+  }
+
+  @Test
+  public void testBuilderWithMetricsCollector() {
+    KeyRouteAffinityMetricsCollector collector = new KeyRouteAffinityMetricsCollector() {};
+
+    KeyRouteAffinityConfig config =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.RMW)
+            .withMetricsCollector(collector)
+            .build();
+
+    assertSame(collector, config.getMetricsCollector());
+  }
+
+  @Test
+  public void testBuilderWithNullMetricsCollectorDisablesMetrics() {
+    KeyRouteAffinityConfig config =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.RMW)
+            .withMetricsCollector(null)
+            .build();
+
+    assertSame(KeyRouteAffinityMetricsCollector.NO_OP, config.getMetricsCollector());
   }
 
   @Test
