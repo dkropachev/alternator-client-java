@@ -7,9 +7,9 @@ import java.util.Map;
 /**
  * Configuration for key-based route affinity.
  *
- * <p>This class holds the affinity type and optional pre-configured partition key information per
- * table. If partition key info is not provided for a table, it will be discovered automatically via
- * DescribeTable.
+ * <p>This class holds the affinity type, optional pre-configured partition key information per
+ * table, and optional observability callbacks for metrics collection. If partition key info is not
+ * provided for a table, it will be discovered automatically via DescribeTable.
  *
  * <p><strong>Important:</strong> Key route affinity only works reliably with synchronous DynamoDB
  * clients ({@link software.amazon.awssdk.services.dynamodb.DynamoDbClient}). With async clients,
@@ -23,6 +23,7 @@ import java.util.Map;
  *     .withType(KeyRouteAffinity.RMW)
  *     .withPkInfo("users", "user_id")
  *     .withPkInfo("orders", "order_id")
+ *     .withMetricsListener(myMetricsListener)
  *     .build();
  * }</pre>
  *
@@ -32,10 +33,15 @@ import java.util.Map;
 public class KeyRouteAffinityConfig {
   private final KeyRouteAffinity type;
   private final Map<String, String> pkInfoPerTable;
+  private final KeyRouteAffinityMetricsListener metricsListener;
 
-  private KeyRouteAffinityConfig(KeyRouteAffinity type, Map<String, String> pkInfoPerTable) {
+  private KeyRouteAffinityConfig(
+      KeyRouteAffinity type,
+      Map<String, String> pkInfoPerTable,
+      KeyRouteAffinityMetricsListener metricsListener) {
     this.type = type != null ? type : KeyRouteAffinity.NONE;
     this.pkInfoPerTable = Collections.unmodifiableMap(new HashMap<>(pkInfoPerTable));
+    this.metricsListener = metricsListener;
   }
 
   /**
@@ -57,12 +63,33 @@ public class KeyRouteAffinityConfig {
   }
 
   /**
+   * Returns the optional metrics listener used for affinity observability.
+   *
+   * <p>A {@code null} value means metrics callbacks are disabled.
+   *
+   * @return the metrics listener, or {@code null} if disabled
+   * @since 2.1.0
+   */
+  public KeyRouteAffinityMetricsListener getMetricsListener() {
+    return metricsListener;
+  }
+
+  /**
    * Checks if route affinity is enabled (type is not NONE).
    *
    * @return true if route affinity is enabled
    */
   public boolean isEnabled() {
     return type != KeyRouteAffinity.NONE;
+  }
+
+  /**
+   * Checks if metrics callbacks are enabled.
+   *
+   * @return true if a metrics listener is configured
+   */
+  public boolean isMetricsEnabled() {
+    return metricsListener != null;
   }
 
   /**
@@ -81,13 +108,14 @@ public class KeyRouteAffinityConfig {
    * @return a new config instance
    */
   public static KeyRouteAffinityConfig of(KeyRouteAffinity type) {
-    return new KeyRouteAffinityConfig(type, Collections.<String, String>emptyMap());
+    return new KeyRouteAffinityConfig(type, Collections.<String, String>emptyMap(), null);
   }
 
   /** Builder for {@link KeyRouteAffinityConfig}. */
   public static class Builder {
     private KeyRouteAffinity type = KeyRouteAffinity.NONE;
     private final Map<String, String> pkInfoPerTable = new HashMap<>();
+    private KeyRouteAffinityMetricsListener metricsListener;
 
     Builder() {}
 
@@ -130,12 +158,27 @@ public class KeyRouteAffinityConfig {
     }
 
     /**
+     * Enables optional key affinity metrics callbacks.
+     *
+     * <p>Metrics are disabled by default. Supply a thread-safe, non-blocking listener to export
+     * counters and gauges to your preferred metrics backend.
+     *
+     * @param metricsListener the metrics listener, or {@code null} to disable callbacks
+     * @return this builder
+     * @since 2.1.0
+     */
+    public Builder withMetricsListener(KeyRouteAffinityMetricsListener metricsListener) {
+      this.metricsListener = metricsListener;
+      return this;
+    }
+
+    /**
      * Builds the configuration.
      *
      * @return a new KeyRouteAffinityConfig instance
      */
     public KeyRouteAffinityConfig build() {
-      return new KeyRouteAffinityConfig(type, pkInfoPerTable);
+      return new KeyRouteAffinityConfig(type, pkInfoPerTable, metricsListener);
     }
   }
 }

@@ -760,6 +760,145 @@ DynamoDbClient client = AlternatorDynamoDbClient.builder()
     .build();
 ```
 
+#### Metrics and debug logging
+
+Key route affinity can publish request and partition-key discovery metrics through a callback
+interface without adding a metrics dependency to the library itself. Metrics remain disabled until
+`withMetricsListener(...)` is configured.
+
+Available events map naturally to counters such as:
+
+- `alternator.affinity.requests.total`
+- `alternator.affinity.requests.affinity`
+- `alternator.affinity.requests.roundrobin`
+- `alternator.affinity.pk.cache.hits`
+- `alternator.affinity.pk.cache.misses`
+- `alternator.affinity.pk.discovery.triggered`
+- `alternator.affinity.pk.discovery.success`
+- `alternator.affinity.pk.discovery.failed`
+
+And gauges such as:
+
+- `alternator.affinity.pk.cache.size`
+- `alternator.affinity.pk.failed.tables`
+
+Fallback reasons exposed to `onRoundRobinFallback(...)` are:
+`request_not_qualifying`, `table_name_unavailable`, `pk_not_cached`, and `pk_missing`.
+
+Example Micrometer bridge:
+
+```java
+import com.scylladb.alternator.keyrouting.KeyRouteAffinity;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityConfig;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityFallbackReason;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetricsListener;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import java.util.concurrent.atomic.AtomicInteger;
+
+MeterRegistry registry = ...;
+AtomicInteger pkCacheSize = new AtomicInteger();
+AtomicInteger failedTables = new AtomicInteger();
+
+Gauge.builder("alternator.affinity.pk.cache.size", pkCacheSize, AtomicInteger::get)
+    .register(registry);
+Gauge.builder("alternator.affinity.pk.failed.tables", failedTables, AtomicInteger::get)
+    .register(registry);
+
+KeyRouteAffinityMetricsListener metrics = new KeyRouteAffinityMetricsListener() {
+  @Override
+  public void onRequest(String tableName, KeyRouteAffinity mode) {
+    registry
+        .counter(
+            "alternator.affinity.requests.total",
+            "table",
+            tableName,
+            "mode",
+            mode.name())
+        .increment();
+  }
+
+  @Override
+  public void onAffinityApplied(String tableName, KeyRouteAffinity mode) {
+    registry
+        .counter(
+            "alternator.affinity.requests.affinity",
+            "table",
+            tableName,
+            "mode",
+            mode.name())
+        .increment();
+  }
+
+  @Override
+  public void onRoundRobinFallback(
+      String tableName,
+      KeyRouteAffinity mode,
+      KeyRouteAffinityFallbackReason reason) {
+    registry
+        .counter(
+            "alternator.affinity.requests.roundrobin",
+            "table",
+            tableName,
+            "mode",
+            mode.name(),
+            "reason",
+            reason.label())
+        .increment();
+  }
+
+  @Override
+  public void onPartitionKeyCacheHit(String tableName) {
+    registry.counter("alternator.affinity.pk.cache.hits", "table", tableName).increment();
+  }
+
+  @Override
+  public void onPartitionKeyCacheMiss(String tableName) {
+    registry.counter("alternator.affinity.pk.cache.misses", "table", tableName).increment();
+  }
+
+  @Override
+  public void onPartitionKeyDiscoveryTriggered(String tableName) {
+    registry.counter("alternator.affinity.pk.discovery.triggered", "table", tableName)
+        .increment();
+  }
+
+  @Override
+  public void onPartitionKeyDiscoverySuccess(String tableName, String partitionKeyName) {
+    registry.counter("alternator.affinity.pk.discovery.success", "table", tableName).increment();
+  }
+
+  @Override
+  public void onPartitionKeyDiscoveryFailed(String tableName, String reason) {
+    registry
+        .counter(
+            "alternator.affinity.pk.discovery.failed", "table", tableName, "reason", reason)
+        .increment();
+  }
+
+  @Override
+  public void onPartitionKeyCacheSizeChanged(int cacheSize) {
+    pkCacheSize.set(cacheSize);
+  }
+
+  @Override
+  public void onFailedTableCountChanged(int failedTableCount) {
+    failedTables.set(failedTableCount);
+  }
+};
+
+KeyRouteAffinityConfig keyAffinity = KeyRouteAffinityConfig.builder()
+    .withType(KeyRouteAffinity.RMW)
+    .withPkInfo("users", "user_id")
+    .withMetricsListener(metrics)
+    .build();
+```
+
+Request-level routing decisions are logged at `FINE` (`DEBUG`) level by
+`AffinityQueryPlanInterceptor`. Partition-key discovery success/failure events are logged at
+`INFO` level by `PartitionKeyResolver`. Because debug logs include partition key values, enable
+them only in environments where that data is safe to emit.
+
 #### How it works
 
 1. The `AffinityQueryPlanInterceptor` intercepts each DynamoDB request

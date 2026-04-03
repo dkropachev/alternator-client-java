@@ -4,11 +4,20 @@ import com.scylladb.alternator.internal.AlternatorLiveNodes;
 import com.scylladb.alternator.internal.LazyQueryPlan;
 import com.scylladb.alternator.keyrouting.AttributeValueHasher;
 import com.scylladb.alternator.keyrouting.KeyAffinityRequestClassifier;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinity;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinityConfig;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityFallbackReason;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetricsListener;
 import com.scylladb.alternator.keyrouting.PartitionKeyResolver;
+import java.net.URI;
+import java.util.function.Consumer;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import software.amazon.awssdk.core.SdkRequest;
 import software.amazon.awssdk.core.interceptor.Context;
+import software.amazon.awssdk.core.interceptor.ExecutionAttribute;
 import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
+import software.amazon.awssdk.http.SdkHttpRequest;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 
@@ -31,8 +40,15 @@ import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
  */
 public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
 
+  private static final Logger logger =
+      Logger.getLogger(AffinityQueryPlanInterceptor.class.getName());
+
+  private static final ExecutionAttribute<AffinityDecision> AFFINITY_DECISION =
+      new ExecutionAttribute<>("AffinityQueryPlanInterceptor.decision");
+
   private final KeyRouteAffinityConfig config;
   private final PartitionKeyResolver pkResolver;
+  private final KeyRouteAffinityMetricsListener metricsListener;
   private volatile DynamoDbClient clientForDiscovery;
 
   /**
@@ -48,7 +64,8 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
       DynamoDbClient clientForDiscovery) {
     super(liveNodes);
     this.config = config;
-    this.pkResolver = new PartitionKeyResolver(config.getPkInfoPerTable());
+    this.metricsListener = config.getMetricsListener();
+    this.pkResolver = new PartitionKeyResolver(config.getPkInfoPerTable(), metricsListener);
     this.clientForDiscovery = clientForDiscovery;
   }
 
@@ -81,57 +98,38 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
     this.clientForDiscovery = client;
   }
 
-  private LazyQueryPlan getQueryPlan(SdkRequest request) {
-    if (!config.isEnabled()) {
-      return null;
-    }
-
-    // Check if this request qualifies for key affinity
-    if (!KeyAffinityRequestClassifier.shouldApply(config.getType(), request)) {
-      // Keep the random plan from base class
-      return null;
-    }
-
-    // Extract table name
-    String tableName = KeyAffinityRequestClassifier.extractTableName(request);
-    if (tableName == null) {
-      // Keep the random plan from base class
-      return null;
-    }
-
-    // Get partition key name
-    String pkName = pkResolver.getPartitionKeyName(tableName);
-    if (pkName == null) {
-      // Trigger async discovery if we have a client
-      if (clientForDiscovery != null) {
-        pkResolver.triggerDiscovery(tableName, clientForDiscovery);
-      }
-      // Keep the random plan from base class for this request
-      return null;
-    }
-
-    // Extract partition key value
-    AttributeValue pkValue = KeyAffinityRequestClassifier.extractPartitionKey(request, pkName);
-    if (pkValue == null) {
-      // Keep the random plan from base class
-      return null;
-    }
-
-    // Hash the partition key and create a deterministic query plan
-    long hash = AttributeValueHasher.hash(pkValue);
-    return new LazyQueryPlan(liveNodes, hash);
-  }
-
   @Override
   public void beforeExecution(
       Context.BeforeExecution context, ExecutionAttributes executionAttributes) {
-    LazyQueryPlan plan = getQueryPlan(context.request());
-    if (plan == null) {
-      plan = new LazyQueryPlan(liveNodes);
+    AffinityDecision decision = evaluateDecision(context.request());
+    executionAttributes.putAttribute(AFFINITY_DECISION, decision);
+    executionAttributes.putAttribute(
+        QUERY_PLAN,
+        decision.affinityApplied
+            ? new LazyQueryPlan(liveNodes, decision.partitionKeyHash)
+            : new LazyQueryPlan(liveNodes));
+
+    recordMetrics(decision);
+    logSkippedDecision(decision);
+  }
+
+  @Override
+  public SdkHttpRequest modifyHttpRequest(
+      Context.ModifyHttpRequest context, ExecutionAttributes executionAttributes) {
+    LazyQueryPlan plan = executionAttributes.getAttribute(QUERY_PLAN);
+    if (plan == null || !plan.hasNext()) {
+      return context.httpRequest();
     }
 
-    // Override the random plan with the deterministic one
-    executionAttributes.putAttribute(QUERY_PLAN, plan);
+    URI targetUri = plan.next();
+    logAppliedDecision(executionAttributes.getAttribute(AFFINITY_DECISION), targetUri);
+
+    return context.httpRequest().toBuilder()
+        .protocol(targetUri.getScheme())
+        .host(targetUri.getHost())
+        .port(targetUri.getPort())
+        .putHeader("Connection", "keep-alive")
+        .build();
   }
 
   /**
@@ -150,5 +148,230 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
    */
   public KeyRouteAffinityConfig getConfig() {
     return config;
+  }
+
+  private AffinityDecision evaluateDecision(SdkRequest request) {
+    KeyRouteAffinity mode = config.getType();
+    String requestType = request.getClass().getSimpleName();
+
+    if (!config.isEnabled()) {
+      return AffinityDecision.roundRobin(
+          "unknown", mode, requestType, KeyRouteAffinityFallbackReason.MODE_DISABLED, null);
+    }
+
+    String tableName = KeyAffinityRequestClassifier.extractTableName(request);
+    String telemetryTableName = normalizeTableName(tableName);
+
+    if (!KeyAffinityRequestClassifier.shouldApply(mode, request)) {
+      return AffinityDecision.roundRobin(
+          telemetryTableName,
+          mode,
+          requestType,
+          KeyRouteAffinityFallbackReason.REQUEST_NOT_QUALIFYING,
+          null);
+    }
+
+    if (tableName == null) {
+      return AffinityDecision.roundRobin(
+          telemetryTableName,
+          mode,
+          requestType,
+          KeyRouteAffinityFallbackReason.TABLE_NAME_UNAVAILABLE,
+          null);
+    }
+
+    String pkName = pkResolver.getPartitionKeyName(tableName);
+    if (pkName == null) {
+      String detail = "discovery_unavailable";
+      if (clientForDiscovery != null) {
+        boolean discoveryTriggered = pkResolver.triggerDiscoveryIfNeeded(tableName, clientForDiscovery);
+        if (discoveryTriggered) {
+          detail = "discovery_triggered";
+        } else if (pkResolver.isInFailureCooldown(tableName)) {
+          detail = "discovery_cooldown";
+        } else {
+          detail = "discovery_pending";
+        }
+      }
+
+      return AffinityDecision.roundRobin(
+          telemetryTableName,
+          mode,
+          requestType,
+          KeyRouteAffinityFallbackReason.PARTITION_KEY_NOT_CACHED,
+          detail);
+    }
+
+    AttributeValue pkValue = KeyAffinityRequestClassifier.extractPartitionKey(request, pkName);
+    if (pkValue == null) {
+      return AffinityDecision.roundRobin(
+          telemetryTableName,
+          mode,
+          requestType,
+          KeyRouteAffinityFallbackReason.PARTITION_KEY_MISSING,
+          "pk_attribute=" + pkName);
+    }
+
+    return AffinityDecision.applied(
+        telemetryTableName,
+        mode,
+        requestType,
+        pkName,
+        formatPartitionKeyValue(pkValue),
+        AttributeValueHasher.hash(pkValue));
+  }
+
+  private void recordMetrics(AffinityDecision decision) {
+    if (metricsListener == null) {
+      return;
+    }
+
+    notifyMetrics(listener -> listener.onRequest(decision.tableName, decision.mode));
+    if (decision.affinityApplied) {
+      notifyMetrics(listener -> listener.onAffinityApplied(decision.tableName, decision.mode));
+      return;
+    }
+
+    notifyMetrics(
+        listener ->
+            listener.onRoundRobinFallback(
+                decision.tableName, decision.mode, decision.fallbackReason));
+  }
+
+  private void logSkippedDecision(AffinityDecision decision) {
+    if (decision.affinityApplied || !logger.isLoggable(Level.FINE)) {
+      return;
+    }
+
+    StringBuilder message =
+        new StringBuilder("Key affinity skipped: table=")
+            .append(decision.tableName)
+            .append(", reason=")
+            .append(decision.fallbackReason.label())
+            .append(", mode=")
+            .append(decision.mode)
+            .append(", request=")
+            .append(decision.requestType);
+
+    if (decision.detail != null && !decision.detail.isEmpty()) {
+      message.append(", detail=").append(decision.detail);
+    }
+
+    logger.fine(message.toString());
+  }
+
+  private void logAppliedDecision(AffinityDecision decision, URI targetUri) {
+    if (decision == null || !decision.affinityApplied || !logger.isLoggable(Level.FINE)) {
+      return;
+    }
+
+    logger.fine(
+        "Key affinity applied: table="
+            + decision.tableName
+            + ", pk="
+            + decision.partitionKeyValue
+            + ", pk_attribute="
+            + decision.partitionKeyName
+            + ", target="
+            + targetUri.getHost()
+            + ":"
+            + targetUri.getPort()
+            + ", mode="
+            + decision.mode
+            + ", request="
+            + decision.requestType);
+  }
+
+  private String normalizeTableName(String tableName) {
+    return tableName != null ? tableName : "unknown";
+  }
+
+  private String formatPartitionKeyValue(AttributeValue pkValue) {
+    if (!logger.isLoggable(Level.FINE)) {
+      return null;
+    }
+    if (pkValue.s() != null) {
+      return pkValue.s();
+    }
+    if (pkValue.n() != null) {
+      return pkValue.n();
+    }
+    if (pkValue.bool() != null) {
+      return pkValue.bool().toString();
+    }
+    if (Boolean.TRUE.equals(pkValue.nul())) {
+      return "null";
+    }
+    return pkValue.toString();
+  }
+
+  private void notifyMetrics(Consumer<KeyRouteAffinityMetricsListener> callback) {
+    try {
+      callback.accept(metricsListener);
+    } catch (RuntimeException e) {
+      logger.log(Level.WARNING, "Key route affinity metrics listener threw an exception", e);
+    }
+  }
+
+  private static final class AffinityDecision {
+    private final boolean affinityApplied;
+    private final String tableName;
+    private final KeyRouteAffinity mode;
+    private final String requestType;
+    private final KeyRouteAffinityFallbackReason fallbackReason;
+    private final String detail;
+    private final String partitionKeyName;
+    private final String partitionKeyValue;
+    private final long partitionKeyHash;
+
+    private AffinityDecision(
+        boolean affinityApplied,
+        String tableName,
+        KeyRouteAffinity mode,
+        String requestType,
+        KeyRouteAffinityFallbackReason fallbackReason,
+        String detail,
+        String partitionKeyName,
+        String partitionKeyValue,
+        long partitionKeyHash) {
+      this.affinityApplied = affinityApplied;
+      this.tableName = tableName;
+      this.mode = mode;
+      this.requestType = requestType;
+      this.fallbackReason = fallbackReason;
+      this.detail = detail;
+      this.partitionKeyName = partitionKeyName;
+      this.partitionKeyValue = partitionKeyValue;
+      this.partitionKeyHash = partitionKeyHash;
+    }
+
+    private static AffinityDecision roundRobin(
+        String tableName,
+        KeyRouteAffinity mode,
+        String requestType,
+        KeyRouteAffinityFallbackReason fallbackReason,
+        String detail) {
+      return new AffinityDecision(
+          false, tableName, mode, requestType, fallbackReason, detail, null, null, 0L);
+    }
+
+    private static AffinityDecision applied(
+        String tableName,
+        KeyRouteAffinity mode,
+        String requestType,
+        String partitionKeyName,
+        String partitionKeyValue,
+        long partitionKeyHash) {
+      return new AffinityDecision(
+          true,
+          tableName,
+          mode,
+          requestType,
+          null,
+          null,
+          partitionKeyName,
+          partitionKeyValue,
+          partitionKeyHash);
+    }
   }
 }
