@@ -32,10 +32,15 @@ import java.util.Map;
 public class KeyRouteAffinityConfig {
   private final KeyRouteAffinity type;
   private final Map<String, String> pkInfoPerTable;
+  private final KeyRouteAffinityMetricsListener metricsListener;
 
-  private KeyRouteAffinityConfig(KeyRouteAffinity type, Map<String, String> pkInfoPerTable) {
+  private KeyRouteAffinityConfig(
+      KeyRouteAffinity type,
+      Map<String, String> pkInfoPerTable,
+      KeyRouteAffinityMetricsListener metricsListener) {
     this.type = type != null ? type : KeyRouteAffinity.NONE;
     this.pkInfoPerTable = Collections.unmodifiableMap(new HashMap<>(pkInfoPerTable));
+    this.metricsListener = metricsListener;
   }
 
   /**
@@ -54,6 +59,15 @@ public class KeyRouteAffinityConfig {
    */
   public Map<String, String> getPkInfoPerTable() {
     return pkInfoPerTable;
+  }
+
+  /**
+   * Returns the optional metrics listener.
+   *
+   * @return the metrics listener, or {@code null} when metrics are disabled
+   */
+  public KeyRouteAffinityMetricsListener getMetricsListener() {
+    return metricsListener;
   }
 
   /**
@@ -81,13 +95,14 @@ public class KeyRouteAffinityConfig {
    * @return a new config instance
    */
   public static KeyRouteAffinityConfig of(KeyRouteAffinity type) {
-    return new KeyRouteAffinityConfig(type, Collections.<String, String>emptyMap());
+    return new KeyRouteAffinityConfig(type, Collections.<String, String>emptyMap(), null);
   }
 
   /** Builder for {@link KeyRouteAffinityConfig}. */
   public static class Builder {
     private KeyRouteAffinity type = KeyRouteAffinity.NONE;
     private final Map<String, String> pkInfoPerTable = new HashMap<>();
+    private KeyRouteAffinityMetricsListener metricsListener;
 
     Builder() {}
 
@@ -130,12 +145,26 @@ public class KeyRouteAffinityConfig {
     }
 
     /**
+     * Attaches an optional metrics listener for affinity observability.
+     *
+     * <p>When omitted or set to {@code null}, affinity metrics callbacks are disabled.
+     *
+     * @param metricsListener the listener to notify, or {@code null} to disable callbacks
+     * @return this builder
+     * @since 2.0.5
+     */
+    public Builder withMetricsListener(KeyRouteAffinityMetricsListener metricsListener) {
+      this.metricsListener = metricsListener;
+      return this;
+    }
+
+    /**
      * Builds the configuration.
      *
      * @return a new KeyRouteAffinityConfig instance
      */
     public KeyRouteAffinityConfig build() {
-      return new KeyRouteAffinityConfig(type, pkInfoPerTable);
+      return new KeyRouteAffinityConfig(type, pkInfoPerTable, metricsListener);
     }
   }
 }
