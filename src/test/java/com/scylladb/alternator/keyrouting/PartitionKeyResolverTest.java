@@ -7,9 +7,15 @@ import static org.mockito.Mockito.*;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.text.MessageFormat;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -33,10 +39,78 @@ public class PartitionKeyResolverTest {
 
   private PartitionKeyResolver resolver;
   private DynamoDbClient mockClient;
+  private RecordingMetricsCollector metricsCollector;
+
+  private static class RecordingMetricsCollector implements KeyRouteAffinityMetricsCollector {
+    final AtomicInteger cacheHits = new AtomicInteger();
+    final AtomicInteger cacheMisses = new AtomicInteger();
+    final AtomicInteger discoveryTriggered = new AtomicInteger();
+    final CopyOnWriteArrayList<String> discoverySuccess = new CopyOnWriteArrayList<>();
+    final CopyOnWriteArrayList<PartitionKeyDiscoveryFailureReason> discoveryFailures =
+        new CopyOnWriteArrayList<>();
+    final CopyOnWriteArrayList<Integer> cacheSizes = new CopyOnWriteArrayList<>();
+    final CopyOnWriteArrayList<Integer> failedTableCounts = new CopyOnWriteArrayList<>();
+
+    @Override
+    public void onPartitionKeyCacheHit(String tableName) {
+      cacheHits.incrementAndGet();
+    }
+
+    @Override
+    public void onPartitionKeyCacheMiss(String tableName) {
+      cacheMisses.incrementAndGet();
+    }
+
+    @Override
+    public void onPartitionKeyDiscoveryTriggered(String tableName) {
+      discoveryTriggered.incrementAndGet();
+    }
+
+    @Override
+    public void onPartitionKeyDiscoverySuccess(String tableName, String partitionKeyName) {
+      discoverySuccess.add(tableName + ":" + partitionKeyName);
+    }
+
+    @Override
+    public void onPartitionKeyDiscoveryFailed(
+        String tableName, PartitionKeyDiscoveryFailureReason reason) {
+      discoveryFailures.add(reason);
+    }
+
+    @Override
+    public void onPartitionKeyCacheSizeChanged(int cacheSize) {
+      cacheSizes.add(cacheSize);
+    }
+
+    @Override
+    public void onPartitionKeyFailedTableCountChanged(int failedTableCount) {
+      failedTableCounts.add(failedTableCount);
+    }
+  }
+
+  private static class TestLogHandler extends Handler {
+    final CopyOnWriteArrayList<String> messages = new CopyOnWriteArrayList<>();
+
+    @Override
+    public void publish(LogRecord record) {
+      String message = record.getMessage();
+      if (record.getParameters() != null) {
+        message = MessageFormat.format(message, record.getParameters());
+      }
+      messages.add(message);
+    }
+
+    @Override
+    public void flush() {}
+
+    @Override
+    public void close() {}
+  }
 
   @Before
   public void setUp() {
-    resolver = new PartitionKeyResolver(null);
+    metricsCollector = new RecordingMetricsCollector();
+    resolver = new PartitionKeyResolver(null, metricsCollector);
     mockClient = mock(DynamoDbClient.class);
   }
 
@@ -56,7 +130,7 @@ public class PartitionKeyResolverTest {
     preConfigured.put("orders", "order_id");
 
     resolver.shutdown(); // Shutdown default resolver
-    resolver = new PartitionKeyResolver(preConfigured);
+    resolver = new PartitionKeyResolver(preConfigured, metricsCollector);
 
     assertEquals("user_id", resolver.getPartitionKeyName("users"));
     assertEquals("order_id", resolver.getPartitionKeyName("orders"));
@@ -71,6 +145,21 @@ public class PartitionKeyResolverTest {
 
     assertEquals("product_id", resolver.getPartitionKeyName("products"));
     assertTrue(resolver.hasPartitionKeyInfo("products"));
+  }
+
+  @Test
+  public void testMetricsCollectorTracksCacheHitsMissesAndGaugeChanges() {
+    assertEquals(Arrays.asList(0), metricsCollector.cacheSizes);
+    assertEquals(Arrays.asList(0), metricsCollector.failedTableCounts);
+
+    assertNull(resolver.getPartitionKeyName("products"));
+    assertEquals(1, metricsCollector.cacheMisses.get());
+
+    resolver.register("products", "product_id");
+
+    assertEquals("product_id", resolver.getPartitionKeyName("products"));
+    assertEquals(1, metricsCollector.cacheHits.get());
+    assertEquals(Integer.valueOf(1), metricsCollector.cacheSizes.get(metricsCollector.cacheSizes.size() - 1));
   }
 
   @Test
@@ -96,6 +185,9 @@ public class PartitionKeyResolverTest {
 
     assertEquals("session_id", resolver.getPartitionKeyName("sessions"));
     assertFalse(resolver.isInFailureCooldown("sessions"));
+    assertEquals(1, metricsCollector.discoveryTriggered.get());
+    assertTrue(metricsCollector.discoverySuccess.contains("sessions:session_id"));
+    assertEquals(Integer.valueOf(1), metricsCollector.cacheSizes.get(metricsCollector.cacheSizes.size() - 1));
   }
 
   @Test
@@ -289,6 +381,9 @@ public class PartitionKeyResolverTest {
     resolver.clearFailure("missing");
 
     assertFalse(resolver.isInFailureCooldown("missing"));
+    assertEquals(
+        Integer.valueOf(0),
+        metricsCollector.failedTableCounts.get(metricsCollector.failedTableCounts.size() - 1));
   }
 
   @Test
@@ -313,6 +408,78 @@ public class PartitionKeyResolverTest {
 
     resolver.clearFailure("missing1");
     assertEquals(1, resolver.getFailedTableCount());
+  }
+
+  @Test
+  public void testMetricsCollectorTracksDiscoveryFailure() throws Exception {
+    CountDownLatch latch = new CountDownLatch(1);
+
+    when(mockClient.describeTable(any(DescribeTableRequest.class)))
+        .thenAnswer(
+            (Answer<DescribeTableResponse>)
+                invocation -> {
+                  latch.countDown();
+                  throw ResourceNotFoundException.builder().message("Not found").build();
+                });
+
+    resolver.triggerDiscovery("missing", mockClient);
+    assertTrue(latch.await(5, TimeUnit.SECONDS));
+    Thread.sleep(100);
+
+    assertTrue(metricsCollector.discoveryFailures.contains(PartitionKeyDiscoveryFailureReason.TABLE_NOT_FOUND));
+    assertEquals(
+        Integer.valueOf(1),
+        metricsCollector.failedTableCounts.get(metricsCollector.failedTableCounts.size() - 1));
+  }
+
+  @Test
+  public void testDiscoverySuccessLoggedAtInfo() throws Exception {
+    Logger logger = Logger.getLogger(PartitionKeyResolver.class.getName());
+    TestLogHandler handler = new TestLogHandler();
+    Level previousLevel = logger.getLevel();
+    boolean previousUseParentHandlers = logger.getUseParentHandlers();
+    logger.setLevel(Level.INFO);
+    logger.setUseParentHandlers(false);
+    logger.addHandler(handler);
+
+    try {
+      when(mockClient.describeTable(any(DescribeTableRequest.class)))
+          .thenReturn(createDescribeTableResponse("session_id"));
+
+      resolver.triggerDiscovery("sessions", mockClient);
+      Thread.sleep(200);
+
+      assertTrue(handler.messages.contains("PK discovery completed: table=sessions, pk_attribute=session_id"));
+    } finally {
+      logger.removeHandler(handler);
+      logger.setLevel(previousLevel);
+      logger.setUseParentHandlers(previousUseParentHandlers);
+    }
+  }
+
+  @Test
+  public void testDiscoveryFailureLoggedAtInfo() throws Exception {
+    Logger logger = Logger.getLogger(PartitionKeyResolver.class.getName());
+    TestLogHandler handler = new TestLogHandler();
+    Level previousLevel = logger.getLevel();
+    boolean previousUseParentHandlers = logger.getUseParentHandlers();
+    logger.setLevel(Level.INFO);
+    logger.setUseParentHandlers(false);
+    logger.addHandler(handler);
+
+    try {
+      when(mockClient.describeTable(any(DescribeTableRequest.class)))
+          .thenThrow(ResourceNotFoundException.builder().message("Not found").build());
+
+      resolver.triggerDiscovery("missing", mockClient);
+      Thread.sleep(200);
+
+      assertTrue(handler.messages.contains("PK discovery failed: table=missing, reason=table_not_found"));
+    } finally {
+      logger.removeHandler(handler);
+      logger.setLevel(previousLevel);
+      logger.setUseParentHandlers(previousUseParentHandlers);
+    }
   }
 
   @Test

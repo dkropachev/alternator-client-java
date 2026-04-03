@@ -760,6 +760,119 @@ DynamoDbClient client = AlternatorDynamoDbClient.builder()
     .build();
 ```
 
+#### Observability: debug logging and optional metrics
+
+Key route affinity emits structured JUL logs and can optionally call a user-provided metrics
+collector.
+
+In JUL, `FINE` is the closest equivalent to a traditional `DEBUG` log level.
+
+- **Request-level logs:** enable `FINE` on
+  `com.scylladb.alternator.queryplan.AffinityQueryPlanInterceptor`
+- **Discovery lifecycle logs:** enable `INFO` on
+  `com.scylladb.alternator.keyrouting.PartitionKeyResolver`
+- **Metrics:** pass a `KeyRouteAffinityMetricsCollector` via
+  `KeyRouteAffinityConfig.Builder.withMetricsCollector(...)`
+
+Metrics are disabled by default and use a no-op callback when not configured, so the hot path keeps
+allocation and branching overhead low.
+
+```java
+import com.scylladb.alternator.keyrouting.PartitionKeyResolver;
+import com.scylladb.alternator.queryplan.AffinityQueryPlanInterceptor;
+import java.util.logging.ConsoleHandler;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+ConsoleHandler handler = new ConsoleHandler();
+handler.setLevel(Level.FINE);
+
+Logger affinityLogger = Logger.getLogger(AffinityQueryPlanInterceptor.class.getName());
+affinityLogger.setLevel(Level.FINE);
+affinityLogger.addHandler(handler);
+
+Logger discoveryLogger = Logger.getLogger(PartitionKeyResolver.class.getName());
+discoveryLogger.setLevel(Level.INFO);
+discoveryLogger.addHandler(handler);
+```
+
+The collector callbacks map directly to the recommended metrics:
+
+| Callback | Suggested metric |
+|----------|------------------|
+| `onRequest(table, mode)` | `alternator.affinity.requests.total` |
+| `onAffinityApplied(...)` | `alternator.affinity.requests.affinity` |
+| `onRoundRobinFallback(..., reason)` | `alternator.affinity.requests.roundrobin` |
+| `onPartitionKeyCacheHit(table)` | `alternator.affinity.pk.cache.hits` |
+| `onPartitionKeyCacheMiss(table)` | `alternator.affinity.pk.cache.misses` |
+| `onPartitionKeyDiscoveryTriggered(table)` | `alternator.affinity.pk.discovery.triggered` |
+| `onPartitionKeyDiscoverySuccess(table, pk)` | `alternator.affinity.pk.discovery.success` |
+| `onPartitionKeyDiscoveryFailed(table, reason)` | `alternator.affinity.pk.discovery.failed` |
+| `onPartitionKeyCacheSizeChanged(size)` | `alternator.affinity.pk.cache.size` |
+| `onPartitionKeyFailedTableCountChanged(size)` | `alternator.affinity.pk.failed.tables` |
+
+#### Micrometer / Prometheus example
+
+If you already use Micrometer, you can bridge the callbacks to any Micrometer registry (including a
+Prometheus registry) without adding a dependency to this library itself:
+
+```java
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import java.util.concurrent.atomic.AtomicInteger;
+
+final class MicrometerAffinityMetrics implements KeyRouteAffinityMetricsCollector {
+  private final MeterRegistry registry;
+  private final AtomicInteger cacheSize = new AtomicInteger();
+  private final AtomicInteger failedTables = new AtomicInteger();
+
+  MicrometerAffinityMetrics(MeterRegistry registry) {
+    this.registry = registry;
+    registry.gauge("alternator.affinity.pk.cache.size", cacheSize);
+    registry.gauge("alternator.affinity.pk.failed.tables", failedTables);
+  }
+
+  @Override
+  public void onRequest(String table, KeyRouteAffinity mode) {
+    Counter.builder("alternator.affinity.requests.total")
+        .tag("table", table != null ? table : "unknown")
+        .tag("mode", mode.name())
+        .register(registry)
+        .increment();
+  }
+
+  @Override
+  public void onRoundRobinFallback(
+      String table, KeyRouteAffinity mode, KeyRouteAffinityFallbackReason reason) {
+    Counter.builder("alternator.affinity.requests.roundrobin")
+        .tag("table", table != null ? table : "unknown")
+        .tag("mode", mode.name())
+        .tag("reason", reason.getTagValue())
+        .register(registry)
+        .increment();
+  }
+
+  @Override
+  public void onPartitionKeyCacheSizeChanged(int size) {
+    cacheSize.set(size);
+  }
+
+  @Override
+  public void onPartitionKeyFailedTableCountChanged(int size) {
+    failedTables.set(size);
+  }
+}
+
+KeyRouteAffinityConfig keyAffinity = KeyRouteAffinityConfig.builder()
+    .withType(KeyRouteAffinity.RMW)
+    .withPkInfo("users", "user_id")
+    .withMetricsCollector(new MicrometerAffinityMetrics(meterRegistry))
+    .build();
+```
+
+For production use, prefer caching the `Counter` instances instead of rebuilding them on every
+callback.
+
 #### How it works
 
 1. The `AffinityQueryPlanInterceptor` intercepts each DynamoDB request

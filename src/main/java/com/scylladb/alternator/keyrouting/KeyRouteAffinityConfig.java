@@ -32,10 +32,16 @@ import java.util.Map;
 public class KeyRouteAffinityConfig {
   private final KeyRouteAffinity type;
   private final Map<String, String> pkInfoPerTable;
+  private final KeyRouteAffinityMetricsCollector metricsCollector;
 
-  private KeyRouteAffinityConfig(KeyRouteAffinity type, Map<String, String> pkInfoPerTable) {
+  private KeyRouteAffinityConfig(
+      KeyRouteAffinity type,
+      Map<String, String> pkInfoPerTable,
+      KeyRouteAffinityMetricsCollector metricsCollector) {
     this.type = type != null ? type : KeyRouteAffinity.NONE;
     this.pkInfoPerTable = Collections.unmodifiableMap(new HashMap<>(pkInfoPerTable));
+    this.metricsCollector =
+        metricsCollector != null ? metricsCollector : KeyRouteAffinityMetricsCollector.NO_OP;
   }
 
   /**
@@ -54,6 +60,17 @@ public class KeyRouteAffinityConfig {
    */
   public Map<String, String> getPkInfoPerTable() {
     return pkInfoPerTable;
+  }
+
+  /**
+   * Returns the configured metrics collector.
+   *
+   * <p>If metrics were not configured, this returns a no-op collector.
+   *
+   * @return the metrics collector, never null
+   */
+  public KeyRouteAffinityMetricsCollector getMetricsCollector() {
+    return metricsCollector;
   }
 
   /**
@@ -81,13 +98,18 @@ public class KeyRouteAffinityConfig {
    * @return a new config instance
    */
   public static KeyRouteAffinityConfig of(KeyRouteAffinity type) {
-    return new KeyRouteAffinityConfig(type, Collections.<String, String>emptyMap());
+    return new KeyRouteAffinityConfig(
+        type,
+        Collections.<String, String>emptyMap(),
+        KeyRouteAffinityMetricsCollector.NO_OP);
   }
 
   /** Builder for {@link KeyRouteAffinityConfig}. */
   public static class Builder {
     private KeyRouteAffinity type = KeyRouteAffinity.NONE;
     private final Map<String, String> pkInfoPerTable = new HashMap<>();
+    private KeyRouteAffinityMetricsCollector metricsCollector =
+        KeyRouteAffinityMetricsCollector.NO_OP;
 
     Builder() {}
 
@@ -130,12 +152,28 @@ public class KeyRouteAffinityConfig {
     }
 
     /**
+     * Sets an optional metrics collector for affinity decisions and partition-key discovery.
+     *
+     * <p>Pass {@code null} to disable metrics collection.
+     *
+     * @param metricsCollector the metrics collector to use
+     * @return this builder
+     */
+    public Builder withMetricsCollector(KeyRouteAffinityMetricsCollector metricsCollector) {
+      this.metricsCollector =
+          metricsCollector != null
+              ? metricsCollector
+              : KeyRouteAffinityMetricsCollector.NO_OP;
+      return this;
+    }
+
+    /**
      * Builds the configuration.
      *
      * @return a new KeyRouteAffinityConfig instance
      */
     public KeyRouteAffinityConfig build() {
-      return new KeyRouteAffinityConfig(type, pkInfoPerTable);
+      return new KeyRouteAffinityConfig(type, pkInfoPerTable, metricsCollector);
     }
   }
 }
