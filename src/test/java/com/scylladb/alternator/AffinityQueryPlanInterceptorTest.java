@@ -4,6 +4,7 @@ import static org.junit.Assert.*;
 import static org.mockito.Mockito.*;
 
 import com.scylladb.alternator.internal.AlternatorLiveNodes;
+import com.scylladb.alternator.keyrouting.AttributeValueHasher;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinity;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinityConfig;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetricLabels;
@@ -1802,13 +1803,39 @@ public class AffinityQueryPlanInterceptorTest {
                           && record.getParameters() != null
                           && record.getParameters().length == 3
                           && TABLE_NAME.equals(record.getParameters()[0])
-                          && record.getParameters()[1] != null
+                          && Long.toUnsignedString(
+                                  AttributeValueHasher.hash(makeItem().get(PK_NAME)), 16)
+                              .equals(record.getParameters()[1])
                           && record.getParameters()[2] instanceof URI));
     } finally {
       logger.removeHandler(handler);
       logger.setUseParentHandlers(originalUseParentHandlers);
       logger.setLevel(originalLevel);
     }
+  }
+
+  @Test
+  public void testMetricsWhenTableNameMissingUseUnknownTableLabel() {
+    RecordingMetrics metrics = new RecordingMetrics();
+    KeyRouteAffinityConfig config =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.ANY_WRITE)
+            .withMetrics(metrics)
+            .build();
+    AlternatorLiveNodes liveNodes = new MockAlternatorLiveNodes(testNodeUris);
+    AffinityQueryPlanInterceptor interceptor = new AffinityQueryPlanInterceptor(config, liveNodes);
+    ExecutionAttributes executionAttributes = new ExecutionAttributes();
+    UpdateItemRequest request = UpdateItemRequest.builder().key(makeKey()).build();
+    Context.BeforeExecution beforeExecution = mock(Context.BeforeExecution.class);
+    when(beforeExecution.request()).thenReturn(request);
+
+    interceptor.beforeExecution(beforeExecution, executionAttributes);
+
+    assertEquals(1, metrics.requestsTotal);
+    assertEquals(0, metrics.requestsAffinity);
+    assertEquals(1, metrics.requestsRoundRobin);
+    assertEquals(KeyRouteAffinityMetricLabels.UNKNOWN_TABLE, metrics.lastRequestTable);
+    assertEquals(KeyRouteAffinityMetricLabels.TABLE_NAME_MISSING, metrics.lastSkipReason);
   }
 
   @Test
@@ -1857,6 +1884,7 @@ public class AffinityQueryPlanInterceptorTest {
       assertEquals(1, metrics.requestsRoundRobin);
       assertEquals(0, metrics.cacheHits);
       assertEquals(1, metrics.cacheMisses);
+      assertEquals(0, metrics.discoveryTriggered);
       assertEquals(KeyRouteAffinityMetricLabels.PK_NOT_CACHED, metrics.lastSkipReason);
       assertTrue(
           records.stream()
@@ -1931,11 +1959,14 @@ public class AffinityQueryPlanInterceptorTest {
     int requestsRoundRobin;
     int cacheHits;
     int cacheMisses;
+    int discoveryTriggered;
+    String lastRequestTable;
     String lastSkipReason;
 
     @Override
     public void onRequest(String tableName, KeyRouteAffinity mode) {
       requestsTotal++;
+      lastRequestTable = tableName;
     }
 
     @Override
@@ -1957,6 +1988,11 @@ public class AffinityQueryPlanInterceptorTest {
     @Override
     public void onPartitionKeyCacheMiss(String tableName) {
       cacheMisses++;
+    }
+
+    @Override
+    public void onPartitionKeyDiscoveryTriggered(String tableName) {
+      discoveryTriggered++;
     }
   }
 

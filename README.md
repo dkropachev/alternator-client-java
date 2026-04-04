@@ -946,8 +946,8 @@ Request-level debug logging is available at JUL `FINE` level from
 Partition-key discovery success/failure events are logged at `INFO` level from
 `com.scylladb.alternator.keyrouting.PartitionKeyResolver`.
 
-**Operational note:** request-level debug logs include a partition-key fingerprint derived from
-the hashed routing key, not the raw key value. Enable `FINE` logging only in trusted environments.
+**Operational note:** request-level debug logs include a partition-key fingerprint derived from the
+hashed routing key, not the raw key value. Enable `FINE` logging only in trusted environments.
 
 Example log messages:
 
