@@ -184,4 +184,17 @@ public class KeyRouteAffinityConfigTest {
     assertTrue(KeyRouteAffinityConfig.of(KeyRouteAffinity.RMW).isEnabled());
     assertTrue(KeyRouteAffinityConfig.of(KeyRouteAffinity.ANY_WRITE).isEnabled());
   }
+
+  @Test
+  public void testBuilderWithMetricsCallback() {
+    KeyRouteAffinityMetrics metrics = new KeyRouteAffinityMetrics() {};
+
+    KeyRouteAffinityConfig config =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.RMW)
+            .withMetrics(metrics)
+            .build();
+
+    assertSame(metrics, config.getMetrics());
+  }
 }

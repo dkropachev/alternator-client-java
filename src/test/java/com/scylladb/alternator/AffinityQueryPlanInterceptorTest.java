@@ -1,10 +1,13 @@
 package com.scylladb.alternator;
 
 import static org.junit.Assert.*;
+import static org.mockito.Mockito.*;
 
 import com.scylladb.alternator.internal.AlternatorLiveNodes;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinity;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinityConfig;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetricLabels;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetrics;
 import com.scylladb.alternator.queryplan.AffinityQueryPlanInterceptor;
 import com.scylladb.alternator.queryplan.BasicQueryPlanInterceptor;
 import java.io.ByteArrayInputStream;
@@ -13,17 +16,25 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider;
 import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
+import software.amazon.awssdk.core.interceptor.Context;
+import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
 import software.amazon.awssdk.http.AbortableInputStream;
 import software.amazon.awssdk.http.ExecutableHttpRequest;
 import software.amazon.awssdk.http.HttpExecuteRequest;
 import software.amazon.awssdk.http.HttpExecuteResponse;
 import software.amazon.awssdk.http.SdkHttpClient;
 import software.amazon.awssdk.http.SdkHttpFullResponse;
+import software.amazon.awssdk.http.SdkHttpMethod;
+import software.amazon.awssdk.http.SdkHttpRequest;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeAction;
@@ -1734,6 +1745,138 @@ public class AffinityQueryPlanInterceptorTest {
     }
   }
 
+  @Test
+  public void testMetricsAndDebugLogWhenAffinityApplied() {
+    RecordingMetrics metrics = new RecordingMetrics();
+    KeyRouteAffinityConfig config =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.ANY_WRITE)
+            .withPkInfo(TABLE_NAME, PK_NAME)
+            .withMetrics(metrics)
+            .build();
+    Logger logger = Logger.getLogger(AffinityQueryPlanInterceptor.class.getName());
+    List<LogRecord> records = new ArrayList<>();
+    Handler handler = new CapturingHandler(records);
+    Level originalLevel = logger.getLevel();
+    boolean originalUseParentHandlers = logger.getUseParentHandlers();
+
+    handler.setLevel(Level.ALL);
+    logger.addHandler(handler);
+    logger.setUseParentHandlers(false);
+    logger.setLevel(Level.FINE);
+    try {
+      AlternatorLiveNodes liveNodes = new MockAlternatorLiveNodes(testNodeUris);
+      AffinityQueryPlanInterceptor interceptor =
+          new AffinityQueryPlanInterceptor(config, liveNodes);
+      ExecutionAttributes executionAttributes = new ExecutionAttributes();
+      PutItemRequest request =
+          PutItemRequest.builder().tableName(TABLE_NAME).item(makeItem()).build();
+      Context.BeforeExecution beforeExecution = mock(Context.BeforeExecution.class);
+      when(beforeExecution.request()).thenReturn(request);
+      Context.ModifyHttpRequest modifyHttpRequest = mock(Context.ModifyHttpRequest.class);
+      when(modifyHttpRequest.httpRequest())
+          .thenReturn(
+              SdkHttpRequest.builder()
+                  .protocol("http")
+                  .host("localhost")
+                  .port(8000)
+                  .method(SdkHttpMethod.POST)
+                  .encodedPath("/")
+                  .build());
+
+      interceptor.beforeExecution(beforeExecution, executionAttributes);
+      interceptor.modifyHttpRequest(modifyHttpRequest, executionAttributes);
+
+      assertEquals(1, metrics.requestsTotal);
+      assertEquals(1, metrics.requestsAffinity);
+      assertEquals(0, metrics.requestsRoundRobin);
+      assertEquals(1, metrics.cacheHits);
+      assertEquals(0, metrics.cacheMisses);
+      assertTrue(
+          records.stream()
+              .anyMatch(
+                  record ->
+                      record.getLevel() == Level.FINE
+                          && "Key affinity applied: table={0}, pk_fingerprint={1}, target={2}"
+                              .equals(record.getMessage())
+                          && record.getParameters() != null
+                          && record.getParameters().length == 3
+                          && TABLE_NAME.equals(record.getParameters()[0])
+                          && record.getParameters()[1] != null
+                          && record.getParameters()[2] instanceof URI));
+    } finally {
+      logger.removeHandler(handler);
+      logger.setUseParentHandlers(originalUseParentHandlers);
+      logger.setLevel(originalLevel);
+    }
+  }
+
+  @Test
+  public void testMetricsAndDebugLogWhenAffinitySkippedForMissingPkCache() {
+    RecordingMetrics metrics = new RecordingMetrics();
+    KeyRouteAffinityConfig config =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.ANY_WRITE)
+            .withMetrics(metrics)
+            .build();
+    Logger logger = Logger.getLogger(AffinityQueryPlanInterceptor.class.getName());
+    List<LogRecord> records = new ArrayList<>();
+    Handler handler = new CapturingHandler(records);
+    Level originalLevel = logger.getLevel();
+    boolean originalUseParentHandlers = logger.getUseParentHandlers();
+
+    handler.setLevel(Level.ALL);
+    logger.addHandler(handler);
+    logger.setUseParentHandlers(false);
+    logger.setLevel(Level.FINE);
+    try {
+      AlternatorLiveNodes liveNodes = new MockAlternatorLiveNodes(testNodeUris);
+      AffinityQueryPlanInterceptor interceptor =
+          new AffinityQueryPlanInterceptor(config, liveNodes);
+      ExecutionAttributes executionAttributes = new ExecutionAttributes();
+      PutItemRequest request =
+          PutItemRequest.builder().tableName(TABLE_NAME).item(makeItem()).build();
+      Context.BeforeExecution beforeExecution = mock(Context.BeforeExecution.class);
+      when(beforeExecution.request()).thenReturn(request);
+      Context.ModifyHttpRequest modifyHttpRequest = mock(Context.ModifyHttpRequest.class);
+      when(modifyHttpRequest.httpRequest())
+          .thenReturn(
+              SdkHttpRequest.builder()
+                  .protocol("http")
+                  .host("localhost")
+                  .port(8000)
+                  .method(SdkHttpMethod.POST)
+                  .encodedPath("/")
+                  .build());
+
+      interceptor.beforeExecution(beforeExecution, executionAttributes);
+      interceptor.modifyHttpRequest(modifyHttpRequest, executionAttributes);
+
+      assertEquals(1, metrics.requestsTotal);
+      assertEquals(0, metrics.requestsAffinity);
+      assertEquals(1, metrics.requestsRoundRobin);
+      assertEquals(0, metrics.cacheHits);
+      assertEquals(1, metrics.cacheMisses);
+      assertEquals(KeyRouteAffinityMetricLabels.PK_NOT_CACHED, metrics.lastSkipReason);
+      assertTrue(
+          records.stream()
+              .anyMatch(
+                  record ->
+                      record.getLevel() == Level.FINE
+                          && "Key affinity skipped: table={0}, reason={1}"
+                              .equals(record.getMessage())
+                          && record.getParameters() != null
+                          && record.getParameters().length == 2
+                          && TABLE_NAME.equals(record.getParameters()[0])
+                          && KeyRouteAffinityMetricLabels.PK_NOT_CACHED.equals(
+                              record.getParameters()[1])));
+    } finally {
+      logger.removeHandler(handler);
+      logger.setUseParentHandlers(originalUseParentHandlers);
+      logger.setLevel(originalLevel);
+    }
+  }
+
   // ========== Mock implementations ==========
 
   /**
@@ -1780,6 +1923,60 @@ public class AffinityQueryPlanInterceptorTest {
     public List<URI> getLiveNodes() {
       return Collections.unmodifiableList(new ArrayList<>(nodes));
     }
+  }
+
+  private static class RecordingMetrics implements KeyRouteAffinityMetrics {
+    int requestsTotal;
+    int requestsAffinity;
+    int requestsRoundRobin;
+    int cacheHits;
+    int cacheMisses;
+    String lastSkipReason;
+
+    @Override
+    public void onRequest(String tableName, KeyRouteAffinity mode) {
+      requestsTotal++;
+    }
+
+    @Override
+    public void onAffinityApplied(String tableName, KeyRouteAffinity mode) {
+      requestsAffinity++;
+    }
+
+    @Override
+    public void onAffinitySkipped(String tableName, KeyRouteAffinity mode, String reason) {
+      requestsRoundRobin++;
+      lastSkipReason = reason;
+    }
+
+    @Override
+    public void onPartitionKeyCacheHit(String tableName) {
+      cacheHits++;
+    }
+
+    @Override
+    public void onPartitionKeyCacheMiss(String tableName) {
+      cacheMisses++;
+    }
+  }
+
+  private static class CapturingHandler extends Handler {
+    private final List<LogRecord> records;
+
+    CapturingHandler(List<LogRecord> records) {
+      this.records = records;
+    }
+
+    @Override
+    public void publish(LogRecord record) {
+      records.add(record);
+    }
+
+    @Override
+    public void flush() {}
+
+    @Override
+    public void close() {}
   }
 
   /**
