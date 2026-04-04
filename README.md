@@ -737,7 +737,7 @@ DynamoDbClient client = AlternatorDynamoDbClient.builder()
 |------|-------------|
 | `KeyRouteAffinity.NONE` | Default — standard round-robin load balancing |
 | `KeyRouteAffinity.RMW` | Optimize read-before-write operations (conditional updates/puts/deletes with `ConditionExpression`, `Expected`, or non-NONE `ReturnValues`) |
-| `KeyRouteAffinity.ANY_WRITE` | Optimize all write operations (`PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem`) |
+| `KeyRouteAffinity.ANY_WRITE` | Optimize single-item write operations (`PutItem`, `UpdateItem`, `DeleteItem`) |
 
 #### Pre-configuring partition key names
 
@@ -767,6 +767,196 @@ DynamoDbClient client = AlternatorDynamoDbClient.builder()
 3. A deterministic hash (MurmurHash3) of the partition key selects a consistent node
 4. All requests for the same partition key are routed to the same Alternator node
 5. Non-qualifying operations continue to use round-robin load balancing
+
+#### Observability: metrics and debug logging
+
+Metrics are disabled by default. To enable them, configure the backend-agnostic
+`KeyRouteAffinityMetrics` callback interface:
+
+```java
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetrics;
+
+KeyRouteAffinityConfig keyAffinity = KeyRouteAffinityConfig.builder()
+    .withType(KeyRouteAffinity.RMW)
+    .withPkInfo("users", "user_id")
+    .withMetrics(new MyAffinityMetrics())
+    .build();
+```
+
+When configured, the library emits callbacks for these canonical metric names:
+
+| Metric | Description |
+|--------|-------------|
+| `alternator.affinity.requests.total` | Total requests processed by the affinity interceptor |
+| `alternator.affinity.requests.affinity` | Requests routed with deterministic key affinity |
+| `alternator.affinity.requests.roundrobin` | Requests that fell back to round-robin |
+| `alternator.affinity.pk.cache.hits` | Partition-key cache hits |
+| `alternator.affinity.pk.cache.misses` | Partition-key cache misses |
+| `alternator.affinity.pk.discovery.triggered` | PK discovery attempts triggered |
+| `alternator.affinity.pk.discovery.success` | Successful PK discoveries |
+| `alternator.affinity.pk.discovery.failed` | Failed PK discoveries |
+| `alternator.affinity.pk.cache.size` | Cached table→partition-key mappings |
+| `alternator.affinity.pk.failed.tables` | Tables currently in discovery failure cooldown |
+
+Recommended labels/tags:
+
+- `table`
+- `mode`
+- `reason`
+
+Common `reason` values include:
+
+- `not_qualifying_request`
+- `table_name_missing`
+- `pk_not_cached`
+- `pk_value_missing`
+- `no_hash_key`
+- `resource_not_found`
+- `access_denied`
+- `validation_error`
+- `client_error`
+- `transient_error`
+- `unexpected_error`
+
+Example bridge to Prometheus:
+
+```java
+import com.scylladb.alternator.keyrouting.KeyRouteAffinity;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetrics;
+import io.prometheus.client.Counter;
+import io.prometheus.client.Gauge;
+
+public final class PrometheusAffinityMetrics implements KeyRouteAffinityMetrics {
+  private final Counter requestsTotal =
+      Counter.build()
+          .name("alternator_affinity_requests_total")
+          .help("Requests processed by the affinity interceptor")
+          .labelNames("table", "mode")
+          .register();
+  private final Counter requestsAffinity =
+      Counter.build()
+          .name("alternator_affinity_requests_affinity")
+          .help("Requests routed with key affinity")
+          .labelNames("table", "mode")
+          .register();
+  private final Counter requestsRoundRobin =
+      Counter.build()
+          .name("alternator_affinity_requests_roundrobin")
+          .help("Requests that fell back to round-robin")
+          .labelNames("table", "mode", "reason")
+          .register();
+  private final Counter pkCacheHits =
+      Counter.build()
+          .name("alternator_affinity_pk_cache_hits")
+          .help("Partition-key cache hits")
+          .labelNames("table")
+          .register();
+  private final Counter pkCacheMisses =
+      Counter.build()
+          .name("alternator_affinity_pk_cache_misses")
+          .help("Partition-key cache misses")
+          .labelNames("table")
+          .register();
+  private final Counter pkDiscoveryTriggered =
+      Counter.build()
+          .name("alternator_affinity_pk_discovery_triggered")
+          .help("Partition-key discovery attempts")
+          .labelNames("table")
+          .register();
+  private final Counter pkDiscoverySuccess =
+      Counter.build()
+          .name("alternator_affinity_pk_discovery_success")
+          .help("Successful partition-key discoveries")
+          .labelNames("table")
+          .register();
+  private final Counter pkDiscoveryFailed =
+      Counter.build()
+          .name("alternator_affinity_pk_discovery_failed")
+          .help("Failed partition-key discoveries")
+          .labelNames("table", "reason")
+          .register();
+  private final Gauge pkCacheSize =
+      Gauge.build()
+          .name("alternator_affinity_pk_cache_size")
+          .help("Partition-key cache size")
+          .register();
+  private final Gauge pkFailedTables =
+      Gauge.build()
+          .name("alternator_affinity_pk_failed_tables")
+          .help("Tables currently in discovery failure cooldown")
+          .register();
+
+  @Override
+  public void onRequest(String tableName, KeyRouteAffinity mode) {
+    requestsTotal.labels(tableName, mode.name()).inc();
+  }
+
+  @Override
+  public void onAffinityApplied(String tableName, KeyRouteAffinity mode) {
+    requestsAffinity.labels(tableName, mode.name()).inc();
+  }
+
+  @Override
+  public void onAffinitySkipped(String tableName, KeyRouteAffinity mode, String reason) {
+    requestsRoundRobin.labels(tableName, mode.name(), reason).inc();
+  }
+
+  @Override
+  public void onPartitionKeyCacheHit(String tableName) {
+    pkCacheHits.labels(tableName).inc();
+  }
+
+  @Override
+  public void onPartitionKeyCacheMiss(String tableName) {
+    pkCacheMisses.labels(tableName).inc();
+  }
+
+  @Override
+  public void onPartitionKeyDiscoveryTriggered(String tableName) {
+    pkDiscoveryTriggered.labels(tableName).inc();
+  }
+
+  @Override
+  public void onPartitionKeyDiscoverySucceeded(String tableName, String partitionKeyName) {
+    pkDiscoverySuccess.labels(tableName).inc();
+  }
+
+  @Override
+  public void onPartitionKeyDiscoveryFailed(String tableName, String reason) {
+    pkDiscoveryFailed.labels(tableName, reason).inc();
+  }
+
+  @Override
+  public void onPartitionKeyCacheSizeChanged(int size) {
+    pkCacheSize.set(size);
+  }
+
+  @Override
+  public void onPartitionKeyFailedTablesChanged(int count) {
+    pkFailedTables.set(count);
+  }
+}
+```
+
+The Prometheus bridge above is an example only. This library does not depend on any specific
+metrics backend.
+
+Request-level debug logging is available at JUL `FINE` level from
+`com.scylladb.alternator.queryplan.AffinityQueryPlanInterceptor`.
+Partition-key discovery success/failure events are logged at `INFO` level from
+`com.scylladb.alternator.keyrouting.PartitionKeyResolver`.
+
+**Operational note:** request-level debug logs include a partition-key fingerprint derived from the
+hashed routing key, not the raw key value. Enable `FINE` logging only in trusted environments.
+
+Example log messages:
+
+```text
+Key affinity applied: table=users, pk_fingerprint=4f7c2d9e1a3b5c6d, target=https://192.168.1.5:8043
+Key affinity skipped: table=users, reason=not_qualifying_request
+PK discovery completed: table=orders, pk_attribute=order_id
+PK discovery failed: table=unknown_table, reason=resource_not_found
+```
 
 #### When to use key route affinity
 
