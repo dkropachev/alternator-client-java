@@ -32,10 +32,13 @@ import java.util.Map;
 public class KeyRouteAffinityConfig {
   private final KeyRouteAffinity type;
   private final Map<String, String> pkInfoPerTable;
+  private final KeyRouteAffinityMetrics metrics;
 
-  private KeyRouteAffinityConfig(KeyRouteAffinity type, Map<String, String> pkInfoPerTable) {
+  private KeyRouteAffinityConfig(
+      KeyRouteAffinity type, Map<String, String> pkInfoPerTable, KeyRouteAffinityMetrics metrics) {
     this.type = type != null ? type : KeyRouteAffinity.NONE;
     this.pkInfoPerTable = Collections.unmodifiableMap(new HashMap<>(pkInfoPerTable));
+    this.metrics = metrics;
   }
 
   /**
@@ -54,6 +57,15 @@ public class KeyRouteAffinityConfig {
    */
   public Map<String, String> getPkInfoPerTable() {
     return pkInfoPerTable;
+  }
+
+  /**
+   * Returns the optional metrics callback.
+   *
+   * @return the metrics callback, or null when metrics are disabled
+   */
+  public KeyRouteAffinityMetrics getMetrics() {
+    return metrics;
   }
 
   /**
@@ -81,13 +93,14 @@ public class KeyRouteAffinityConfig {
    * @return a new config instance
    */
   public static KeyRouteAffinityConfig of(KeyRouteAffinity type) {
-    return new KeyRouteAffinityConfig(type, Collections.<String, String>emptyMap());
+    return new KeyRouteAffinityConfig(type, Collections.<String, String>emptyMap(), null);
   }
 
   /** Builder for {@link KeyRouteAffinityConfig}. */
   public static class Builder {
     private KeyRouteAffinity type = KeyRouteAffinity.NONE;
     private final Map<String, String> pkInfoPerTable = new HashMap<>();
+    private KeyRouteAffinityMetrics metrics;
 
     Builder() {}
 
@@ -130,12 +143,26 @@ public class KeyRouteAffinityConfig {
     }
 
     /**
+     * Sets the optional metrics callback.
+     *
+     * <p>When not configured, no metrics callbacks are emitted and request processing only pays a
+     * null-check overhead.
+     *
+     * @param metrics the metrics callback, or null to disable metrics
+     * @return this builder
+     */
+    public Builder withMetrics(KeyRouteAffinityMetrics metrics) {
+      this.metrics = metrics;
+      return this;
+    }
+
+    /**
      * Builds the configuration.
      *
      * @return a new KeyRouteAffinityConfig instance
      */
     public KeyRouteAffinityConfig build() {
-      return new KeyRouteAffinityConfig(type, pkInfoPerTable);
+      return new KeyRouteAffinityConfig(type, pkInfoPerTable, metrics);
     }
   }
 }

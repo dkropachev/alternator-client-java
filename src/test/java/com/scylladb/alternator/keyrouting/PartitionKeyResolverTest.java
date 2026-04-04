@@ -6,10 +6,15 @@ import static org.mockito.Mockito.*;
 
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -33,10 +38,12 @@ public class PartitionKeyResolverTest {
 
   private PartitionKeyResolver resolver;
   private DynamoDbClient mockClient;
+  private RecordingMetrics metrics;
 
   @Before
   public void setUp() {
-    resolver = new PartitionKeyResolver(null);
+    metrics = new RecordingMetrics();
+    resolver = new PartitionKeyResolver(null, metrics);
     mockClient = mock(DynamoDbClient.class);
   }
 
@@ -262,6 +269,8 @@ public class PartitionKeyResolverTest {
     assertEquals(PartitionKeyResolver.MAX_RETRIES + 1, attempts.get());
     // Transient failures allow immediate retry via triggerDiscovery
     assertFalse(resolver.isInFailureCooldown("failing"));
+    assertEquals(0, resolver.getFailedTableCount());
+    assertEquals(0, metrics.lastFailedTableCount);
   }
 
   // ========== Failure cooldown tests ==========
@@ -313,6 +322,72 @@ public class PartitionKeyResolverTest {
 
     resolver.clearFailure("missing1");
     assertEquals(1, resolver.getFailedTableCount());
+  }
+
+  @Test
+  public void testMetricsOnSuccessfulDiscovery() throws Exception {
+    DescribeTableResponse response = createDescribeTableResponse("account_id");
+    CountDownLatch latch = new CountDownLatch(1);
+
+    when(mockClient.describeTable(any(DescribeTableRequest.class)))
+        .thenAnswer(
+            invocation -> {
+              latch.countDown();
+              return response;
+            });
+
+    resolver.triggerDiscovery("accounts", mockClient);
+
+    assertTrue(latch.await(5, TimeUnit.SECONDS));
+    Thread.sleep(100);
+
+    assertEquals(1, metrics.discoveryTriggered);
+    assertEquals(1, metrics.discoverySucceeded);
+    assertEquals("accounts", metrics.lastDiscoveryTable);
+    assertEquals("account_id", metrics.lastDiscoveredPkName);
+    assertEquals(1, metrics.lastCacheSize);
+    assertEquals(0, metrics.lastFailedTableCount);
+  }
+
+  @Test
+  public void testMetricsAndInfoLogOnDiscoveryFailure() throws Exception {
+    Logger logger = Logger.getLogger(PartitionKeyResolver.class.getName());
+    List<LogRecord> records = new java.util.ArrayList<>();
+    Handler handler = new CapturingHandler(records);
+    Level originalLevel = logger.getLevel();
+
+    logger.addHandler(handler);
+    logger.setLevel(Level.INFO);
+    try {
+      CountDownLatch latch = new CountDownLatch(1);
+      when(mockClient.describeTable(any(DescribeTableRequest.class)))
+          .thenAnswer(
+              invocation -> {
+                latch.countDown();
+                throw ResourceNotFoundException.builder().message("Not found").build();
+              });
+
+      resolver.triggerDiscovery("missing_table", mockClient);
+
+      assertTrue(latch.await(5, TimeUnit.SECONDS));
+      Thread.sleep(100);
+
+      assertEquals(1, metrics.discoveryFailed);
+      assertEquals("missing_table", metrics.lastDiscoveryTable);
+      assertEquals(KeyRouteAffinityMetricLabels.RESOURCE_NOT_FOUND, metrics.lastFailureReason);
+      assertEquals(1, metrics.lastFailedTableCount);
+      assertTrue(
+          records.stream()
+              .anyMatch(
+                  record ->
+                      record.getLevel() == Level.INFO
+                          && record
+                              .getMessage()
+                              .contains("PK discovery failed: table={0}, reason={1}")));
+    } finally {
+      logger.removeHandler(handler);
+      logger.setLevel(originalLevel);
+    }
   }
 
   @Test
@@ -398,5 +473,65 @@ public class PartitionKeyResolverTest {
                             .build()))
                 .build())
         .build();
+  }
+
+  private static class RecordingMetrics implements KeyRouteAffinityMetrics {
+    int discoveryTriggered;
+    int discoverySucceeded;
+    int discoveryFailed;
+    int lastCacheSize;
+    int lastFailedTableCount;
+    String lastDiscoveryTable;
+    String lastDiscoveredPkName;
+    String lastFailureReason;
+
+    @Override
+    public void onPartitionKeyDiscoveryTriggered(String tableName) {
+      discoveryTriggered++;
+      lastDiscoveryTable = tableName;
+    }
+
+    @Override
+    public void onPartitionKeyDiscoverySucceeded(String tableName, String partitionKeyName) {
+      discoverySucceeded++;
+      lastDiscoveryTable = tableName;
+      lastDiscoveredPkName = partitionKeyName;
+    }
+
+    @Override
+    public void onPartitionKeyDiscoveryFailed(String tableName, String reason) {
+      discoveryFailed++;
+      lastDiscoveryTable = tableName;
+      lastFailureReason = reason;
+    }
+
+    @Override
+    public void onPartitionKeyCacheSizeChanged(int size) {
+      lastCacheSize = size;
+    }
+
+    @Override
+    public void onPartitionKeyFailedTablesChanged(int count) {
+      lastFailedTableCount = count;
+    }
+  }
+
+  private static class CapturingHandler extends Handler {
+    private final List<LogRecord> records;
+
+    CapturingHandler(List<LogRecord> records) {
+      this.records = records;
+    }
+
+    @Override
+    public void publish(LogRecord record) {
+      records.add(record);
+    }
+
+    @Override
+    public void flush() {}
+
+    @Override
+    public void close() {}
   }
 }
