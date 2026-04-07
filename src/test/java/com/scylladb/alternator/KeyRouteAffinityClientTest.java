@@ -1,10 +1,15 @@
 package com.scylladb.alternator;
 
 import static org.junit.Assert.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.*;
 
 import com.scylladb.alternator.internal.AlternatorLiveNodes;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinity;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinityConfig;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetricLabels;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetrics;
 import com.scylladb.alternator.queryplan.AffinityQueryPlanInterceptor;
 import com.scylladb.alternator.queryplan.BasicQueryPlanInterceptor;
 import java.io.ByteArrayInputStream;
@@ -1101,6 +1106,60 @@ public class KeyRouteAffinityClientTest {
       CapturedRequest(URI uri) {
         this.uri = uri;
       }
+    }
+  }
+
+  @Test
+  public void testAffinityAppliedInvokesMetricsCallback() {
+    KeyRouteAffinityMetrics metricsCallback = mock(KeyRouteAffinityMetrics.class);
+    KeyRouteAffinityConfig keyAffinity =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.ANY_WRITE)
+            .withPkInfo("users", "user_id")
+            .withMetrics(metricsCallback)
+            .build();
+
+    DynamoDbClient client = createClientWithKeyAffinity(keyAffinity);
+
+    try {
+      Map<String, AttributeValue> item = new HashMap<>();
+      item.put("user_id", AttributeValue.builder().s("user-123").build());
+
+      client.putItem(PutItemRequest.builder().tableName("users").item(item).build());
+
+      verify(metricsCallback).onAffinityApplied(eq("users"), eq(KeyRouteAffinity.ANY_WRITE));
+      verify(metricsCallback).onRequest(eq("users"), eq(KeyRouteAffinity.ANY_WRITE));
+      verify(metricsCallback, never()).onAffinitySkipped(any(), any(), any());
+    } finally {
+      client.close();
+    }
+  }
+
+  @Test
+  public void testAffinitySkippedInvokesMetricsCallback() {
+    KeyRouteAffinityMetrics metricsCallback = mock(KeyRouteAffinityMetrics.class);
+    KeyRouteAffinityConfig keyAffinity =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.RMW)
+            .withPkInfo("users", "user_id")
+            .withMetrics(metricsCallback)
+            .build();
+
+    DynamoDbClient client = createClientWithKeyAffinity(keyAffinity);
+
+    try {
+      Map<String, AttributeValue> item = new HashMap<>();
+      item.put("user_id", AttributeValue.builder().s("user-123").build());
+
+      client.putItem(PutItemRequest.builder().tableName("users").item(item).build());
+
+      verify(metricsCallback)
+          .onAffinitySkipped(
+              "users", KeyRouteAffinity.RMW, KeyRouteAffinityMetricLabels.NOT_QUALIFYING_REQUEST);
+      verify(metricsCallback).onRequest(eq("users"), eq(KeyRouteAffinity.RMW));
+      verify(metricsCallback, never()).onAffinityApplied(any(), any());
+    } finally {
+      client.close();
     }
   }
 }

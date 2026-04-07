@@ -20,6 +20,7 @@ public class KeyRouteAffinityConfigTest {
     assertEquals(KeyRouteAffinity.NONE, config.getType());
     assertTrue(config.getPkInfoPerTable().isEmpty());
     assertFalse(config.isEnabled());
+    assertSame(KeyRouteAffinityMetrics.NO_OP, config.getMetrics());
   }
 
   @Test
@@ -112,6 +113,7 @@ public class KeyRouteAffinityConfigTest {
     assertEquals(KeyRouteAffinity.RMW, config.getType());
     assertTrue(config.getPkInfoPerTable().isEmpty());
     assertTrue(config.isEnabled());
+    assertSame(KeyRouteAffinityMetrics.NO_OP, config.getMetrics());
   }
 
   @Test
@@ -128,6 +130,7 @@ public class KeyRouteAffinityConfigTest {
 
     assertEquals(KeyRouteAffinity.NONE, config.getType());
     assertFalse(config.isEnabled());
+    assertSame(KeyRouteAffinityMetrics.NO_OP, config.getMetrics());
   }
 
   @Test
@@ -183,5 +186,25 @@ public class KeyRouteAffinityConfigTest {
     assertFalse(KeyRouteAffinityConfig.of(KeyRouteAffinity.NONE).isEnabled());
     assertTrue(KeyRouteAffinityConfig.of(KeyRouteAffinity.RMW).isEnabled());
     assertTrue(KeyRouteAffinityConfig.of(KeyRouteAffinity.ANY_WRITE).isEnabled());
+  }
+
+  @Test
+  public void testBuilderWithMetricsCallback() {
+    KeyRouteAffinityMetrics callback = new KeyRouteAffinityMetrics() {};
+
+    KeyRouteAffinityConfig config =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.RMW)
+            .withMetrics(callback)
+            .build();
+
+    assertSame(callback, config.getMetrics());
+  }
+
+  @Test
+  public void testBuilderWithNullMetricsCallbackUsesNoOp() {
+    KeyRouteAffinityConfig config = KeyRouteAffinityConfig.builder().withMetrics(null).build();
+
+    assertSame(KeyRouteAffinityMetrics.NO_OP, config.getMetrics());
   }
 }

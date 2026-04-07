@@ -2,6 +2,7 @@ package com.scylladb.alternator;
 
 import com.scylladb.alternator.internal.AlternatorLiveNodes;
 import com.scylladb.alternator.internal.ApacheSyncClientFactory;
+import com.scylladb.alternator.internal.CloseAwareClientProxy;
 import com.scylladb.alternator.internal.CrtSyncClientFactory;
 import com.scylladb.alternator.internal.SyncClientDetector;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinity;
@@ -573,7 +574,8 @@ public class AlternatorDynamoDbClient {
     /** {@inheritDoc} */
     @Override
     public DynamoDbClient build() {
-      return buildWithAlternatorAPI().getClient();
+      AlternatorDynamoDbClientWrapper wrapper = buildWithAlternatorAPI();
+      return CloseAwareClientProxy.wrap(DynamoDbClient.class, wrapper.getClient(), wrapper::close);
     }
 
     /**
