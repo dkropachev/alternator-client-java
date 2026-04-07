@@ -184,4 +184,30 @@ public class KeyRouteAffinityConfigTest {
     assertTrue(KeyRouteAffinityConfig.of(KeyRouteAffinity.RMW).isEnabled());
     assertTrue(KeyRouteAffinityConfig.of(KeyRouteAffinity.ANY_WRITE).isEnabled());
   }
+
+  @Test
+  public void testMetricsAndLoggingDefaults() {
+    KeyRouteAffinityConfig config = KeyRouteAffinityConfig.builder().build();
+
+    assertFalse(config.isMetricsEnabled());
+    assertFalse(config.isDebugLoggingEnabled());
+    assertSame(AffinityMetricsCallback.NO_OP, config.getMetricsCallback());
+  }
+
+  @Test
+  public void testBuilderWithMetricsAndLogging() {
+    AffinityMetricsCallback callback = new AffinityMetricsCallback() {};
+
+    KeyRouteAffinityConfig config =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.ANY_WRITE)
+            .withMetricsEnabled(true)
+            .withDebugLoggingEnabled(true)
+            .withMetricsCallback(callback)
+            .build();
+
+    assertTrue(config.isMetricsEnabled());
+    assertTrue(config.isDebugLoggingEnabled());
+    assertSame(callback, config.getMetricsCallback());
+  }
 }

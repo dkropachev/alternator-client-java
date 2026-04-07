@@ -16,13 +16,23 @@ import java.util.Map;
  * the ThreadLocal-based context passing mechanism may fail due to cross-thread execution. Do not
  * use key route affinity with {@link software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient}.
  *
+ * <p>Metrics and structured decision logging are optional. When disabled, the affinity path keeps
+ * the same behavior as before and avoids metrics callback overhead.
+ *
  * <p>Example usage:
  *
  * <pre>{@code
  * KeyRouteAffinityConfig config = KeyRouteAffinityConfig.builder()
  *     .withType(KeyRouteAffinity.RMW)
  *     .withPkInfo("users", "user_id")
- *     .withPkInfo("orders", "order_id")
+ *     .withMetricsEnabled(true)
+ *     .withDebugLoggingEnabled(true)
+ *     .withMetricsCallback(new AffinityMetricsCallback() {
+ *       @Override
+ *       public void onAffinityApplied(String table, String pkValue, URI targetNode, KeyRouteAffinity mode) {
+ *         // Forward to your metrics backend here.
+ *       }
+ *     })
  *     .build();
  * }</pre>
  *
@@ -32,10 +42,21 @@ import java.util.Map;
 public class KeyRouteAffinityConfig {
   private final KeyRouteAffinity type;
   private final Map<String, String> pkInfoPerTable;
+  private final boolean metricsEnabled;
+  private final boolean debugLoggingEnabled;
+  private final AffinityMetricsCallback metricsCallback;
 
-  private KeyRouteAffinityConfig(KeyRouteAffinity type, Map<String, String> pkInfoPerTable) {
+  private KeyRouteAffinityConfig(
+      KeyRouteAffinity type,
+      Map<String, String> pkInfoPerTable,
+      boolean metricsEnabled,
+      boolean debugLoggingEnabled,
+      AffinityMetricsCallback metricsCallback) {
     this.type = type != null ? type : KeyRouteAffinity.NONE;
     this.pkInfoPerTable = Collections.unmodifiableMap(new HashMap<>(pkInfoPerTable));
+    this.metricsEnabled = metricsEnabled;
+    this.debugLoggingEnabled = debugLoggingEnabled;
+    this.metricsCallback = metricsCallback != null ? metricsCallback : AffinityMetricsCallback.NO_OP;
   }
 
   /**
@@ -66,6 +87,33 @@ public class KeyRouteAffinityConfig {
   }
 
   /**
+   * Returns whether metrics callbacks should be invoked.
+   *
+   * @return true when metrics are enabled
+   */
+  public boolean isMetricsEnabled() {
+    return metricsEnabled;
+  }
+
+  /**
+   * Returns whether detailed affinity decision logging is enabled.
+   *
+   * @return true when debug/info observability logs should be emitted
+   */
+  public boolean isDebugLoggingEnabled() {
+    return debugLoggingEnabled;
+  }
+
+  /**
+   * Returns the configured metrics callback.
+   *
+   * @return the callback, never null
+   */
+  public AffinityMetricsCallback getMetricsCallback() {
+    return metricsCallback;
+  }
+
+  /**
    * Creates a new builder for KeyRouteAffinityConfig.
    *
    * @return a new builder instance
@@ -81,13 +129,21 @@ public class KeyRouteAffinityConfig {
    * @return a new config instance
    */
   public static KeyRouteAffinityConfig of(KeyRouteAffinity type) {
-    return new KeyRouteAffinityConfig(type, Collections.<String, String>emptyMap());
+    return new KeyRouteAffinityConfig(
+        type,
+        Collections.<String, String>emptyMap(),
+        false,
+        false,
+        AffinityMetricsCallback.NO_OP);
   }
 
   /** Builder for {@link KeyRouteAffinityConfig}. */
   public static class Builder {
     private KeyRouteAffinity type = KeyRouteAffinity.NONE;
     private final Map<String, String> pkInfoPerTable = new HashMap<>();
+    private boolean metricsEnabled = false;
+    private boolean debugLoggingEnabled = false;
+    private AffinityMetricsCallback metricsCallback = AffinityMetricsCallback.NO_OP;
 
     Builder() {}
 
@@ -130,12 +186,47 @@ public class KeyRouteAffinityConfig {
     }
 
     /**
+     * Enables or disables metrics callbacks.
+     *
+     * @param enabled true to enable metrics callbacks
+     * @return this builder
+     */
+    public Builder withMetricsEnabled(boolean enabled) {
+      this.metricsEnabled = enabled;
+      return this;
+    }
+
+    /**
+     * Enables or disables additional DEBUG/INFO affinity logging.
+     *
+     * @param enabled true to enable detailed logging
+     * @return this builder
+     */
+    public Builder withDebugLoggingEnabled(boolean enabled) {
+      this.debugLoggingEnabled = enabled;
+      return this;
+    }
+
+    /**
+     * Sets the metrics callback implementation.
+     *
+     * @param metricsCallback callback to receive affinity events
+     * @return this builder
+     */
+    public Builder withMetricsCallback(AffinityMetricsCallback metricsCallback) {
+      this.metricsCallback =
+          metricsCallback != null ? metricsCallback : AffinityMetricsCallback.NO_OP;
+      return this;
+    }
+
+    /**
      * Builds the configuration.
      *
      * @return a new KeyRouteAffinityConfig instance
      */
     public KeyRouteAffinityConfig build() {
-      return new KeyRouteAffinityConfig(type, pkInfoPerTable);
+      return new KeyRouteAffinityConfig(
+          type, pkInfoPerTable, metricsEnabled, debugLoggingEnabled, metricsCallback);
     }
   }
 }
