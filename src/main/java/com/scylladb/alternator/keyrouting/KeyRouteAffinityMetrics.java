@@ -43,6 +43,9 @@ package com.scylladb.alternator.keyrouting;
  */
 public interface KeyRouteAffinityMetrics {
 
+  /** Shared no-op metrics instance. */
+  KeyRouteAffinityMetrics NO_OP = new KeyRouteAffinityMetrics() {};
+
   /**
    * Called for every request processed by the affinity interceptor.
    *

@@ -20,7 +20,7 @@ import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
  * AlternatorDynamoDbClientWrapper wrapper = AlternatorDynamoDbClient.builder()
  *     .endpointOverride(URI.create("http://localhost:8000"))
  *     .credentialsProvider(credentialsProvider)
- *     .build();
+ *     .buildWithAlternatorAPI();
  *
  * // Get the DynamoDB client for normal operations
  * DynamoDbClient client = wrapper.getClient();
@@ -173,7 +173,7 @@ public class AlternatorDynamoDbClientWrapper implements AutoCloseable {
    * <ul>
    *   <li>Shutting down the partition key resolver's discovery executor if key route affinity is
    *       enabled
-   *   <li>Interrupting the LiveNodes background thread
+   *   <li>Requesting LiveNodes shutdown and waiting briefly for the background thread to stop
    *   <li>Closing the polling HTTP client
    *   <li>Closing the underlying DynamoDB client
    * </ul>
@@ -183,11 +183,14 @@ public class AlternatorDynamoDbClientWrapper implements AutoCloseable {
     if (affinityInterceptor != null) {
       affinityInterceptor.getPartitionKeyResolver().shutdown();
     }
-    // Interrupt the LiveNodes thread to stop polling
-    liveNodes.interrupt();
-    // Close the polling HTTP client
+    liveNodes.shutdown();
     if (pollingHttpClient != null) {
       pollingHttpClient.close();
+    }
+    try {
+      liveNodes.join(5000);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
     }
     client.close();
   }

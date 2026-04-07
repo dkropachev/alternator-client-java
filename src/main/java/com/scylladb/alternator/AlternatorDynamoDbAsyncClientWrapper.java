@@ -19,7 +19,7 @@ import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
  * AlternatorDynamoDbAsyncClientWrapper wrapper = AlternatorDynamoDbAsyncClient.builder()
  *     .endpointOverride(URI.create("http://localhost:8000"))
  *     .credentialsProvider(credentialsProvider)
- *     .build();
+ *     .buildWithAlternatorAPI();
  *
  * // Get the DynamoDB async client for normal operations
  * DynamoDbAsyncClient client = wrapper.getClient();
@@ -145,18 +145,21 @@ public class AlternatorDynamoDbAsyncClientWrapper implements AutoCloseable {
    * <p>This includes:
    *
    * <ul>
-   *   <li>Interrupting the LiveNodes background thread
+   *   <li>Requesting LiveNodes shutdown and waiting briefly for the background thread to stop
    *   <li>Closing the polling HTTP client
    *   <li>Closing the underlying async DynamoDB client
    * </ul>
    */
   @Override
   public void close() {
-    // Interrupt the LiveNodes thread to stop polling
-    liveNodes.interrupt();
-    // Close the polling HTTP client
+    liveNodes.shutdown();
     if (pollingHttpClient != null) {
       pollingHttpClient.close();
+    }
+    try {
+      liveNodes.join(5000);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
     }
     client.close();
   }

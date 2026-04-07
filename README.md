@@ -760,6 +760,116 @@ DynamoDbClient client = AlternatorDynamoDbClient.builder()
     .build();
 ```
 
+#### Metrics and debug logging
+
+Key route affinity can publish optional observability callbacks for request routing, partition-key
+cache activity, and auto-discovery outcomes. Metrics are disabled by default and become active only
+when you attach an `KeyRouteAffinityMetrics`.
+
+```java
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetrics;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+
+MeterRegistry registry = ...;
+AtomicInteger cacheSize = new AtomicInteger();
+AtomicInteger failedTables = new AtomicInteger();
+
+KeyRouteAffinityMetrics metrics = new KeyRouteAffinityMetrics() {
+    @Override
+    public void onAffinityApplied(
+            String table, KeyRouteAffinity mode, AttributeValue pkValue, URI targetNode) {
+        registry.counter(
+                "alternator.affinity.requests.total",
+                "table", table,
+                "mode", mode.name())
+            .increment();
+        registry.counter(
+                "alternator.affinity.requests.affinity",
+                "table", table,
+                "mode", mode.name())
+            .increment();
+    }
+
+    @Override
+    public void onAffinitySkipped(String table, KeyRouteAffinity mode, String reason) {
+        String effectiveTable = table == null ? "unknown" : table;
+        registry.counter(
+                "alternator.affinity.requests.total",
+                "table", effectiveTable,
+                "mode", mode.name())
+            .increment();
+        registry.counter(
+                "alternator.affinity.requests.roundrobin",
+                "table", effectiveTable,
+                "mode", mode.name(),
+                "reason", reason)
+            .increment();
+    }
+
+    @Override
+    public void onPartitionKeyCacheHit(String table) {
+        registry.counter("alternator.affinity.pk.cache.hits", "table", table).increment();
+    }
+
+    @Override
+    public void onPartitionKeyCacheMiss(String table) {
+        registry.counter("alternator.affinity.pk.cache.misses", "table", table).increment();
+    }
+
+    @Override
+    public void onPartitionKeyDiscoveryTriggered(String table) {
+        registry.counter("alternator.affinity.pk.discovery.triggered", "table", table).increment();
+    }
+
+    @Override
+    public void onPartitionKeyDiscoverySucceeded(String table, String pkAttributeName) {
+        registry.counter("alternator.affinity.pk.discovery.success", "table", table).increment();
+    }
+
+    @Override
+    public void onPartitionKeyDiscoveryFailed(String table, String reason) {
+        registry.counter(
+                "alternator.affinity.pk.discovery.failed",
+                "table", table,
+                "reason", reason)
+            .increment();
+    }
+
+    @Override
+    public void onPartitionKeyCacheSizeChanged(int size) {
+        cacheSize.set(size);
+    }
+
+    @Override
+    public void onPartitionKeyFailedTablesChanged(int size) {
+        failedTables.set(size);
+    }
+};
+
+Gauge.builder("alternator.affinity.pk.cache.size", cacheSize, AtomicInteger::get)
+    .register(registry);
+Gauge.builder("alternator.affinity.pk.failed.tables", failedTables, AtomicInteger::get)
+    .register(registry);
+
+KeyRouteAffinityConfig keyAffinity = KeyRouteAffinityConfig.builder()
+    .withType(KeyRouteAffinity.RMW)
+    .withMetrics(metrics)
+    .build();
+```
+
+When Java Util Logging is configured for `FINE`, the client emits request-level debug messages such
+as:
+
+- `Key affinity applied: table=users, pk_fingerprint=4f8c2a13f7f5f4e1, target=http://127.0.0.2:8000`
+- `Key affinity skipped: table=users, reason=not_qualifying_request`
+
+Significant partition-key discovery events are logged at `INFO`, for example:
+
+- `PK discovery completed: table=orders, pk_attribute=order_id`
+- `PK discovery failed: table=unknown_table, reason=resource_not_found`
+
 #### How it works
 
 1. The `AffinityQueryPlanInterceptor` intercepts each DynamoDB request

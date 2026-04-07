@@ -38,90 +38,47 @@ public class KeyRouteAffinityConfig {
       KeyRouteAffinity type, Map<String, String> pkInfoPerTable, KeyRouteAffinityMetrics metrics) {
     this.type = type != null ? type : KeyRouteAffinity.NONE;
     this.pkInfoPerTable = Collections.unmodifiableMap(new HashMap<>(pkInfoPerTable));
-    this.metrics = metrics;
+    this.metrics = metrics != null ? metrics : KeyRouteAffinityMetrics.NO_OP;
   }
 
-  /**
-   * Returns the route affinity type.
-   *
-   * @return the affinity type, never null
-   */
   public KeyRouteAffinity getType() {
     return type;
   }
 
-  /**
-   * Returns the pre-configured partition key info per table.
-   *
-   * @return unmodifiable map of table name to partition key attribute name
-   */
   public Map<String, String> getPkInfoPerTable() {
     return pkInfoPerTable;
   }
 
-  /**
-   * Returns the optional metrics callback.
-   *
-   * @return the metrics callback, or null when metrics are disabled
-   */
   public KeyRouteAffinityMetrics getMetrics() {
     return metrics;
   }
 
-  /**
-   * Checks if route affinity is enabled (type is not NONE).
-   *
-   * @return true if route affinity is enabled
-   */
   public boolean isEnabled() {
     return type != KeyRouteAffinity.NONE;
   }
 
-  /**
-   * Creates a new builder for KeyRouteAffinityConfig.
-   *
-   * @return a new builder instance
-   */
   public static Builder builder() {
     return new Builder();
   }
 
-  /**
-   * Creates a config with the specified type and no pre-configured PK info.
-   *
-   * @param type the route affinity type
-   * @return a new config instance
-   */
   public static KeyRouteAffinityConfig of(KeyRouteAffinity type) {
-    return new KeyRouteAffinityConfig(type, Collections.<String, String>emptyMap(), null);
+    return new KeyRouteAffinityConfig(
+        type, Collections.<String, String>emptyMap(), KeyRouteAffinityMetrics.NO_OP);
   }
 
   /** Builder for {@link KeyRouteAffinityConfig}. */
   public static class Builder {
     private KeyRouteAffinity type = KeyRouteAffinity.NONE;
     private final Map<String, String> pkInfoPerTable = new HashMap<>();
-    private KeyRouteAffinityMetrics metrics;
+    private KeyRouteAffinityMetrics metrics = KeyRouteAffinityMetrics.NO_OP;
 
     Builder() {}
 
-    /**
-     * Sets the route affinity type.
-     *
-     * @param type the affinity type
-     * @return this builder
-     */
     public Builder withType(KeyRouteAffinity type) {
       this.type = type;
       return this;
     }
 
-    /**
-     * Adds partition key info for a table.
-     *
-     * @param tableName the table name
-     * @param pkAttributeName the partition key attribute name
-     * @return this builder
-     */
     public Builder withPkInfo(String tableName, String pkAttributeName) {
       if (tableName != null && pkAttributeName != null) {
         pkInfoPerTable.put(tableName, pkAttributeName);
@@ -129,12 +86,6 @@ public class KeyRouteAffinityConfig {
       return this;
     }
 
-    /**
-     * Adds partition key info for multiple tables.
-     *
-     * @param pkInfo map of table name to partition key attribute name
-     * @return this builder
-     */
     public Builder withPkInfoMap(Map<String, String> pkInfo) {
       if (pkInfo != null) {
         pkInfoPerTable.putAll(pkInfo);
@@ -142,25 +93,11 @@ public class KeyRouteAffinityConfig {
       return this;
     }
 
-    /**
-     * Sets the optional metrics callback.
-     *
-     * <p>When not configured, no metrics callbacks are emitted and request processing only pays a
-     * null-check overhead.
-     *
-     * @param metrics the metrics callback, or null to disable metrics
-     * @return this builder
-     */
     public Builder withMetrics(KeyRouteAffinityMetrics metrics) {
-      this.metrics = metrics;
+      this.metrics = metrics != null ? metrics : KeyRouteAffinityMetrics.NO_OP;
       return this;
     }
 
-    /**
-     * Builds the configuration.
-     *
-     * @return a new KeyRouteAffinityConfig instance
-     */
     public KeyRouteAffinityConfig build() {
       return new KeyRouteAffinityConfig(type, pkInfoPerTable, metrics);
     }

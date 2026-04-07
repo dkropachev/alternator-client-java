@@ -5,7 +5,7 @@ import com.scylladb.alternator.internal.LazyQueryPlan;
 import com.scylladb.alternator.keyrouting.AttributeValueHasher;
 import com.scylladb.alternator.keyrouting.KeyAffinityRequestClassifier;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinityConfig;
-import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetricLabels;
+import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetricLabel;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinityMetrics;
 import com.scylladb.alternator.keyrouting.PartitionKeyResolver;
 import java.net.URI;
@@ -19,23 +19,7 @@ import software.amazon.awssdk.http.SdkHttpRequest;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 
-/**
- * Execution interceptor that implements key-based route affinity.
- *
- * <p>This interceptor extends {@link BasicQueryPlanInterceptor} to provide deterministic routing
- * based on partition key values. When key affinity conditions are met, it creates a {@link
- * LazyQueryPlan} with a seed derived from the partition key hash, ensuring that requests for the
- * same partition key are routed to the same node.
- *
- * <p>When key affinity conditions are not met (e.g., request type doesn't qualify, partition key
- * not found), the interceptor falls back to the random plan created by the base class.
- *
- * <p>The interceptor is automatically configured when key route affinity is enabled via {@link
- * com.scylladb.alternator.AlternatorDynamoDbClient.AlternatorDynamoDbClientBuilder#withKeyRouteAffinity}.
- *
- * @author dmitry.kropachev
- * @since 2.0.0
- */
+/** Execution interceptor that implements key-based route affinity. */
 public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
   private static final Logger logger =
       Logger.getLogger(AffinityQueryPlanInterceptor.class.getName());
@@ -47,13 +31,6 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
   private final KeyRouteAffinityMetrics metrics;
   private volatile DynamoDbClient clientForDiscovery;
 
-  /**
-   * Creates a new interceptor with the given configuration and live nodes.
-   *
-   * @param config the key route affinity configuration
-   * @param liveNodes the live nodes manager
-   * @param clientForDiscovery the DynamoDB client to use for PK discovery (may be null)
-   */
   public AffinityQueryPlanInterceptor(
       KeyRouteAffinityConfig config,
       AlternatorLiveNodes liveNodes,
@@ -65,80 +42,55 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
     this.clientForDiscovery = clientForDiscovery;
   }
 
-  /**
-   * Creates a new interceptor without auto-discovery support.
-   *
-   * <p>Note: To enable auto-discovery, call {@link #setClientForDiscovery(DynamoDbClient)} after
-   * the client is built.
-   *
-   * @param config the key route affinity configuration
-   * @param liveNodes the live nodes manager
-   */
   public AffinityQueryPlanInterceptor(
       KeyRouteAffinityConfig config, AlternatorLiveNodes liveNodes) {
     this(config, liveNodes, null);
   }
 
-  /**
-   * Sets the DynamoDB client used for partition key auto-discovery.
-   *
-   * <p>This method should be called after the client is built to enable auto-discovery of partition
-   * key names for tables not pre-configured via {@link
-   * KeyRouteAffinityConfig.Builder#withPkInfo(String, String)}.
-   *
-   * <p>Thread-safe: This method can be called from any thread after construction.
-   *
-   * @param client the DynamoDB client to use for DescribeTable calls
-   */
   public void setClientForDiscovery(DynamoDbClient client) {
     this.clientForDiscovery = client;
   }
 
   private RoutingDecision evaluateRequest(SdkRequest request) {
-    String tableName = KeyAffinityRequestClassifier.extractTableName(request);
-    String metricTableName = metricTableName(tableName);
+    String requestTableName = KeyAffinityRequestClassifier.extractTableName(request);
+    String metricsTableName =
+        requestTableName != null
+            ? requestTableName
+            : KeyRouteAffinityMetricLabel.UNKNOWN_TABLE.value();
+
+    metrics.onRequest(metricsTableName, config.getType());
 
     if (!config.isEnabled()) {
-      return RoutingDecision.skip(
-          tableName, KeyRouteAffinityMetricLabels.NOT_QUALIFYING_REQUEST, metricTableName);
+      return RoutingDecision.skipped(metricsTableName, "affinity_disabled");
     }
 
-    emitRequest(metricTableName);
-
-    // Check if this request qualifies for key affinity
     if (!KeyAffinityRequestClassifier.shouldApply(config.getType(), request)) {
-      return RoutingDecision.skip(
-          tableName, KeyRouteAffinityMetricLabels.NOT_QUALIFYING_REQUEST, metricTableName);
+      return RoutingDecision.skipped(
+          metricsTableName, KeyRouteAffinityMetricLabel.NOT_QUALIFYING_REQUEST.value());
     }
 
-    if (tableName == null) {
-      return RoutingDecision.skip(
-          null, KeyRouteAffinityMetricLabels.TABLE_NAME_MISSING, metricTableName);
+    if (requestTableName == null) {
+      return RoutingDecision.skipped(
+          metricsTableName, KeyRouteAffinityMetricLabel.TABLE_NAME_MISSING.value());
     }
 
-    // Get partition key name
-    String pkName = pkResolver.getPartitionKeyName(tableName);
+    String pkName = pkResolver.getPartitionKeyName(requestTableName);
     if (pkName == null) {
-      emitPartitionKeyCacheMiss(metricTableName);
-      // Trigger async discovery if we have a client
-      if (clientForDiscovery != null) {
-        pkResolver.triggerDiscovery(tableName, clientForDiscovery);
+      if (!pkResolver.isInFailureCooldown(requestTableName) && clientForDiscovery != null) {
+        pkResolver.triggerDiscovery(requestTableName, clientForDiscovery);
       }
-      return RoutingDecision.skip(
-          tableName, KeyRouteAffinityMetricLabels.PK_NOT_CACHED, metricTableName);
+      return RoutingDecision.skipped(
+          metricsTableName, KeyRouteAffinityMetricLabel.PK_NOT_CACHED.value());
     }
-    emitPartitionKeyCacheHit(metricTableName);
 
-    // Extract partition key value
     AttributeValue pkValue = KeyAffinityRequestClassifier.extractPartitionKey(request, pkName);
     if (pkValue == null) {
-      return RoutingDecision.skip(
-          tableName, KeyRouteAffinityMetricLabels.PK_VALUE_MISSING, metricTableName);
+      return RoutingDecision.skipped(
+          metricsTableName, KeyRouteAffinityMetricLabel.PK_VALUE_MISSING.value());
     }
 
-    // Hash the partition key and create a deterministic query plan
     long hash = AttributeValueHasher.hash(pkValue);
-    return RoutingDecision.affinity(tableName, metricTableName, pkValue, hash);
+    return RoutingDecision.applied(metricsTableName, hash, Long.toUnsignedString(hash, 16));
   }
 
   @Override
@@ -149,15 +101,14 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
 
     LazyQueryPlan plan;
     if (decision.affinityApplied) {
-      emitAffinityApplied(decision.metricTableName);
+      metrics.onAffinityApplied(decision.tableName, config.getType());
       plan = new LazyQueryPlan(liveNodes, decision.hash);
     } else {
-      emitAffinitySkipped(decision.metricTableName, decision.reason);
       logAffinitySkipped(decision);
+      metrics.onAffinitySkipped(decision.tableName, config.getType(), decision.reason);
       plan = new LazyQueryPlan(liveNodes);
     }
 
-    // Override the random plan with the deterministic one
     executionAttributes.putAttribute(QUERY_PLAN, plan);
   }
 
@@ -175,9 +126,7 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
       logger.log(
           Level.FINE,
           "Key affinity applied: table={0}, pk_fingerprint={1}, target={2}",
-          new Object[] {
-            decision.metricTableName, formatPartitionKeyFingerprint(decision), targetUri
-          });
+          new Object[] {decision.tableName, decision.partitionKeyFingerprint, targetUri});
     }
 
     SdkHttpRequest originalRequest = context.httpRequest();
@@ -189,52 +138,12 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
         .build();
   }
 
-  /**
-   * Returns the partition key resolver used by this interceptor.
-   *
-   * @return the partition key resolver
-   */
   public PartitionKeyResolver getPartitionKeyResolver() {
     return pkResolver;
   }
 
-  /**
-   * Returns the key route affinity configuration.
-   *
-   * @return the configuration
-   */
   public KeyRouteAffinityConfig getConfig() {
     return config;
-  }
-
-  private void emitRequest(String metricTableName) {
-    if (metrics != null) {
-      metrics.onRequest(metricTableName, config.getType());
-    }
-  }
-
-  private void emitAffinityApplied(String metricTableName) {
-    if (metrics != null) {
-      metrics.onAffinityApplied(metricTableName, config.getType());
-    }
-  }
-
-  private void emitAffinitySkipped(String metricTableName, String reason) {
-    if (metrics != null) {
-      metrics.onAffinitySkipped(metricTableName, config.getType(), reason);
-    }
-  }
-
-  private void emitPartitionKeyCacheHit(String metricTableName) {
-    if (metrics != null) {
-      metrics.onPartitionKeyCacheHit(metricTableName);
-    }
-  }
-
-  private void emitPartitionKeyCacheMiss(String metricTableName) {
-    if (metrics != null) {
-      metrics.onPartitionKeyCacheMiss(metricTableName);
-    }
   }
 
   private void logAffinitySkipped(RoutingDecision decision) {
@@ -242,51 +151,36 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
       logger.log(
           Level.FINE,
           "Key affinity skipped: table={0}, reason={1}",
-          new Object[] {decision.metricTableName, decision.reason});
+          new Object[] {decision.tableName, decision.reason});
     }
-  }
-
-  private String metricTableName(String tableName) {
-    return tableName != null ? tableName : KeyRouteAffinityMetricLabels.UNKNOWN_TABLE;
-  }
-
-  private String formatPartitionKeyFingerprint(RoutingDecision decision) {
-    if (decision.partitionKeyValue == null) {
-      return "null";
-    }
-    return Long.toUnsignedString(decision.hash, 16);
   }
 
   private static final class RoutingDecision {
-    private final boolean affinityApplied;
-    private final String tableName;
-    private final String metricTableName;
-    private final String reason;
-    private final AttributeValue partitionKeyValue;
-    private final long hash;
+    final String tableName;
+    final String reason;
+    final String partitionKeyFingerprint;
+    final long hash;
+    final boolean affinityApplied;
 
     private RoutingDecision(
-        boolean affinityApplied,
         String tableName,
-        String metricTableName,
         String reason,
-        AttributeValue partitionKeyValue,
-        long hash) {
-      this.affinityApplied = affinityApplied;
+        String partitionKeyFingerprint,
+        long hash,
+        boolean affinityApplied) {
       this.tableName = tableName;
-      this.metricTableName = metricTableName;
       this.reason = reason;
-      this.partitionKeyValue = partitionKeyValue;
+      this.partitionKeyFingerprint = partitionKeyFingerprint;
       this.hash = hash;
+      this.affinityApplied = affinityApplied;
     }
 
-    private static RoutingDecision affinity(
-        String tableName, String metricTableName, AttributeValue partitionKeyValue, long hash) {
-      return new RoutingDecision(true, tableName, metricTableName, null, partitionKeyValue, hash);
+    static RoutingDecision skipped(String tableName, String reason) {
+      return new RoutingDecision(tableName, reason, null, 0L, false);
     }
 
-    private static RoutingDecision skip(String tableName, String reason, String metricTableName) {
-      return new RoutingDecision(false, tableName, metricTableName, reason, null, 0L);
+    static RoutingDecision applied(String tableName, long hash, String partitionKeyFingerprint) {
+      return new RoutingDecision(tableName, null, partitionKeyFingerprint, hash, true);
     }
   }
 }
