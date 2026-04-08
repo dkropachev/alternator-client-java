@@ -3,6 +3,7 @@ package com.scylladb.alternator;
 import static org.junit.Assert.*;
 
 import com.scylladb.alternator.internal.AlternatorLiveNodes;
+import com.scylladb.alternator.keyrouting.AffinityMetricsCallback;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinity;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinityConfig;
 import com.scylladb.alternator.queryplan.AffinityQueryPlanInterceptor;
@@ -102,6 +103,53 @@ public class AffinityQueryPlanInterceptorTest {
 
   private KeyRouteAffinityConfig buildConfig(KeyRouteAffinity type) {
     return KeyRouteAffinityConfig.builder().withType(type).withPkInfo(TABLE_NAME, PK_NAME).build();
+  }
+
+  @Test
+  public void testPutItemSimpleAnyWriteRecordsAffinityCallback() {
+    RecordingAffinityMetricsCallback callback = new RecordingAffinityMetricsCallback();
+    KeyRouteAffinityConfig config =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.ANY_WRITE)
+            .withPkInfo(TABLE_NAME, PK_NAME)
+            .withMetricsEnabled(true)
+            .withMetricsCallback(callback)
+            .build();
+    DynamoDbClient client = createClient(config);
+    try {
+      client.putItem(PutItemRequest.builder().tableName(TABLE_NAME).item(makeItem()).build());
+    } finally {
+      client.close();
+    }
+
+    assertEquals(1, callback.requestsObserved);
+    assertEquals(1, callback.affinityApplied);
+    assertEquals(0, callback.roundRobinFallbacks);
+    assertEquals(TABLE_NAME, callback.lastTable);
+    assertEquals(PK_VALUE, callback.lastPkValue);
+  }
+
+  @Test
+  public void testPutItemSimpleRmwRecordsFallbackCallback() {
+    RecordingAffinityMetricsCallback callback = new RecordingAffinityMetricsCallback();
+    KeyRouteAffinityConfig config =
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.RMW)
+            .withPkInfo(TABLE_NAME, PK_NAME)
+            .withMetricsEnabled(true)
+            .withMetricsCallback(callback)
+            .build();
+    DynamoDbClient client = createClient(config);
+    try {
+      client.putItem(PutItemRequest.builder().tableName(TABLE_NAME).item(makeItem()).build());
+    } finally {
+      client.close();
+    }
+
+    assertEquals(1, callback.requestsObserved);
+    assertEquals(0, callback.affinityApplied);
+    assertEquals(1, callback.roundRobinFallbacks);
+    assertEquals("request_not_qualifying", callback.lastFallbackReason);
   }
 
   /** Verify that an operation routes to the same node consistently (affinity applies). */
@@ -1842,6 +1890,36 @@ public class AffinityQueryPlanInterceptorTest {
       CapturedRequest(URI uri) {
         this.uri = uri;
       }
+    }
+  }
+
+  private static final class RecordingAffinityMetricsCallback implements AffinityMetricsCallback {
+    int requestsObserved;
+    int affinityApplied;
+    int roundRobinFallbacks;
+    String lastTable;
+    String lastPkValue;
+    String lastFallbackReason;
+
+    @Override
+    public void onRequestObserved(String tableName, KeyRouteAffinity mode) {
+      requestsObserved++;
+      lastTable = tableName;
+    }
+
+    @Override
+    public void onAffinityApplied(
+        String tableName, String partitionKeyValue, URI targetNode, KeyRouteAffinity mode) {
+      affinityApplied++;
+      lastTable = tableName;
+      lastPkValue = partitionKeyValue;
+    }
+
+    @Override
+    public void onRoundRobinFallback(String tableName, KeyRouteAffinity mode, String reason) {
+      roundRobinFallbacks++;
+      lastTable = tableName;
+      lastFallbackReason = reason;
     }
   }
 }
