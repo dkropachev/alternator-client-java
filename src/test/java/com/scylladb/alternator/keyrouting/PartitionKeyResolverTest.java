@@ -33,11 +33,20 @@ public class PartitionKeyResolverTest {
 
   private PartitionKeyResolver resolver;
   private DynamoDbClient mockClient;
+  private RecordingMetricsCallback metrics;
 
   @Before
   public void setUp() {
     resolver = new PartitionKeyResolver(null);
     mockClient = mock(DynamoDbClient.class);
+    metrics = new RecordingMetricsCallback();
+    resolver.configureObservability(
+        KeyRouteAffinityConfig.builder()
+            .withType(KeyRouteAffinity.ANY_WRITE)
+            .withMetricsEnabled(true)
+            .withDebugLoggingEnabled(true)
+            .withMetricsCallback(metrics)
+            .build());
   }
 
   @After
@@ -71,6 +80,19 @@ public class PartitionKeyResolverTest {
 
     assertEquals("product_id", resolver.getPartitionKeyName("products"));
     assertTrue(resolver.hasPartitionKeyInfo("products"));
+    assertEquals(1, metrics.pkCacheHits);
+    assertEquals(1, metrics.pkCacheSize);
+  }
+
+  @Test
+  public void testCacheHitAndMissMetrics() {
+    resolver.register("users", "user_id");
+
+    assertEquals("user_id", resolver.getPartitionKeyName("users"));
+    assertNull(resolver.getPartitionKeyName("orders"));
+
+    assertEquals(1, metrics.pkCacheHits);
+    assertEquals(1, metrics.pkCacheMisses);
   }
 
   @Test
@@ -96,6 +118,10 @@ public class PartitionKeyResolverTest {
 
     assertEquals("session_id", resolver.getPartitionKeyName("sessions"));
     assertFalse(resolver.isInFailureCooldown("sessions"));
+    assertEquals(1, metrics.pkDiscoveryTriggered);
+    assertEquals(1, metrics.pkDiscoverySucceeded);
+    assertEquals("sessions", metrics.lastDiscoveryTable);
+    assertEquals("session_id", metrics.lastDiscoveredPk);
   }
 
   @Test
@@ -163,6 +189,8 @@ public class PartitionKeyResolverTest {
     assertNull(resolver.getPartitionKeyName("nonexistent"));
     assertEquals(1, attempts.get()); // No retries
     assertTrue(resolver.isInFailureCooldown("nonexistent"));
+    assertEquals(1, metrics.pkDiscoveryFailed);
+    assertEquals("ResourceNotFoundException", metrics.lastFailureReason);
   }
 
   @Test
@@ -398,5 +426,52 @@ public class PartitionKeyResolverTest {
                             .build()))
                 .build())
         .build();
+  }
+
+  private static class RecordingMetricsCallback implements AffinityMetricsCallback {
+    int pkCacheHits;
+    int pkCacheMisses;
+    int pkDiscoveryTriggered;
+    int pkDiscoverySucceeded;
+    int pkDiscoveryFailed;
+    int pkCacheSize;
+    String lastDiscoveryTable;
+    String lastDiscoveredPk;
+    String lastFailureReason;
+
+    @Override
+    public void onPkCacheHit(String tableName) {
+      pkCacheHits++;
+    }
+
+    @Override
+    public void onPkCacheMiss(String tableName) {
+      pkCacheMisses++;
+    }
+
+    @Override
+    public void onPkDiscoveryTriggered(String tableName) {
+      pkDiscoveryTriggered++;
+      lastDiscoveryTable = tableName;
+    }
+
+    @Override
+    public void onPkDiscoverySucceeded(String tableName, String partitionKeyAttributeName) {
+      pkDiscoverySucceeded++;
+      lastDiscoveryTable = tableName;
+      lastDiscoveredPk = partitionKeyAttributeName;
+    }
+
+    @Override
+    public void onPkDiscoveryFailed(String tableName, String reason) {
+      pkDiscoveryFailed++;
+      lastDiscoveryTable = tableName;
+      lastFailureReason = reason;
+    }
+
+    @Override
+    public void onPkCacheSizeChanged(int size) {
+      pkCacheSize = size;
+    }
   }
 }
