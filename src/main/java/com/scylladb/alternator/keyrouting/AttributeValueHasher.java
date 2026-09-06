@@ -71,7 +71,7 @@ import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
  * <ul>
  *   <li>Type prefixes must use the exact byte values (0x01 for S, 0x02 for N, 0x03 for B)
  *   <li>Strings must be encoded as UTF-8 bytes
- *   <li>The MurmurHash3 implementation must use the x86_128 variant with seed 0, returning the
+ *   <li>The MurmurHash3 implementation must use the x64_128 variant with seed 0, returning the
  *       first 64 bits
  * </ul>
  *
