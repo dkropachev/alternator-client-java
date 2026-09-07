@@ -40,6 +40,7 @@ to this Java implementation without making the Java names normative for other cl
 | Health state | The routing classification `ACTIVE`, `QUARANTINED`, or `DOWN`. | [`NodeHealthState`](../src/main/java/com/scylladb/alternator/NodeHealthState.java) |
 | Status | A snapshot containing state, relevant consecutive counters, last-update time, and the current attempt generation. | [`NodeHealthStatus`](../src/main/java/com/scylladb/alternator/NodeHealthStatus.java) |
 | Health store | Per-client mutable state and state-transition logic keyed by canonical endpoint. | `NodeHealthStore` |
+| Health manager | Per-client coordination of health state, direct-probe admission, deduplication, prioritization, timeouts, and lifecycle. | [`NodeHealthManager`](../src/main/java/com/scylladb/alternator/internal/NodeHealthManager.java) |
 | Observation | A classified traffic or probe result that is allowed to update health. | [`NodeHealthObservation`](../src/main/java/com/scylladb/alternator/NodeHealthObservation.java) |
 | Attempt generation | A per-endpoint token captured when traffic is routed and incremented whenever the endpoint enters `DOWN`. It prevents a late result from an older health cycle from changing current health. | `NodeHealthStatus.getGeneration()` and the generation-aware `AlternatorLiveNodes.reportNodeResult(...)` overload |
 | Health-neutral response | A response that updates transmission bookkeeping but produces no health observation and changes no health counter or timestamp. | The retryable-server-status branch in [`BasicQueryPlanInterceptor`](../src/main/java/com/scylladb/alternator/queryplan/BasicQueryPlanInterceptor.java) |
@@ -246,6 +247,8 @@ operations, while `AlternatorLiveNodes` additionally exposes state snapshots and
 for custom integrations. Java's built-in traffic integration uses the generation-aware
 `reportNodeResult(...)` overload. A custom integration that can have concurrent or late traffic
 results must capture `getNodeHealthGeneration(...)` at final routing and use that overload as well.
+`AlternatorLiveNodes` owns topology discovery and delegates health state and probe orchestration to
+`NodeHealthManager`.
 
 ## Health-aware routing
 

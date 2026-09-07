@@ -55,45 +55,33 @@ import software.amazon.awssdk.http.SdkHttpRequest;
  */
 public class AlternatorLiveNodes extends Thread {
   private static final long DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
-  private static final int PROBE_QUEUE_MULTIPLIER = 16;
-  private static final AtomicInteger PROBE_THREAD_ID = new AtomicInteger();
-  private static final ThreadLocal<Boolean> PROBE_WORKER = new ThreadLocal<>();
 
   /**
    * Nodes discovered for the configured routing scope.
    *
-   * <p>This is not a health-filtered live-node list. Health state lives in {@link #healthStore};
-   * down and quarantined nodes can remain here so key-affinity hashing uses a stable scoped node
-   * ring. Initial seed nodes are kept separately and used as discovery fallbacks without being
-   * published into this routing ring unless they are returned by discovery for the configured
-   * scope. Query plans later skip down nodes, return active candidates first, and use quarantined
-   * candidates only after the active pass is exhausted.
+   * <p>This is not a health-filtered live-node list. Health state lives in {@link
+   * #nodeHealthManager}; down and quarantined nodes can remain here so key-affinity hashing uses a
+   * stable scoped node ring. Initial seed nodes are kept separately and used as discovery fallbacks
+   * without being published into this routing ring unless they are returned by discovery for the
+   * configured scope. Query plans later skip down nodes, return active candidates first, and use
+   * quarantined candidates only after the active pass is exhausted.
    */
   private final AtomicReference<List<URI>> discoveredNodes;
+
   private final List<URI> initialNodes;
   private final AlternatorConfig config;
   private final AtomicBoolean running = new AtomicBoolean(false);
   private final AtomicBoolean shutdownRequested = new AtomicBoolean(false);
-  private final AtomicBoolean probeShutdownStarted = new AtomicBoolean(false);
+  private final AtomicBoolean shutdownStarted = new AtomicBoolean(false);
   private final AtomicBoolean pollingClientClosed = new AtomicBoolean(false);
   private final SdkHttpClient pollingHttpClient;
   private final boolean ownsPollingClient;
   private final AtomicLong lastActivityTime = new AtomicLong(0);
   private final LocalNodesResponseParser localNodesResponseParser;
   private final AtomicInteger nextLiveNodeIndex = new AtomicInteger();
-  private final NodeHealthStore healthStore;
-  private final Object topologyHealthLock = new Object();
-  private final ThreadPoolExecutor healthProbeExecutor;
-  private final ScheduledThreadPoolExecutor healthProbeTimeoutExecutor;
-  private final Semaphore healthProbeCapacity;
-  private final ConcurrentMap<URI, ProbeJob> inFlightHealthProbes = new ConcurrentHashMap<>();
-  private final Set<URI> skipNextBackgroundQuarantineProbe = ConcurrentHashMap.newKeySet();
+  private final NodeHealthManager nodeHealthManager;
   private final Set<ExecutableHttpRequest> activeControlPlaneRequests =
       ConcurrentHashMap.newKeySet();
-  private final AtomicLong healthProbeSequence = new AtomicLong();
-  private final AtomicInteger nextDownBackgroundProbeIndex = new AtomicInteger();
-  private final AtomicInteger nextQuarantineBackgroundProbeIndex = new AtomicInteger();
-  private final AtomicInteger backgroundSingleSlotTier = new AtomicInteger();
 
   private static Logger logger = Logger.getLogger(AlternatorLiveNodes.class.getName());
 
@@ -182,12 +170,8 @@ public class AlternatorLiveNodes extends Thread {
    */
   public void shutdown() {
     shutdownRequested.set(true);
-    if (probeShutdownStarted.compareAndSet(false, true)) {
-      for (ProbeJob job : inFlightHealthProbes.values()) {
-        job.cancelForShutdown();
-      }
-      healthProbeExecutor.shutdownNow();
-      healthProbeTimeoutExecutor.shutdownNow();
+    if (shutdownStarted.compareAndSet(false, true)) {
+      nodeHealthManager.shutdown();
       for (ExecutableHttpRequest request : activeControlPlaneRequests) {
         abortQuietly(request);
       }
@@ -215,13 +199,11 @@ public class AlternatorLiveNodes extends Thread {
    */
   public boolean shutdownAndWait(long timeoutMs) {
     shutdown();
-    if (Thread.currentThread() == this || Boolean.TRUE.equals(PROBE_WORKER.get())) {
+    if (Thread.currentThread() == this || nodeHealthManager.isProbeWorkerThread()) {
       return false;
     }
     if (timeoutMs <= 0) {
-      return !isAlive()
-          && healthProbeExecutor.isTerminated()
-          && healthProbeTimeoutExecutor.isTerminated();
+      return !isAlive() && nodeHealthManager.isTerminated();
     }
     long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
     try {
@@ -229,13 +211,8 @@ public class AlternatorLiveNodes extends Thread {
       if (remainingMs > 0) {
         join(remainingMs);
       }
-      boolean probeStopped =
-          healthProbeExecutor.awaitTermination(
-              remainingMillis(deadlineNanos), TimeUnit.MILLISECONDS);
-      boolean timeoutStopped =
-          healthProbeTimeoutExecutor.awaitTermination(
-              remainingMillis(deadlineNanos), TimeUnit.MILLISECONDS);
-      return !isAlive() && probeStopped && timeoutStopped;
+      boolean healthStopped = nodeHealthManager.awaitTermination(deadlineNanos);
+      return !isAlive() && healthStopped;
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       return false;
@@ -462,28 +439,12 @@ public class AlternatorLiveNodes extends Thread {
     this.config = config;
     this.pollingHttpClient = pollingHttpClient;
     this.ownsPollingClient = ownsPollingClient;
-    int probeConcurrency = config.getNodeHealthConfig().getHealthProbeConcurrency();
-    this.healthProbeCapacity = new Semaphore(probeConcurrency * (PROBE_QUEUE_MULTIPLIER + 1));
-    this.healthProbeExecutor =
-        new ThreadPoolExecutor(
-            probeConcurrency,
-            probeConcurrency,
-            30,
-            TimeUnit.SECONDS,
-            new PriorityBlockingQueue<>(),
-            runnable -> daemonThread(runnable, "alternator-health-probe-"));
-    this.healthProbeExecutor.allowCoreThreadTimeOut(true);
-    this.healthProbeTimeoutExecutor =
-        new ScheduledThreadPoolExecutor(
-            1, runnable -> daemonThread(runnable, "alternator-health-probe-timeout-"));
-    this.healthProbeTimeoutExecutor.setKeepAliveTime(30, TimeUnit.SECONDS);
-    this.healthProbeTimeoutExecutor.allowCoreThreadTimeOut(true);
-    this.healthProbeTimeoutExecutor.setRemoveOnCancelPolicy(true);
-    this.healthStore =
-        new NodeHealthStore(config.getNodeHealthConfig(), Collections.<URI>emptyList());
-    for (URI initialNode : initialNodes) {
-      this.healthStore.addQuarantinedNode(initialNode);
-    }
+    this.nodeHealthManager =
+        new NodeHealthManager(
+            config.getNodeHealthConfig(),
+            initialNodes,
+            this::getDiscoveredNodesInternal,
+            this::executeHealthProbe);
     try {
       this.validate();
     } catch (ValidationError e) {
@@ -714,12 +675,7 @@ public class AlternatorLiveNodes extends Thread {
    */
   private void setDiscoveredNodes(List<URI> nodes) {
     List<URI> deduped = sortAndDedupeNodes(nodes);
-    synchronized (topologyHealthLock) {
-      for (URI node : deduped) {
-        healthStore.addQuarantinedNode(node);
-      }
-      discoveredNodes.set(deduped);
-    }
+    nodeHealthManager.publishDiscoveredNodes(deduped, discoveredNodes::set);
   }
 
   private List<URI> getNodesForScope(RoutingScope scope) throws IOException {
@@ -900,12 +856,10 @@ public class AlternatorLiveNodes extends Thread {
     }
   }
 
-  private int getHttpStatus(URI uri) throws IOException {
-    return getHttpStatus(uri, null);
-  }
-
-  private int getHttpStatus(URI uri, ProbeJob probeJob) throws IOException {
-    try (ControlPlaneResponse controlPlaneResponse = executeGet(uri, probeJob)) {
+  private int executeHealthProbe(URI node, NodeHealthManager.ProbeRequest probeRequest)
+      throws IOException, URISyntaxException {
+    URI uri = withPathAndQuery(node, "/localnodes", null);
+    try (ControlPlaneResponse controlPlaneResponse = executeGet(uri, probeRequest)) {
       HttpExecuteResponse response = controlPlaneResponse.response;
       int statusCode = response.httpResponse().statusCode();
       response.responseBody().ifPresent(this::consumeAndClose);
@@ -917,7 +871,8 @@ public class AlternatorLiveNodes extends Thread {
     return executeGet(uri, null);
   }
 
-  private ControlPlaneResponse executeGet(URI uri, ProbeJob probeJob) throws IOException {
+  private ControlPlaneResponse executeGet(URI uri, NodeHealthManager.ProbeRequest probeRequest)
+      throws IOException {
     SdkHttpRequest sdkRequest =
         SdkHttpRequest.builder()
             .uri(uri)
@@ -928,8 +883,8 @@ public class AlternatorLiveNodes extends Thread {
     HttpExecuteRequest executeRequest = HttpExecuteRequest.builder().request(sdkRequest).build();
     ExecutableHttpRequest preparedRequest = pollingHttpClient.prepareRequest(executeRequest);
     activeControlPlaneRequests.add(preparedRequest);
-    if (probeJob != null) {
-      probeJob.setRequest(preparedRequest);
+    if (probeRequest != null) {
+      probeRequest.setRequest(preparedRequest);
     }
     if (shutdownRequested.get()) {
       abortQuietly(preparedRequest);
@@ -938,42 +893,44 @@ public class AlternatorLiveNodes extends Thread {
     try {
       HttpExecuteResponse response = preparedRequest.call();
       ControlPlaneResponse controlPlaneResponse =
-          new ControlPlaneResponse(response, preparedRequest, probeJob);
+          new ControlPlaneResponse(response, preparedRequest, probeRequest);
       handedOff = true;
       return controlPlaneResponse;
     } finally {
       if (!handedOff) {
-        releaseControlPlaneRequest(preparedRequest, probeJob);
+        releaseControlPlaneRequest(preparedRequest, probeRequest);
       }
     }
   }
 
   private void releaseControlPlaneRequest(
-      ExecutableHttpRequest preparedRequest, ProbeJob probeJob) {
+      ExecutableHttpRequest preparedRequest, NodeHealthManager.ProbeRequest probeRequest) {
     activeControlPlaneRequests.remove(preparedRequest);
-    if (probeJob != null) {
-      probeJob.clearRequest(preparedRequest);
+    if (probeRequest != null) {
+      probeRequest.clearRequest(preparedRequest);
     }
   }
 
   private final class ControlPlaneResponse implements AutoCloseable {
     private final HttpExecuteResponse response;
     private final ExecutableHttpRequest preparedRequest;
-    private final ProbeJob probeJob;
+    private final NodeHealthManager.ProbeRequest probeRequest;
     private boolean closed;
 
     private ControlPlaneResponse(
-        HttpExecuteResponse response, ExecutableHttpRequest preparedRequest, ProbeJob probeJob) {
+        HttpExecuteResponse response,
+        ExecutableHttpRequest preparedRequest,
+        NodeHealthManager.ProbeRequest probeRequest) {
       this.response = response;
       this.preparedRequest = preparedRequest;
-      this.probeJob = probeJob;
+      this.probeRequest = probeRequest;
     }
 
     @Override
     public void close() {
       if (!closed) {
         closed = true;
-        releaseControlPlaneRequest(preparedRequest, probeJob);
+        releaseControlPlaneRequest(preparedRequest, probeRequest);
       }
     }
   }
@@ -1168,7 +1125,7 @@ public class AlternatorLiveNodes extends Thread {
    * @since 2.0.6
    */
   public NodeHealthStatus getNodeHealthStatus(URI node) {
-    return healthStore.getNodeStatus(node);
+    return nodeHealthManager.getNodeStatus(node);
   }
 
   /**
@@ -1178,8 +1135,7 @@ public class AlternatorLiveNodes extends Thread {
    * @return current generation, or zero when the node is unknown
    */
   public long getNodeHealthGeneration(URI node) {
-    NodeHealthStatus status = healthStore.getNodeStatus(node);
-    return status != null ? status.getGeneration() : 0;
+    return nodeHealthManager.getNodeGeneration(node);
   }
 
   /**
@@ -1203,105 +1159,24 @@ public class AlternatorLiveNodes extends Thread {
   public void reportNodeResult(
       URI node, NodeHealthObservation observation, long expectedTrafficGeneration) {
     markActivity();
-    if (healthStore.reportNodeResult(node, observation, expectedTrafficGeneration)) {
-      updateBackgroundProbeSuppression(node, observation);
-    }
+    nodeHealthManager.reportNodeResult(node, observation, expectedTrafficGeneration);
   }
 
   void reportNodeResult(URI node, NodeHealthObservation observation, boolean markActivity) {
     if (markActivity) {
       markActivity();
     }
-    healthStore.reportNodeResult(node, observation);
-    updateBackgroundProbeSuppression(node, observation);
+    nodeHealthManager.reportNodeResult(node, observation);
   }
 
   /** Runs and waits for one explicit probe batch for currently down nodes. */
   List<URI> runDownNodeProbes() {
-    List<URI> candidates = getDownNodeProbeCandidates();
-    List<CompletableFuture<ProbeOutcome>> futures = new ArrayList<>();
-    for (URI node : candidates) {
-      futures.add(submitHealthProbe(node, ProbePriority.DOWN, true));
-    }
-    awaitProbeFutures(futures);
-    List<URI> recovered = new ArrayList<>();
-    for (URI node : candidates) {
-      NodeHealthStatus status = healthStore.getNodeStatus(node);
-      if (status != null && status.getState() == NodeHealthState.QUARANTINED) {
-        recovered.add(node);
-      }
-    }
-    return recovered;
+    return nodeHealthManager.runDownNodeProbes(getDownNodeProbeCandidates());
   }
 
   void scheduleBackgroundHealthProbes() {
-    List<URI> down = getDownNodeProbeCandidates();
-    List<URI> quarantined = getQuarantinedNodesInternal();
-    int available = healthProbeCapacity.availablePermits();
-    Set<URI> scheduledThisCycle = new HashSet<>();
-
-    int quarantineBudget;
-    if (down.isEmpty() || quarantined.isEmpty()) {
-      quarantineBudget = down.isEmpty() ? available : 0;
-    } else if (available == 1) {
-      quarantineBudget = Math.floorMod(backgroundSingleSlotTier.getAndIncrement(), 2);
-    } else {
-      quarantineBudget = available / 2;
-    }
-    int downBudget = available - quarantineBudget;
-
-    submitBackgroundProbeBatch(
-        down, ProbePriority.DOWN, downBudget, nextDownBackgroundProbeIndex, scheduledThisCycle);
-    submitBackgroundProbeBatch(
-        quarantined,
-        ProbePriority.QUARANTINED,
-        quarantineBudget,
-        nextQuarantineBackgroundProbeIndex,
-        scheduledThisCycle);
-
-    // Reuse any budget left because one tier was smaller than its share. Priority ordering in the
-    // executor still ensures admitted down-node work runs before queued quarantine work.
-    submitBackgroundProbeBatch(
-        down,
-        ProbePriority.DOWN,
-        healthProbeCapacity.availablePermits(),
-        nextDownBackgroundProbeIndex,
-        scheduledThisCycle);
-    submitBackgroundProbeBatch(
-        quarantined,
-        ProbePriority.QUARANTINED,
-        healthProbeCapacity.availablePermits(),
-        nextQuarantineBackgroundProbeIndex,
-        scheduledThisCycle);
-  }
-
-  private void submitBackgroundProbeBatch(
-      List<URI> candidates,
-      ProbePriority priority,
-      int admissionBudget,
-      AtomicInteger nextIndex,
-      Set<URI> scheduledThisCycle) {
-    if (candidates.isEmpty() || admissionBudget <= 0) {
-      return;
-    }
-
-    int start = Math.floorMod(nextIndex.get(), candidates.size());
-    int examined = 0;
-    int submissions = 0;
-    while (examined < candidates.size() && submissions < admissionBudget) {
-      URI node = candidates.get((start + examined) % candidates.size());
-      examined++;
-      URI key = NodeHealthStore.canonicalNodeKey(node);
-      if (key == null || !scheduledThisCycle.add(key)) {
-        continue;
-      }
-      if (inFlightHealthProbes.containsKey(key)) {
-        continue;
-      }
-      submitHealthProbe(node, priority, false);
-      submissions++;
-    }
-    nextIndex.addAndGet(examined);
+    nodeHealthManager.scheduleBackgroundProbes(
+        getDownNodeProbeCandidates(), getQuarantinedNodesInternal());
   }
 
   /**
@@ -1317,17 +1192,7 @@ public class AlternatorLiveNodes extends Thread {
    * @since 2.1.0
    */
   public List<URI> probeQuarantinedNodes() {
-    if (Boolean.TRUE.equals(PROBE_WORKER.get())) {
-      throw new IllegalStateException("blocking probe API cannot run on a health-probe worker");
-    }
-    try {
-      return probeQuarantinedNodesAsync().join();
-    } catch (CompletionException e) {
-      if (e.getCause() instanceof IllegalStateException) {
-        throw (IllegalStateException) e.getCause();
-      }
-      throw e;
-    }
+    return nodeHealthManager.probeQuarantinedNodes(getQuarantinedNodesInternal());
   }
 
   /**
@@ -1340,179 +1205,7 @@ public class AlternatorLiveNodes extends Thread {
    * @since 2.1.0
    */
   public CompletableFuture<List<URI>> probeQuarantinedNodesAsync() {
-    if (shutdownRequested.get()) {
-      return failedFuture(new IllegalStateException("live-node manager is shut down"));
-    }
-    List<URI> candidates = getQuarantinedNodesInternal();
-    List<CompletableFuture<ProbeOutcome>> futures = new ArrayList<>();
-    for (URI node : candidates) {
-      futures.add(submitHealthProbe(node, ProbePriority.EXPLICIT, true));
-    }
-    CompletableFuture<Void> completed =
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0]));
-    return completed.thenApply(
-        ignored -> {
-          List<URI> successful = new ArrayList<>();
-          for (int i = 0; i < candidates.size(); i++) {
-            if (futures.get(i).join() == ProbeOutcome.SUCCESS) {
-              successful.add(candidates.get(i));
-            }
-          }
-          return Collections.unmodifiableList(successful);
-        });
-  }
-
-  private CompletableFuture<ProbeOutcome> submitHealthProbe(
-      URI node, ProbePriority priority, boolean explicit) {
-    if (shutdownRequested.get()) {
-      return failedFuture(new IllegalStateException("live-node manager is shut down"));
-    }
-    URI key = NodeHealthStore.canonicalNodeKey(node);
-    if (key == null) {
-      return CompletableFuture.completedFuture(ProbeOutcome.SKIPPED);
-    }
-
-    while (true) {
-      ProbeJob existing = inFlightHealthProbes.get(key);
-      if (existing != null) {
-        return joinHealthProbe(node, priority, explicit, existing);
-      }
-      if (!healthProbeCapacity.tryAcquire()) {
-        return explicit
-            ? failedFuture(new RejectedExecutionException("health-probe queue is full"))
-            : CompletableFuture.completedFuture(ProbeOutcome.SKIPPED);
-      }
-
-      ProbeJob created = new ProbeJob(node, key, priority, explicit);
-      existing = inFlightHealthProbes.putIfAbsent(key, created);
-      if (existing != null) {
-        healthProbeCapacity.release();
-        return joinHealthProbe(node, priority, explicit, existing);
-      }
-      if (shutdownRequested.get()) {
-        created.cancelForShutdown();
-        return created.result;
-      }
-      try {
-        healthProbeExecutor.execute(created);
-      } catch (RejectedExecutionException e) {
-        inFlightHealthProbes.remove(key, created);
-        created.releaseCapacity();
-        created.result.completeExceptionally(e);
-      }
-      return created.result;
-    }
-  }
-
-  private CompletableFuture<ProbeOutcome> joinHealthProbe(
-      URI node, ProbePriority priority, boolean explicit, ProbeJob existing) {
-    if (!explicit) {
-      return existing.result;
-    }
-    existing.requestExplicit();
-    // The background worker may already have committed to skipping just before the upgrade.
-    // Wait for it to leave the in-flight map before retrying so an explicit caller always gets an
-    // actual probe while the node remains quarantined.
-    return existing.result.thenCompose(
-        outcome ->
-            outcome == ProbeOutcome.SKIPPED
-                ? existing.physicalCompletion.thenCompose(
-                    ignored -> submitHealthProbe(node, priority, true))
-                : CompletableFuture.completedFuture(outcome));
-  }
-
-  private void awaitProbeFutures(List<CompletableFuture<ProbeOutcome>> futures) {
-    try {
-      CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0])).join();
-    } catch (CompletionException | CancellationException e) {
-      if (!shutdownRequested.get()) {
-        throw e;
-      }
-    }
-  }
-
-  private boolean shouldRunProbe(ProbeJob job) {
-    NodeHealthStatus status = healthStore.getNodeStatus(job.node);
-    if (status == null || status.getState() == NodeHealthState.ACTIVE) {
-      return false;
-    }
-    if (status.getState() == NodeHealthState.QUARANTINED) {
-      synchronized (topologyHealthLock) {
-        status = healthStore.getNodeStatus(job.node);
-        if (status == null
-            || status.getState() != NodeHealthState.QUARANTINED
-            || !isCurrentlyDiscoveredLocked(job.key)) {
-          return false;
-        }
-        if (!job.isExplicit() && skipNextBackgroundQuarantineProbe.remove(job.key)) {
-          return false;
-        }
-      }
-    }
-    return true;
-  }
-
-  private void applyProbeObservation(URI node, NodeHealthObservation observation) {
-    NodeHealthStatus status = healthStore.getNodeStatus(node);
-    if (status == null || status.getState() == NodeHealthState.ACTIVE) {
-      return;
-    }
-    if (status.getState() == NodeHealthState.QUARANTINED) {
-      URI key = NodeHealthStore.canonicalNodeKey(node);
-      synchronized (topologyHealthLock) {
-        status = healthStore.getNodeStatus(node);
-        if (status != null
-            && status.getState() == NodeHealthState.QUARANTINED
-            && isCurrentlyDiscoveredLocked(key)) {
-          reportNodeResult(node, observation, false);
-        }
-      }
-      return;
-    }
-    reportNodeResult(node, observation, false);
-  }
-
-  private boolean isCurrentlyDiscoveredLocked(URI key) {
-    for (URI discovered : getDiscoveredNodesInternal()) {
-      if (Objects.equals(key, NodeHealthStore.canonicalNodeKey(discovered))) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private void updateBackgroundProbeSuppression(URI node, NodeHealthObservation observation) {
-    URI key = NodeHealthStore.canonicalNodeKey(node);
-    if (key == null) {
-      return;
-    }
-    NodeHealthStatus status = healthStore.getNodeStatus(node);
-    if (observation == NodeHealthObservation.TRAFFIC_SUCCESS
-        && status != null
-        && status.getState() == NodeHealthState.QUARANTINED) {
-      ProbeJob job = inFlightHealthProbes.get(key);
-      if (job == null || !job.isRunning()) {
-        skipNextBackgroundQuarantineProbe.add(key);
-      }
-      return;
-    }
-    if (observation == NodeHealthObservation.TRAFFIC_FAILURE
-        || status == null
-        || status.getState() != NodeHealthState.QUARANTINED) {
-      skipNextBackgroundQuarantineProbe.remove(key);
-    }
-  }
-
-  private static <T> CompletableFuture<T> failedFuture(Throwable failure) {
-    CompletableFuture<T> future = new CompletableFuture<>();
-    future.completeExceptionally(failure);
-    return future;
-  }
-
-  private static Thread daemonThread(Runnable runnable, String prefix) {
-    Thread thread = new Thread(runnable, prefix + PROBE_THREAD_ID.incrementAndGet());
-    thread.setDaemon(true);
-    return thread;
+    return nodeHealthManager.probeQuarantinedNodesAsync(getQuarantinedNodesInternal());
   }
 
   private static long remainingMillis(long deadlineNanos) {
@@ -1531,200 +1224,12 @@ public class AlternatorLiveNodes extends Thread {
     }
   }
 
-  private enum ProbeOutcome {
-    SUCCESS,
-    FAILURE,
-    SKIPPED
-  }
-
-  private enum ProbePriority {
-    EXPLICIT(0),
-    DOWN(1),
-    QUARANTINED(2);
-
-    private final int value;
-
-    ProbePriority(int value) {
-      this.value = value;
-    }
-  }
-
-  private final class ProbeJob implements Runnable, Comparable<ProbeJob> {
-    private final URI node;
-    private final URI key;
-    private final long sequence = healthProbeSequence.incrementAndGet();
-    private final CompletableFuture<ProbeOutcome> result = new CompletableFuture<>();
-    private final CompletableFuture<Void> physicalCompletion = new CompletableFuture<>();
-    private final AtomicBoolean completed = new AtomicBoolean();
-    private final AtomicBoolean capacityReleased = new AtomicBoolean();
-    private volatile ProbePriority priority;
-    private volatile boolean explicit;
-    private volatile boolean running;
-    private volatile ExecutableHttpRequest request;
-    private volatile ScheduledFuture<?> timeoutTask;
-
-    private ProbeJob(URI node, URI key, ProbePriority priority, boolean explicit) {
-      this.node = node;
-      this.key = key;
-      this.priority = priority;
-      this.explicit = explicit;
-    }
-
-    @Override
-    public int compareTo(ProbeJob other) {
-      int byPriority = Integer.compare(priority.value, other.priority.value);
-      return byPriority != 0 ? byPriority : Long.compare(sequence, other.sequence);
-    }
-
-    private void requestExplicit() {
-      boolean removed = false;
-      synchronized (this) {
-        if (completed.get()) {
-          return;
-        }
-        if (!running && priority != ProbePriority.EXPLICIT) {
-          removed = healthProbeExecutor.remove(this);
-        }
-        explicit = true;
-        priority = ProbePriority.EXPLICIT;
-      }
-      if (removed) {
-        try {
-          healthProbeExecutor.execute(this);
-        } catch (RejectedExecutionException e) {
-          cancelForShutdown();
-        }
-      }
-    }
-
-    private boolean isExplicit() {
-      return explicit;
-    }
-
-    private boolean isRunning() {
-      return running;
-    }
-
-    @Override
-    public void run() {
-      PROBE_WORKER.set(Boolean.TRUE);
-      synchronized (this) {
-        if (completed.get()) {
-          cleanupAfterPhysicalCompletion();
-          PROBE_WORKER.remove();
-          return;
-        }
-        running = true;
-      }
-      try {
-        if (shutdownRequested.get()) {
-          cancelForShutdown();
-          return;
-        }
-        if (!shouldRunProbe(this)) {
-          complete(ProbeOutcome.SKIPPED, null);
-          return;
-        }
-        timeoutTask =
-            healthProbeTimeoutExecutor.schedule(
-                this::timeout,
-                config.getNodeHealthConfig().getHealthProbeTimeoutMs(),
-                TimeUnit.MILLISECONDS);
-        int statusCode = getHttpStatus(withPathAndQuery(node, "/localnodes", null), this);
-        if (statusCode == HttpURLConnection.HTTP_OK) {
-          complete(ProbeOutcome.SUCCESS, NodeHealthObservation.PROBE_SUCCESS);
-        } else {
-          complete(ProbeOutcome.FAILURE, NodeHealthObservation.PROBE_FAILURE);
-        }
-      } catch (IOException | RuntimeException | URISyntaxException e) {
-        if (shutdownRequested.get()) {
-          cancelForShutdown();
-        } else {
-          complete(ProbeOutcome.FAILURE, NodeHealthObservation.PROBE_FAILURE);
-        }
-      } finally {
-        ScheduledFuture<?> timeout = timeoutTask;
-        if (timeout != null) {
-          timeout.cancel(false);
-        }
-        cleanupAfterPhysicalCompletion();
-        PROBE_WORKER.remove();
-      }
-    }
-
-    private void timeout() {
-      complete(ProbeOutcome.FAILURE, NodeHealthObservation.PROBE_FAILURE);
-      ExecutableHttpRequest current = request;
-      if (current != null) {
-        abortQuietly(current);
-      }
-    }
-
-    private void setRequest(ExecutableHttpRequest request) {
-      this.request = request;
-      if (completed.get() || shutdownRequested.get()) {
-        abortQuietly(request);
-      }
-    }
-
-    private void clearRequest(ExecutableHttpRequest request) {
-      if (this.request == request) {
-        this.request = null;
-      }
-    }
-
-    private void complete(ProbeOutcome outcome, NodeHealthObservation observation) {
-      if (!completed.compareAndSet(false, true)) {
-        return;
-      }
-      if (observation != null) {
-        applyProbeObservation(node, observation);
-      }
-      result.complete(outcome);
-    }
-
-    private void cancelForShutdown() {
-      if (completed.compareAndSet(false, true)) {
-        result.completeExceptionally(
-            new CancellationException("health probe cancelled by shutdown"));
-      }
-      ScheduledFuture<?> timeout = timeoutTask;
-      if (timeout != null) {
-        timeout.cancel(false);
-      }
-      ExecutableHttpRequest current = request;
-      if (current != null) {
-        abortQuietly(current);
-      }
-      synchronized (this) {
-        if (!running) {
-          inFlightHealthProbes.remove(key, this);
-          releaseCapacity();
-          physicalCompletion.complete(null);
-        }
-      }
-    }
-
-    private void cleanupAfterPhysicalCompletion() {
-      running = false;
-      inFlightHealthProbes.remove(key, this);
-      releaseCapacity();
-      physicalCompletion.complete(null);
-    }
-
-    private void releaseCapacity() {
-      if (capacityReleased.compareAndSet(false, true)) {
-        healthProbeCapacity.release();
-      }
-    }
-  }
-
   private List<URI> getDownNodeProbeCandidates() {
     List<URI> candidates = dedupePreservingOrder(getDiscoveredNodesInternal());
     appendUniqueNodes(candidates, initialNodes);
     List<URI> down = new ArrayList<>();
     for (URI candidate : candidates) {
-      NodeHealthStatus status = healthStore.getNodeStatus(candidate);
+      NodeHealthStatus status = nodeHealthManager.getNodeStatus(candidate);
       if (status != null && status.getState() == NodeHealthState.DOWN) {
         down.add(candidate);
       }
@@ -1802,8 +1307,7 @@ public class AlternatorLiveNodes extends Thread {
   }
 
   NodeHealthState getQueryPlanNodeState(URI node) {
-    NodeHealthStatus status = healthStore.getNodeStatus(node);
-    return status != null ? status.getState() : NodeHealthState.ACTIVE;
+    return nodeHealthManager.getNodeState(node);
   }
 
   boolean hasActiveQueryPlanNodes() {
@@ -1883,7 +1387,7 @@ public class AlternatorLiveNodes extends Thread {
   protected List<URI> getActiveNodesInternal() {
     List<URI> activeNodes = new ArrayList<>();
     for (URI node : getDiscoveredNodesInternal()) {
-      NodeHealthStatus status = healthStore.getNodeStatus(node);
+      NodeHealthStatus status = nodeHealthManager.getNodeStatus(node);
       if (status == null || status.getState() == NodeHealthState.ACTIVE) {
         activeNodes.add(node);
       }
@@ -1902,7 +1406,7 @@ public class AlternatorLiveNodes extends Thread {
   private List<URI> getDiscoveredNodesByState(NodeHealthState state) {
     List<URI> nodes = new ArrayList<>();
     for (URI node : getDiscoveredNodesInternal()) {
-      NodeHealthStatus status = healthStore.getNodeStatus(node);
+      NodeHealthStatus status = nodeHealthManager.getNodeStatus(node);
       if (status != null && status.getState() == state) {
         nodes.add(node);
       }
@@ -1989,7 +1493,7 @@ public class AlternatorLiveNodes extends Thread {
   public List<URI> getLiveNodes() {
     List<URI> live = new ArrayList<>();
     for (URI node : getDiscoveredNodesInternal()) {
-      NodeHealthStatus status = healthStore.getNodeStatus(node);
+      NodeHealthStatus status = nodeHealthManager.getNodeStatus(node);
       if (status == null || status.getState() == NodeHealthState.ACTIVE) {
         live.add(node);
       }
