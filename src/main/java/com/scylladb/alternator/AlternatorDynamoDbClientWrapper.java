@@ -144,9 +144,9 @@ public class AlternatorDynamoDbClientWrapper implements AutoCloseable {
   }
 
   /**
-   * Returns a snapshot of discovered nodes currently active for normal routing.
+   * Returns a snapshot of the current discovered nodes list.
    *
-   * @return an unmodifiable list of active discovered node URIs
+   * @return an unmodifiable list of the current discovered node URIs
    */
   public List<URI> getLiveNodes() {
     return liveNodes.getLiveNodes();
@@ -156,7 +156,7 @@ public class AlternatorDynamoDbClientWrapper implements AutoCloseable {
    * Returns the next node URI using round-robin selection.
    *
    * @return the next eligible node URI
-   * @deprecated Request routing is automatic; use {@link #getLiveNodes()} to inspect active nodes.
+   * @deprecated Request routing is automatic; use {@link #getLiveNodes()} to inspect topology.
    */
   @Deprecated
   public URI nextAsURI() {

@@ -250,6 +250,11 @@ results must capture `getNodeHealthGeneration(...)` at final routing and use tha
 `AlternatorLiveNodes` owns topology discovery and delegates health state and probe orchestration to
 `NodeHealthManager`.
 
+For source and behavioral compatibility, Java's existing `getLiveNodes()` method remains a raw
+discovered-topology view and is equivalent to `getDiscoveredNodes()`; it must not silently become a
+health-filtered view. Callers use `getActiveNodes()`, `getQuarantinedNodes()`, and `getDownNodes()`
+when they need explicit health partitions.
+
 ## Health-aware routing
 
 The base query plan must remain health agnostic and produce every discovered candidate at most once

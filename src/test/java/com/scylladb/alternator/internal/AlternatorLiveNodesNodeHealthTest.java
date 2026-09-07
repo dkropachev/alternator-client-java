@@ -613,7 +613,7 @@ public class AlternatorLiveNodesNodeHealthTest {
 
     assertTrue(liveNodes.getDiscoveredNodes().contains(transientNode));
     assertEquals(NodeHealthState.DOWN, liveNodes.getNodeHealthStatus(transientNode).getState());
-    assertFalse(liveNodes.getLiveNodes().contains(transientNode));
+    assertFalse(liveNodes.getActiveNodes().contains(transientNode));
   }
 
   @Test

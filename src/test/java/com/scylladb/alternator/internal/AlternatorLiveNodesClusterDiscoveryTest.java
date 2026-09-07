@@ -183,7 +183,7 @@ public class AlternatorLiveNodesClusterDiscoveryTest {
     assertEquals(
         new LinkedHashSet<>(Arrays.asList("node2.example.com", "node3.example.com")),
         hostSet(liveNodes.getDiscoveredNodes()));
-    assertTrue(liveNodes.getLiveNodes().isEmpty());
+    assertTrue(liveNodes.getActiveNodes().isEmpty());
 
     failingHosts.add("seed.example.com");
     httpClient.capturedRequests.clear();
@@ -219,7 +219,7 @@ public class AlternatorLiveNodesClusterDiscoveryTest {
     assertEquals(
         new LinkedHashSet<>(Arrays.asList("node2.example.com", "node3.example.com")),
         hostSet(liveNodes.getDiscoveredNodes()));
-    assertTrue(liveNodes.getLiveNodes().isEmpty());
+    assertTrue(liveNodes.getActiveNodes().isEmpty());
 
     failingHosts.add("node2.example.com");
     responses.put("seed.example.com", "[\"recovered.example.com\"]");
@@ -229,7 +229,7 @@ public class AlternatorLiveNodesClusterDiscoveryTest {
     assertEquals(
         new LinkedHashSet<>(Arrays.asList("recovered.example.com")),
         hostSet(liveNodes.getDiscoveredNodes()));
-    assertTrue(liveNodes.getLiveNodes().isEmpty());
+    assertTrue(liveNodes.getActiveNodes().isEmpty());
     List<String> captured = capturedHosts(httpClient.capturedRequests);
     assertEquals(3, captured.size());
     assertEquals(

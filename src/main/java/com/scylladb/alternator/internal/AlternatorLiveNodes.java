@@ -560,7 +560,8 @@ public class AlternatorLiveNodes extends Thread {
    * does not call this method.
    *
    * @return the next eligible node URI
-   * @deprecated Request routing is automatic; use {@link #getLiveNodes()} to inspect active nodes.
+   * @deprecated Request routing is automatic; use {@link #getActiveNodes()} to inspect active
+   *     nodes.
    */
   @Deprecated
   public URI nextAsURI() {
@@ -581,7 +582,8 @@ public class AlternatorLiveNodes extends Thread {
    * @param path URI path
    * @param query URI query
    * @return the next eligible node URI with the supplied path and query
-   * @deprecated Request routing is automatic; use {@link #getLiveNodes()} to inspect active nodes.
+   * @deprecated Request routing is automatic; use {@link #getActiveNodes()} to inspect active
+   *     nodes.
    */
   @Deprecated
   public URI nextAsURI(String path, String query) {
@@ -1482,22 +1484,15 @@ public class AlternatorLiveNodes extends Thread {
   }
 
   /**
-   * Returns a snapshot of discovered nodes currently active for normal routing.
+   * Returns a snapshot of the current discovered nodes list.
    *
-   * <p>Nodes that are quarantined or down remain visible through {@link #getDiscoveredNodes()} but
-   * are excluded from this live-node view.
+   * <p>This method preserves its historical topology-view semantics. Use {@link #getActiveNodes()},
+   * {@link #getQuarantinedNodes()}, and {@link #getDownNodes()} for health-filtered views.
    *
-   * @return an unmodifiable list of active discovered node URIs in stored discovered-node order
+   * @return an unmodifiable list of the current discovered node URIs
    * @since 2.0.0
    */
   public List<URI> getLiveNodes() {
-    List<URI> live = new ArrayList<>();
-    for (URI node : getDiscoveredNodesInternal()) {
-      NodeHealthStatus status = nodeHealthManager.getNodeStatus(node);
-      if (status == null || status.getState() == NodeHealthState.ACTIVE) {
-        live.add(node);
-      }
-    }
-    return Collections.unmodifiableList(dedupePreservingOrder(live));
+    return getDiscoveredNodes();
   }
 }

@@ -66,9 +66,10 @@ public class AlternatorLiveNodesTest {
             new URI("http://node1.example.com:8000"), new URI("http://node2.example.com:8000"));
     AlternatorLiveNodes liveNodes = new AlternatorLiveNodes(nodes, "http", 8000, "", "");
 
-    List<URI> result = liveNodes.getLiveNodes();
+    List<URI> result = liveNodes.getActiveNodes();
 
     assertTrue(result.isEmpty());
+    assertEquals(nodes, liveNodes.getLiveNodes());
     assertEquals(nodes, liveNodes.getQuarantinedNodes());
   }
 
@@ -88,7 +89,7 @@ public class AlternatorLiveNodesTest {
   }
 
   @Test
-  public void testGetLiveNodesExcludesDownNodes() throws URISyntaxException {
+  public void testGetActiveNodesExcludesDownNodes() throws URISyntaxException {
     URI active = new URI("http://node1.example.com:8000");
     URI down = new URI("http://node2.example.com:8000");
     AlternatorLiveNodes liveNodes =
@@ -97,7 +98,8 @@ public class AlternatorLiveNodesTest {
     markNodeDown(liveNodes, down);
 
     assertEquals(Arrays.asList(active, down), liveNodes.getDiscoveredNodes());
-    assertTrue(liveNodes.getLiveNodes().isEmpty());
+    assertEquals(Arrays.asList(active, down), liveNodes.getLiveNodes());
+    assertTrue(liveNodes.getActiveNodes().isEmpty());
     assertEquals(Collections.singletonList(active), liveNodes.getQuarantinedNodes());
   }
 
