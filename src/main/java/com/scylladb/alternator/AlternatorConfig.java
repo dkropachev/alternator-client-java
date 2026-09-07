@@ -223,9 +223,10 @@ public class AlternatorConfig {
   private final long connectionTimeToLiveMs;
   private final long connectionAcquisitionTimeoutMs;
   private final long connectionTimeoutMs;
+  private final NodeHealthConfig nodeHealthConfig;
 
   /**
-   * Package-private constructor. Use {@link AlternatorConfig#builder()} to create instances.
+   * Protected constructor kept for source and binary compatibility with 2.0.x subclasses.
    *
    * @param seedHosts the list of seed host addresses (IP or hostname) for cluster discovery
    * @param scheme the URI scheme (http or https)
@@ -274,6 +275,83 @@ public class AlternatorConfig {
       long connectionTimeToLiveMs,
       long connectionAcquisitionTimeoutMs,
       long connectionTimeoutMs) {
+    this(
+        seedHosts,
+        scheme,
+        port,
+        routingScope,
+        compressionAlgorithm,
+        minCompressionSizeBytes,
+        responseCompressionAlgorithms,
+        optimizeHeaders,
+        headersWhitelist,
+        userAgentEnabled,
+        authenticationEnabled,
+        tlsSessionCacheConfig,
+        tlsConfig,
+        keyRouteAffinityConfig,
+        activeRefreshIntervalMs,
+        idleRefreshIntervalMs,
+        maxConnections,
+        connectionMaxIdleTimeMs,
+        connectionTimeToLiveMs,
+        connectionAcquisitionTimeoutMs,
+        connectionTimeoutMs,
+        NodeHealthConfig.getDefault());
+  }
+
+  /**
+   * Private constructor. Use {@link AlternatorConfig#builder()} to create instances.
+   *
+   * @param seedHosts the list of seed host addresses (IP or hostname) for cluster discovery
+   * @param scheme the URI scheme (http or https)
+   * @param port the port number
+   * @param routingScope the routing scope for node targeting
+   * @param compressionAlgorithm the compression algorithm to use
+   * @param minCompressionSizeBytes minimum request size in bytes to trigger compression
+   * @param responseCompressionAlgorithms response compression algorithms to advertise and decode
+   * @param optimizeHeaders whether to enable HTTP header optimization
+   * @param headersWhitelist the set of headers to preserve when optimization is enabled
+   * @param userAgentEnabled whether user-agent reporting is enabled
+   * @param authenticationEnabled whether authentication is enabled
+   * @param tlsSessionCacheConfig the TLS session cache configuration for quick TLS renegotiation
+   * @param tlsConfig the TLS configuration including CA certificates and verification settings
+   * @param keyRouteAffinityConfig the key route affinity configuration
+   * @param activeRefreshIntervalMs refresh interval when there are active requests
+   * @param idleRefreshIntervalMs refresh interval when the client is idle
+   * @param maxConnections maximum number of connections in the HTTP client pool
+   * @param connectionMaxIdleTimeMs maximum idle time for pooled connections in milliseconds
+   * @param connectionTimeToLiveMs maximum lifetime for pooled connections in milliseconds (0 =
+   *     unlimited)
+   * @param connectionAcquisitionTimeoutMs maximum time to wait for a connection from the pool in
+   *     milliseconds
+   * @param connectionTimeoutMs maximum time to wait for a connection to be established in
+   *     milliseconds
+   * @param nodeHealthConfig configuration for node health tracking
+   */
+  private AlternatorConfig(
+      List<String> seedHosts,
+      String scheme,
+      int port,
+      RoutingScope routingScope,
+      RequestCompressionAlgorithm compressionAlgorithm,
+      int minCompressionSizeBytes,
+      List<ResponseCompressionAlgorithm> responseCompressionAlgorithms,
+      boolean optimizeHeaders,
+      Set<String> headersWhitelist,
+      boolean userAgentEnabled,
+      boolean authenticationEnabled,
+      TlsSessionCacheConfig tlsSessionCacheConfig,
+      TlsConfig tlsConfig,
+      KeyRouteAffinityConfig keyRouteAffinityConfig,
+      long activeRefreshIntervalMs,
+      long idleRefreshIntervalMs,
+      int maxConnections,
+      long connectionMaxIdleTimeMs,
+      long connectionTimeToLiveMs,
+      long connectionAcquisitionTimeoutMs,
+      long connectionTimeoutMs,
+      NodeHealthConfig nodeHealthConfig) {
     this.seedHosts =
         seedHosts != null
             ? Collections.unmodifiableList(new ArrayList<>(seedHosts))
@@ -315,6 +393,8 @@ public class AlternatorConfig {
     this.connectionTimeToLiveMs = connectionTimeToLiveMs;
     this.connectionAcquisitionTimeoutMs = connectionAcquisitionTimeoutMs;
     this.connectionTimeoutMs = connectionTimeoutMs;
+    this.nodeHealthConfig =
+        nodeHealthConfig != null ? nodeHealthConfig : NodeHealthConfig.getDefault();
   }
 
   /**
@@ -610,6 +690,16 @@ public class AlternatorConfig {
   }
 
   /**
+   * Gets the node health tracking configuration.
+   *
+   * @return the node health configuration, never null
+   * @since 2.0.6
+   */
+  public NodeHealthConfig getNodeHealthConfig() {
+    return nodeHealthConfig;
+  }
+
+  /**
    * Returns the set of HTTP headers required for this configuration.
    *
    * <p>This method returns the minimum set of headers needed based on the current settings
@@ -669,6 +759,7 @@ public class AlternatorConfig {
     private long connectionTimeToLiveMs = DEFAULT_CONNECTION_TIME_TO_LIVE_MS;
     private long connectionAcquisitionTimeoutMs = DEFAULT_CONNECTION_ACQUISITION_TIMEOUT_MS;
     private long connectionTimeoutMs = DEFAULT_CONNECTION_TIMEOUT_MS;
+    private NodeHealthConfig nodeHealthConfig = NodeHealthConfig.getDefault();
 
     /** Package-private constructor. Use {@link AlternatorConfig#builder()} to create instances. */
     Builder() {}
@@ -1284,6 +1375,30 @@ public class AlternatorConfig {
     }
 
     /**
+     * Sets node health tracking configuration.
+     *
+     * @param nodeHealthConfig node health configuration, or null to use defaults
+     * @return this builder instance
+     * @since 2.0.6
+     */
+    public Builder withNodeHealthConfig(NodeHealthConfig nodeHealthConfig) {
+      this.nodeHealthConfig =
+          nodeHealthConfig != null ? nodeHealthConfig : NodeHealthConfig.getDefault();
+      return this;
+    }
+
+    /**
+     * Disables node health tracking.
+     *
+     * @return this builder instance
+     * @since 2.0.6
+     */
+    public Builder withNodeHealthDisabled() {
+      this.nodeHealthConfig = NodeHealthConfig.disabled();
+      return this;
+    }
+
+    /**
      * Builds and returns an {@link AlternatorConfig} instance with the configured settings.
      *
      * @return a new {@link AlternatorConfig} instance
@@ -1396,7 +1511,8 @@ public class AlternatorConfig {
           connectionMaxIdleTimeMs,
           connectionTimeToLiveMs,
           connectionAcquisitionTimeoutMs,
-          connectionTimeoutMs);
+          connectionTimeoutMs,
+          nodeHealthConfig);
     }
   }
 }

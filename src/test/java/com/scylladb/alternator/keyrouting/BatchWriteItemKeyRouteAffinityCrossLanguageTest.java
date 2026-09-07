@@ -19,7 +19,6 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import com.scylladb.alternator.internal.AlternatorLiveNodes;
-import com.scylladb.alternator.internal.LazyQueryPlan;
 import com.scylladb.alternator.keyrouting.KeyAffinityRequestClassifier.BatchWriteRoutingTarget;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -114,7 +113,7 @@ public class BatchWriteItemKeyRouteAffinityCrossLanguageTest {
       }
       try {
         long hash = AttributeValueHasher.hash(pkValue);
-        URI preferredNode = LazyQueryPlan.preferredNodeForHash(liveNodes, hash);
+        URI preferredNode = liveNodes.getPreferredQueryPlanNodeForHash(hash);
         if (preferredNode != null) {
           votes.merge(preferredNode, 1, Integer::sum);
         }

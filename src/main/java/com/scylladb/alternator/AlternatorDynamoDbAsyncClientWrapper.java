@@ -19,6 +19,7 @@ import com.scylladb.alternator.internal.AlternatorLiveNodes;
 import com.scylladb.alternator.queryplan.AffinityQueryPlanInterceptor;
 import java.net.URI;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import software.amazon.awssdk.http.SdkHttpClient;
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 
@@ -43,7 +44,6 @@ import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
  *
  * // Access Alternator-specific functionality
  * List<URI> nodes = wrapper.getLiveNodes();
- * URI nextNode = wrapper.nextAsURI();
  * }</pre>
  *
  * @author dmitry.kropachev
@@ -131,9 +131,19 @@ public class AlternatorDynamoDbAsyncClientWrapper implements AutoCloseable {
   }
 
   /**
-   * Returns a snapshot of the current live nodes list.
+   * Returns a snapshot of the current discovered nodes list.
    *
-   * @return an unmodifiable list of the current live node URIs
+   * @return an unmodifiable list of the current discovered node URIs
+   * @since 2.1.0
+   */
+  public List<URI> getDiscoveredNodes() {
+    return liveNodes.getDiscoveredNodes();
+  }
+
+  /**
+   * Returns a snapshot of the current discovered nodes list.
+   *
+   * @return an unmodifiable list of the current discovered node URIs
    */
   public List<URI> getLiveNodes() {
     return liveNodes.getLiveNodes();
@@ -142,10 +152,34 @@ public class AlternatorDynamoDbAsyncClientWrapper implements AutoCloseable {
   /**
    * Returns the next node URI using round-robin selection.
    *
-   * @return the next {@link URI} in the round-robin sequence
+   * @return the next eligible node URI
+   * @deprecated Request routing is automatic; use {@link #getLiveNodes()} to inspect topology.
    */
+  @Deprecated
   public URI nextAsURI() {
     return liveNodes.nextAsURI();
+  }
+
+  /**
+   * Directly probes and activates reachable quarantined nodes in the current discovered set.
+   *
+   * <p>This control-plane operation is synchronous and uses the client's polling HTTP transport.
+   *
+   * @return endpoints that returned HTTP 200 during this probe operation
+   * @since 2.1.0
+   */
+  public List<URI> probeQuarantinedNodes() {
+    return liveNodes.probeQuarantinedNodes();
+  }
+
+  /**
+   * Asynchronously probes and activates reachable quarantined nodes.
+   *
+   * @return future containing endpoints that returned HTTP 200 in snapshot order
+   * @since 2.1.0
+   */
+  public CompletableFuture<List<URI>> probeQuarantinedNodesAsync() {
+    return liveNodes.probeQuarantinedNodesAsync();
   }
 
   /**

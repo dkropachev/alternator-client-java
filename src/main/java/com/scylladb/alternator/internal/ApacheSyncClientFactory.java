@@ -96,9 +96,14 @@ public final class ApacheSyncClientFactory {
    * @return a configured SdkHttpClient with small pool size
    */
   public static SdkHttpClient createPollingClient(TlsConfig tlsConfig) {
+    return createPollingClient(tlsConfig, 4);
+  }
+
+  /** Creates a sync HTTP client for LiveNodes polling with the requested pool size. */
+  public static SdkHttpClient createPollingClient(TlsConfig tlsConfig, int maxConnections) {
     ApacheHttpClient.Builder builder = ApacheHttpClient.builder();
     builder.tcpKeepAlive(true);
-    builder.maxConnections(4);
+    builder.maxConnections(maxConnections);
 
     return buildWithTls(builder, tlsConfig);
   }

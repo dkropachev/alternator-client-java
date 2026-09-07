@@ -31,9 +31,9 @@ import org.junit.Test;
 /**
  * Tests that HTTP connections are properly managed and not leaked in AlternatorLiveNodes.
  *
- * <p>These tests call {@link AlternatorLiveNodes#updateLiveNodes()} synchronously (no background
- * thread) and verify that connections are properly released by checking that subsequent requests
- * succeed (they would hang/fail if connections were leaked from a small pool).
+ * <p>These tests call {@link AlternatorLiveNodes#refreshDiscoveredNodes()} synchronously (no
+ * background thread) and verify that connections are properly released by checking that subsequent
+ * requests succeed (they would hang/fail if connections were leaked from a small pool).
  */
 public class ConnectionLeakTest {
 
@@ -89,7 +89,7 @@ public class ConnectionLeakTest {
 
     // If connections are leaked, this will eventually hang due to pool exhaustion
     for (int i = 0; i < 20; i++) {
-      liveNodes.updateLiveNodes();
+      liveNodes.refreshDiscoveredNodes();
     }
     // If we get here without timeout, connections are properly released
   }
@@ -102,10 +102,10 @@ public class ConnectionLeakTest {
     AlternatorLiveNodes liveNodes = createLiveNodes();
 
     for (int i = 0; i < 30; i++) {
-      liveNodes.updateLiveNodes();
+      liveNodes.refreshDiscoveredNodes();
     }
 
-    assertEquals(2, liveNodes.getLiveNodes().size());
+    assertEquals(2, liveNodes.getDiscoveredNodes().size());
   }
 
   /** Verifies malformed successful /localnodes responses do not terminate discovery. */
@@ -117,11 +117,11 @@ public class ConnectionLeakTest {
 
     for (int i = 0; i < 30; i++) {
       responseBody = malformedBodies[i % malformedBodies.length];
-      liveNodes.updateLiveNodes();
+      liveNodes.refreshDiscoveredNodes();
     }
 
-    assertEquals(1, liveNodes.getLiveNodes().size());
-    assertEquals("127.0.0.1", liveNodes.getLiveNodes().get(0).getHost());
+    assertEquals(1, liveNodes.getDiscoveredNodes().size());
+    assertEquals("127.0.0.1", liveNodes.getDiscoveredNodes().get(0).getHost());
   }
 
   /** Verifies no leaks when alternating between error and success responses. */
@@ -151,7 +151,7 @@ public class ConnectionLeakTest {
     AlternatorLiveNodes liveNodes = createLiveNodes();
 
     for (int i = 0; i < 40; i++) {
-      liveNodes.updateLiveNodes();
+      liveNodes.refreshDiscoveredNodes();
     }
     // If we get here without timeout, connections are properly released
   }
@@ -171,10 +171,10 @@ public class ConnectionLeakTest {
 
     // Make several requests so the connection pool has a chance to stabilize
     for (int i = 0; i < 20; i++) {
-      liveNodes.updateLiveNodes();
+      liveNodes.refreshDiscoveredNodes();
     }
 
     // All requests should succeed, proving connections are properly managed
-    assertEquals(1, liveNodes.getLiveNodes().size());
+    assertEquals(1, liveNodes.getDiscoveredNodes().size());
   }
 }

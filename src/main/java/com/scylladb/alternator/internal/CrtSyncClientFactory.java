@@ -107,6 +107,11 @@ public final class CrtSyncClientFactory {
    * @return a configured SdkHttpClient with small pool size
    */
   public static SdkHttpClient createPollingClient(TlsConfig tlsConfig) {
+    return createPollingClient(tlsConfig, 4);
+  }
+
+  /** Creates a sync HTTP client for LiveNodes polling with the requested pool size. */
+  public static SdkHttpClient createPollingClient(TlsConfig tlsConfig, int maxConcurrency) {
     validateTlsConfig(tlsConfig);
     AwsCrtHttpClient.Builder builder = AwsCrtHttpClient.builder();
     builder.tcpKeepAliveConfiguration(
@@ -114,7 +119,7 @@ public final class CrtSyncClientFactory {
             .keepAliveInterval(Duration.ofSeconds(30))
             .keepAliveTimeout(Duration.ofSeconds(30))
             .build());
-    builder.maxConcurrency(4);
+    builder.maxConcurrency(maxConcurrency);
 
     return buildWithTls(builder, tlsConfig);
   }

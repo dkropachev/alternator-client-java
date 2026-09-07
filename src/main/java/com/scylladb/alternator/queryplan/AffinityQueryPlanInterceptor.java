@@ -38,10 +38,11 @@ import software.amazon.awssdk.services.dynamodb.model.BatchWriteItemRequest;
 /**
  * Execution interceptor that implements key-based route affinity.
  *
- * <p>This interceptor extends {@link BasicQueryPlanInterceptor} to provide deterministic routing
- * based on partition key values. When key affinity conditions are met, it creates a {@link
- * LazyQueryPlan} with a seed derived from the partition key hash, ensuring that requests for the
- * same partition key are routed to the same node.
+ * <p>This interceptor extends {@link BasicQueryPlanInterceptor} to provide deterministic
+ * discovered-node candidate order based on partition key values. When key affinity conditions are
+ * met, it creates a {@link LazyQueryPlan} with a seed derived from the partition key hash. Final
+ * node-health eligibility is applied by {@link BasicQueryPlanInterceptor} as each request attempt
+ * is routed.
  *
  * <p>When key affinity conditions are not met (e.g., request type doesn't qualify, partition key
  * not found), the interceptor falls back to the random plan created by the base class.
@@ -144,7 +145,7 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
       return null;
     }
 
-    // Hash the partition key and create a deterministic query plan
+    // Hash the partition key and create a deterministic known-node candidate order.
     try {
       long hash = AttributeValueHasher.hash(pkValue);
       return new LazyQueryPlan(liveNodes, hash);
@@ -174,15 +175,15 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
 
       try {
         long hash = AttributeValueHasher.hash(pkValue);
-        URI preferredNode = LazyQueryPlan.preferredNodeForHash(liveNodes, hash);
-        if (preferredNode == null) {
-          return null;
+        URI preferredNode = liveNodes.getPreferredQueryPlanNodeForHash(hash);
+        if (preferredNode != null) {
+          votes.merge(preferredNode, 1, Integer::sum);
         }
-        votes.merge(preferredNode, 1, Integer::sum);
       } catch (IllegalArgumentException e) {
         // Unsupported partition-key shapes cannot be routed by key affinity.
       }
     }
+
     List<URI> preferredNodes = votePreferenceOrder(votes);
     if (preferredNodes.isEmpty()) {
       return null;
@@ -205,15 +206,14 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
   }
 
   @Override
-  public void beforeExecution(
+  protected void initializeQueryPlan(
       Context.BeforeExecution context, ExecutionAttributes executionAttributes) {
     LazyQueryPlan plan = getQueryPlan(context.request());
+    boolean affinity = plan != null;
     if (plan == null) {
       plan = new LazyQueryPlan(liveNodes);
     }
-
-    // Override the random plan with the deterministic one
-    executionAttributes.putAttribute(QUERY_PLAN, plan);
+    setQueryPlan(executionAttributes, plan, affinity);
   }
 
   /**

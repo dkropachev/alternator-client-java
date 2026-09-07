@@ -140,7 +140,7 @@ public class KeyRouteAffinityAutodiscoveryIT {
       Thread.sleep(2000);
 
       // Second write should now benefit from cached PK info.
-      // If autodiscovery failed, this would still succeed (falls back to round-robin),
+      // If autodiscovery failed, this would still succeed (falls back to random query-plan routing),
       // but we verify the data is correct regardless.
       client.putItem(
           PutItemRequest.builder()

@@ -40,7 +40,7 @@ public class AlternatorLiveNodesKeepAliveTest {
 
   /**
    * Mock SdkHttpClient that captures outgoing requests and returns a valid /localnodes JSON
-   * response so that updateLiveNodes() succeeds.
+   * response so that refreshDiscoveredNodes() succeeds.
    */
   private static class CapturingHttpClient implements SdkHttpClient {
     final List<SdkHttpRequest> capturedRequests = new CopyOnWriteArrayList<>();
@@ -80,7 +80,7 @@ public class AlternatorLiveNodesKeepAliveTest {
     AlternatorLiveNodes liveNodes = new AlternatorLiveNodes(config, capturingClient);
 
     // Trigger a polling cycle
-    liveNodes.updateLiveNodes();
+    liveNodes.refreshDiscoveredNodes();
 
     assertFalse(
         "Should have captured at least one request", capturingClient.capturedRequests.isEmpty());
@@ -105,7 +105,7 @@ public class AlternatorLiveNodesKeepAliveTest {
 
     // Multiple polling cycles
     for (int i = 0; i < 5; i++) {
-      liveNodes.updateLiveNodes();
+      liveNodes.refreshDiscoveredNodes();
     }
 
     assertTrue(
@@ -129,7 +129,7 @@ public class AlternatorLiveNodesKeepAliveTest {
     AlternatorLiveNodes liveNodes = new AlternatorLiveNodes(config, capturingClient);
 
     // Trigger a polling cycle
-    liveNodes.updateLiveNodes();
+    liveNodes.refreshDiscoveredNodes();
 
     assertFalse(
         "Should have captured at least one request", capturingClient.capturedRequests.isEmpty());
@@ -155,7 +155,7 @@ public class AlternatorLiveNodesKeepAliveTest {
 
     // Multiple polling cycles
     for (int i = 0; i < 5; i++) {
-      liveNodes.updateLiveNodes();
+      liveNodes.refreshDiscoveredNodes();
     }
 
     assertTrue(
