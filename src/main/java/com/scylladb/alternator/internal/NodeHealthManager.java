@@ -318,7 +318,14 @@ final class NodeHealthManager {
     if (!explicit) {
       return existing.result;
     }
+    boolean completedBeforeJoin = existing.isCompleted();
     existing.requestExplicit();
+    if (completedBeforeJoin) {
+      // Result completion precedes physical cleanup so timeouts are observable even when a
+      // transport is slow to honor abortion. A later explicit caller must not reuse that completed
+      // result: wait for the old job to leave the in-flight map, then submit fresh work.
+      return existing.physicalCompletion.thenCompose(ignored -> submitProbe(node, priority, true));
+    }
     // The background worker may already have committed to skipping just before the upgrade. Wait
     // for it to leave the in-flight map before retrying so an explicit caller gets an actual probe
     // while the node remains quarantined.
@@ -559,6 +566,10 @@ final class NodeHealthManager {
 
     private boolean isRunning() {
       return running;
+    }
+
+    private boolean isCompleted() {
+      return completed.get();
     }
 
     @Override

@@ -117,6 +117,35 @@ public class AlternatorLiveNodesConcurrentProbeTest {
   }
 
   @Test
+  public void explicitProbeAfterCompletedTimeoutWaitsForCleanupAndRunsAgain() throws Exception {
+    SlowAbortHttpClient client = new SlowAbortHttpClient();
+    URI node = node("node-a.local");
+    AlternatorLiveNodes liveNodes =
+        liveNodes(
+            Arrays.asList(node.getHost()),
+            NodeHealthConfig.builder()
+                .withHealthProbeConcurrency(1)
+                .withHealthProbeTimeoutMs(50)
+                .build(),
+            client,
+            null);
+    try {
+      assertTrue(liveNodes.probeQuarantinedNodes().isEmpty());
+      assertTrue(client.firstStarted.await(5, TimeUnit.SECONDS));
+
+      CompletableFuture<List<URI>> second = liveNodes.probeQuarantinedNodesAsync();
+      assertFalse("completed probe result must not satisfy a later call", second.isDone());
+
+      client.releaseFirst.countDown();
+      assertEquals(Arrays.asList(node), second.get(5, TimeUnit.SECONDS));
+      assertEquals(2, client.calls.get());
+    } finally {
+      client.releaseFirst.countDown();
+      liveNodes.shutdownAndWait();
+    }
+  }
+
+  @Test
   public void successfulTrafficSkipsQueuedBackgroundProbeOnce() throws Exception {
     FirstProbeBlockingHttpClient client = new FirstProbeBlockingHttpClient();
     AlternatorLiveNodes liveNodes =
@@ -482,6 +511,45 @@ public class AlternatorLiveNodesConcurrentProbeTest {
     @Override
     public String clientName() {
       return "partial-response-blocking";
+    }
+  }
+
+  private static final class SlowAbortHttpClient implements SdkHttpClient {
+    private final AtomicInteger calls = new AtomicInteger();
+    private final CountDownLatch firstStarted = new CountDownLatch(1);
+    private final CountDownLatch releaseFirst = new CountDownLatch(1);
+
+    @Override
+    public ExecutableHttpRequest prepareRequest(HttpExecuteRequest request) {
+      return new ExecutableHttpRequest() {
+        @Override
+        public HttpExecuteResponse call() throws IOException {
+          int call = calls.incrementAndGet();
+          if (call == 1) {
+            firstStarted.countDown();
+            try {
+              releaseFirst.await();
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              throw new IOException(e);
+            }
+          }
+          return okResponse();
+        }
+
+        @Override
+        public void abort() {
+          // Deliberately return without releasing the request to expose the cleanup handoff.
+        }
+      };
+    }
+
+    @Override
+    public void close() {}
+
+    @Override
+    public String clientName() {
+      return "slow-abort";
     }
   }
 

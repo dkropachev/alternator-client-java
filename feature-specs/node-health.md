@@ -359,7 +359,9 @@ Probe work is deduplicated by canonical endpoint across background and explicit 
 queue admits at most seventeen times the configured concurrency including running jobs. Excess
 background work is retried by a later cycle; an explicit call fails when capacity is exhausted.
 Queued explicit work may upgrade an existing queued background job. Cancelling an aggregate explicit
-future does not cancel endpoint work shared with other callers.
+future does not cancel endpoint work shared with other callers. An explicit call that begins after a
+shared result is already complete must not reuse that completed result: it waits for physical cleanup
+and submits a fresh probe if the endpoint remains eligible.
 
 Background admission must avoid starving either health tier or nodes near the end of a large
 candidate set. When both down and quarantined work exist, a cycle shares its currently available
