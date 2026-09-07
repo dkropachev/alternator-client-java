@@ -38,9 +38,10 @@ to this Java implementation without making the Java names normative for other cl
 | Canonical endpoint | The normalized identity used to recognize equivalent endpoint spellings, including implicit and explicit default ports. | `NodeHealthStore.canonicalNodeKey(...)` in [`NodeHealthStore`](../src/main/java/com/scylladb/alternator/internal/NodeHealthStore.java) |
 | Discovered set | Endpoints returned for the effective routing scope by topology discovery. | `discoveredNodes` in `AlternatorLiveNodes` |
 | Health state | The routing classification `ACTIVE`, `QUARANTINED`, or `DOWN`. | [`NodeHealthState`](../src/main/java/com/scylladb/alternator/NodeHealthState.java) |
-| Status | A snapshot containing state, relevant consecutive counters, and last-update time. | [`NodeHealthStatus`](../src/main/java/com/scylladb/alternator/NodeHealthStatus.java) |
+| Status | A snapshot containing state, relevant consecutive counters, last-update time, and the current attempt generation. | [`NodeHealthStatus`](../src/main/java/com/scylladb/alternator/NodeHealthStatus.java) |
 | Health store | Per-client mutable state and state-transition logic keyed by canonical endpoint. | `NodeHealthStore` |
 | Observation | A classified traffic or probe result that is allowed to update health. | [`NodeHealthObservation`](../src/main/java/com/scylladb/alternator/NodeHealthObservation.java) |
+| Attempt generation | A per-endpoint token captured when traffic is routed and incremented whenever the endpoint enters `DOWN`. It prevents a late result from an older health cycle from changing current health. | `NodeHealthStatus.getGeneration()` and the generation-aware `AlternatorLiveNodes.reportNodeResult(...)` overload |
 | Health-neutral response | A response that updates transmission bookkeeping but produces no health observation and changes no health counter or timestamp. | The retryable-server-status branch in [`BasicQueryPlanInterceptor`](../src/main/java/com/scylladb/alternator/queryplan/BasicQueryPlanInterceptor.java) |
 | Admission quarantine | Initial validation of a configured seed or newly discovered endpoint. | A node added through `NodeHealthStore.addQuarantinedNode(...)` |
 | Recovery quarantine | Verification after a `DOWN` endpoint passes enough recovery probes. | `QUARANTINED` after down-node recovery |
@@ -121,15 +122,23 @@ quarantined endpoint and initializes its active counters; a failed direct probe 
 traffic counters unchanged. A discovery or probe failure does not count as a DynamoDB traffic
 failure.
 
-Each background health-probe cycle first advances recovery for down endpoints and then directly
-probes quarantined endpoints in the current discovered set. Explicit `probeQuarantinedNodes()` calls
-run the quarantine portion immediately without waiting for the next cycle.
+Standalone health probes classify `/localnodes` responses by HTTP status and do not parse the
+response body. Topology discovery also requires a syntactically valid response body before it
+reports a successful contact; a valid empty array is still a successful direct contact.
+
+Each background health-probe cycle takes snapshots of eligible down and quarantined endpoints and
+submits both kinds of work without waiting for either kind to finish. Admitted down-node work has
+higher queue priority than background quarantine validation. A down endpoint that reaches recovery
+quarantine becomes eligible for direct validation in a later cycle; it is not added to the
+quarantine snapshot already taken for the current cycle. Explicit `probeQuarantinedNodes()` calls
+run quarantine validation immediately without waiting for the next cycle.
 
 Health probes run through a bounded priority executor. Explicit probes have highest priority,
 followed by down-node recovery and background quarantine validation. One canonical endpoint may
 have at most one physical probe in flight; concurrent requests share its result. Background cycles
-submit work without waiting, while explicit synchronous and asynchronous APIs wait for their own
-snapshot results. Per-node failures do not fail an explicit batch.
+submit work without waiting. Explicit synchronous calls return, and explicit asynchronous futures
+complete, only after their own snapshot results settle. Per-node failures do not fail an explicit
+batch.
 
 The per-probe timeout starts when a worker begins the request. Timeout reports probe failure and
 aborts the prepared request. A late response after timeout is ignored. Transport implementations
@@ -171,14 +180,29 @@ must honor request abortion for timeout and shutdown to release blocked workers 
 Entering recovery quarantine never promotes a node directly to active. A subsequent successful
 DynamoDB promotion sequence or direct validation probe is required.
 
+### Attempt generations and stale traffic
+
+Every endpoint starts with attempt generation zero. Entering `DOWN` increments its generation,
+including each later transition to `DOWN` after a recovery cycle. A transport must capture the
+current generation at the final eligibility check for each DynamoDB attempt and submit that captured
+generation with the attempt's health observation.
+
+A traffic observation is accepted only when its captured generation equals the endpoint's current
+generation. This rule rejects results from attempts sent before the endpoint entered `DOWN`, even if
+the result arrives after that endpoint has recovered to quarantine or active. Rejected stale results
+must not change state, counters, or the health-update time. Probe observations do not use attempt
+generations.
+
 ## Endpoint admission and direct validation
 
 Endpoint admission uses direct client-to-endpoint evidence instead of trusting an endpoint merely
 because another node returned it from topology discovery:
 
 1. Configured seeds start quarantined and remain eligible as bootstrap candidates.
-2. A quarantined seed or other quarantined discovery candidate that successfully returns a valid
-   HTTP 200 `/localnodes` response becomes active, including when the returned node list is empty.
+2. A quarantined seed or other quarantined discovery candidate that successfully returns HTTP 200
+   from `/localnodes` becomes active. A standalone direct validation probe checks status only. A
+   topology-discovery contact additionally requires a parseable response body; an empty array is
+   valid and activates the contacted endpoint.
 3. Endpoints contained in a discovery response are added in quarantine unless the client already
    has a health record for them. Being reported by another node does not activate them.
 4. Background health cycles and `probeQuarantinedNodes()` directly send `GET /localnodes` to each
@@ -214,6 +238,14 @@ for source compatibility. Their values no longer affect routing.
 Built-in polling transports reserve one connection beyond health-probe concurrency for topology and
 feature-check traffic. An externally supplied polling transport must support concurrent calls and
 request abortion.
+
+In Java, `AlternatorConfig.Builder.withNodeHealthConfig(...)` installs this configuration and
+`withNodeHealthDisabled()` disables the feature. The synchronous and asynchronous client builders
+provide the same two methods. Client wrappers expose synchronous and asynchronous quarantine-probe
+operations, while `AlternatorLiveNodes` additionally exposes state snapshots and health reporting
+for custom integrations. Java's built-in traffic integration uses the generation-aware
+`reportNodeResult(...)` overload. A custom integration that can have concurrent or late traffic
+results must capture `getNodeHealthGeneration(...)` at final routing and use that overload as well.
 
 ## Health-aware routing
 
@@ -321,14 +353,22 @@ background work is retried by a later cycle; an explicit call fails when capacit
 Queued explicit work may upgrade an existing queued background job. Cancelling an aggregate explicit
 future does not cancel endpoint work shared with other callers.
 
+Background admission must avoid starving either health tier or nodes near the end of a large
+candidate set. When both down and quarantined work exist, a cycle shares its currently available
+capacity between the two tiers, alternates the tier that receives a sole available slot, rotates the
+starting endpoint within each tier across cycles, and reassigns capacity that one tier cannot use.
+Once admitted, executor priority remains explicit probes, down-node recovery, then background
+quarantine validation.
+
 Successful DynamoDB traffic on a quarantined endpoint suppresses one queued or upcoming background
 quarantine probe. A worker already running that endpoint probe continues and its result applies.
 Explicit probes ignore suppression. Traffic failure or transition out of quarantine clears pending
 suppression.
 
-Shutdown rejects new probes, cancels queued work without reporting health failure, aborts running
-control-plane requests, and waits for both live-node and probe executors within one shared timeout.
-A polling transport that ignores abortion may cause bounded shutdown to report failure.
+Shutdown rejects new probes, cancels queued work without reporting health failure, and aborts running
+control-plane requests. The bounded `shutdownAndWait` operation waits for the live-node thread and
+both probe executors within one shared timeout. A polling transport that ignores abortion may cause
+bounded shutdown to report failure.
 
 ### Disabled node health
 
@@ -361,10 +401,14 @@ an endpoint. Other routing features continue to operate normally.
   publication and quarantine-result application use one lock.
 - A successful DynamoDB contact skips a queued background quarantine probe once but does not cancel
   a probe that already started.
+- A down node that reaches recovery quarantine during a background cycle is considered for direct
+  quarantine validation on a later cycle, because both candidate snapshots are taken before work is
+  submitted.
 - Timeout, shutdown, and HTTP completion race through one terminal decision; at most one observation
   updates health.
-- A response received after another concurrent attempt marks the endpoint down is stale and must
-  not resurrect it.
+- A response received after another concurrent attempt marks the endpoint down carries an older
+  attempt generation and must not resurrect it, even if recovery completed before that response
+  arrived.
 
 ## Regular logic edge cases
 
@@ -396,6 +440,8 @@ The Java implementation organizes conformance coverage as follows:
 | Admission quarantine, explicit validation probes, discovery, down-node probes, rediscovery, scope behavior, and control-plane isolation | [`AlternatorLiveNodesNodeHealthTest`](../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesNodeHealthTest.java) |
 | Probe concurrency, timeout, suppression, topology races, and shutdown rejection | [`AlternatorLiveNodesConcurrentProbeTest`](../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesConcurrentProbeTest.java) |
 | Per-attempt retry routing, transport reports, authentication responses, and health-neutral server statuses | [`RetryDistributionTest`](../src/test/java/com/scylladb/alternator/RetryDistributionTest.java) |
+| Final-gate revalidation before the first physical transmission | [`BasicQueryPlanInterceptorTest`](../src/test/java/com/scylladb/alternator/queryplan/BasicQueryPlanInterceptorTest.java) |
+| Polling-loop resilience, probe scheduling during refresh failures, and bounded shutdown | [`AlternatorLiveNodesShutdownTest`](../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesShutdownTest.java) |
 | Affinity request classification, batch voting, random fallback, and down preferred candidates | [`AffinityQueryPlanInterceptorTest`](../src/test/java/com/scylladb/alternator/AffinityQueryPlanInterceptorTest.java) |
 | Stable cross-language base-plan ordering | [`LazyQueryPlanCrossLanguageTest`](../src/test/java/com/scylladb/alternator/LazyQueryPlanCrossLanguageTest.java) |
 | Default configuration compatibility | [`AlternatorConfigCompatibilityTest`](../src/test/java/com/scylladb/alternator/AlternatorConfigCompatibilityTest.java) |
