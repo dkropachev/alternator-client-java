@@ -1441,8 +1441,13 @@ public class AlternatorLiveNodes extends Thread {
 
   static List<URI> sortAndDedupeNodes(List<URI> nodes) {
     List<URI> sorted = dedupePreservingOrder(nodes);
-    sorted.sort(Comparator.comparing(URI::toString));
+    sorted.sort(Comparator.comparing(AlternatorLiveNodes::canonicalNodeSortKey));
     return sorted;
+  }
+
+  private static String canonicalNodeSortKey(URI node) {
+    URI key = NodeHealthStore.canonicalNodeKey(node);
+    return key.toString().toLowerCase(Locale.ROOT);
   }
 
   static List<URI> dedupePreservingOrder(List<URI> nodes) {

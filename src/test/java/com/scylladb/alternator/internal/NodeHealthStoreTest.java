@@ -17,6 +17,7 @@ package com.scylladb.alternator.internal;
 
 import static org.junit.Assert.*;
 
+import com.scylladb.alternator.CoversRequirements;
 import com.scylladb.alternator.NodeHealthConfig;
 import com.scylladb.alternator.NodeHealthObservation;
 import com.scylladb.alternator.NodeHealthState;
@@ -366,6 +367,7 @@ public class NodeHealthStoreTest {
   }
 
   @Test
+  @CoversRequirements("HEALTH-REQ-004")
   public void trafficFromGenerationBeforeDownIsIgnoredAfterRecovery() {
     URI node = node("node1.local");
     NodeHealthConfig config =

@@ -19,6 +19,7 @@ import static org.junit.Assert.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
+import com.scylladb.alternator.CoversRequirements;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
@@ -36,6 +37,7 @@ import software.amazon.awssdk.services.dynamodb.model.DescribeTableResponse;
 import software.amazon.awssdk.services.dynamodb.model.DynamoDbException;
 import software.amazon.awssdk.services.dynamodb.model.KeySchemaElement;
 import software.amazon.awssdk.services.dynamodb.model.KeyType;
+import software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughputExceededException;
 import software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException;
 import software.amazon.awssdk.services.dynamodb.model.TableDescription;
 
@@ -154,6 +156,59 @@ public class PartitionKeyResolverTest {
 
     assertEquals("item_id", resolver.getPartitionKeyName("items"));
     assertEquals(3, attempts.get()); // 2 failures + 1 success
+  }
+
+  @Test
+  @CoversRequirements("AFF-REQ-002")
+  public void testRetryOnModeledStructured400WithoutAwsErrorDetails() throws Exception {
+    AtomicInteger attempts = new AtomicInteger(0);
+    CountDownLatch latch = new CountDownLatch(1);
+
+    when(mockClient.describeTable(any(DescribeTableRequest.class)))
+        .thenAnswer(
+            (Answer<DescribeTableResponse>)
+                invocation -> {
+                  if (attempts.incrementAndGet() == 1) {
+                    throw ProvisionedThroughputExceededException.builder()
+                        .message("Rate exceeded")
+                        .statusCode(400)
+                        .build();
+                  }
+                  latch.countDown();
+                  return createDescribeTableResponse("item_id");
+                });
+
+    resolver.triggerDiscovery("items", mockClient);
+
+    assertTrue(
+        "Discovery should retry the modeled transient error", latch.await(5, TimeUnit.SECONDS));
+    resolver.shutdown();
+    assertEquals("item_id", resolver.getPartitionKeyName("items"));
+    assertEquals(2, attempts.get());
+    assertFalse(resolver.isInFailureCooldown("items"));
+  }
+
+  @Test
+  public void testUnknownSubclassWithoutAwsErrorDetailsUsesStatusFallback() throws Exception {
+    AtomicInteger attempts = new AtomicInteger(0);
+    CountDownLatch latch = new CountDownLatch(1);
+
+    when(mockClient.describeTable(any(DescribeTableRequest.class)))
+        .thenAnswer(
+            (Answer<DescribeTableResponse>)
+                invocation -> {
+                  attempts.incrementAndGet();
+                  latch.countDown();
+                  throw new CustomDynamoDbException(
+                      DynamoDbException.builder().message("Bad request").statusCode(400));
+                });
+
+    resolver.triggerDiscovery("custom-failure", mockClient);
+
+    assertTrue("Discovery should complete", latch.await(5, TimeUnit.SECONDS));
+    resolver.shutdown();
+    assertEquals("Unknown subclasses should not bypass status classification", 1, attempts.get());
+    assertTrue(resolver.isInFailureCooldown("custom-failure"));
   }
 
   @Test
@@ -413,5 +468,11 @@ public class PartitionKeyResolverTest {
                             .build()))
                 .build())
         .build();
+  }
+
+  private static final class CustomDynamoDbException extends DynamoDbException {
+    private CustomDynamoDbException(DynamoDbException.Builder builder) {
+      super(builder);
+    }
   }
 }

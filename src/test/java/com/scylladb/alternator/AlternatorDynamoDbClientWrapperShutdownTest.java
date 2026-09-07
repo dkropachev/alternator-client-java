@@ -81,6 +81,7 @@ public class AlternatorDynamoDbClientWrapperShutdownTest {
   }
 
   @Test
+  @CoversRequirements("AFF-REQ-007")
   public void testAsyncWrapperShutsDownAffinityResolverBeforeClosingClients() {
     List<String> events = new ArrayList<>();
     TrackingLiveNodes liveNodes = new TrackingLiveNodes(events);

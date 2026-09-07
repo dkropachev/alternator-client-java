@@ -89,6 +89,7 @@ public class ResponseCompressionInterceptorTest {
   }
 
   @Test
+  @CoversRequirements("COMP-REQ-004")
   public void testGzipSyncResponseIsDecompressedAndHeadersAreStripped() throws Exception {
     byte[] original = "compressed gzip response".getBytes(StandardCharsets.UTF_8);
     byte[] compressed = gzip(original);
@@ -179,6 +180,7 @@ public class ResponseCompressionInterceptorTest {
   }
 
   @Test
+  @CoversRequirements("COMP-REQ-006")
   public void testGzipAsyncResponseIsDecompressedAndHeadersAreStripped() throws Exception {
     byte[] original = "async gzip response".getBytes(StandardCharsets.UTF_8);
     byte[] compressed = gzip(original);

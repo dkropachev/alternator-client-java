@@ -41,7 +41,7 @@ DOCKER_CACHE_FILE := $(DOCKER_CACHE_DIR)/scylla-image.tar
 CERT_CACHE_DIR := $(MAKEFILE_PATH)/.cert-cache
 CERT_DIR := $(MAKEFILE_PATH)/test/scylla
 
-.PHONY: clean verify lint lint-fix compile compile-test compile-demo test test-unit test-integration test-demo release-prepare release release-dry-run
+.PHONY: clean verify lint lint-specs lint-fix compile compile-test compile-demo test test-unit test-integration test-demo release-prepare release release-dry-run
 
 clean:
 	${mvn} clean
@@ -54,7 +54,11 @@ lint:
 	${mvn} fmt:check
 	${mvn} checkstyle:check
 	${mvn} compile test-compile
+	$(MAKE) lint-specs
 	$(MAKE) lint-docs
+
+lint-specs:
+	${mvn} test -Dtest=FeatureSpecFormatTest,FeatureSpecVectorsTest,FeatureSpecDefaultsTest,FeatureSpecCanonicalEndpointVectorsTest,FeatureSpecNodeHealthTransitionsTest
 
 lint-docs:
 	${mvn} javadoc:test-javadoc javadoc:test-aggregate javadoc:test-aggregate-jar javadoc:test-jar javadoc:test-resource-bundle

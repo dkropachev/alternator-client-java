@@ -21,6 +21,14 @@ it do the right thing for Alternator.
 
 This library supports AWS SDK for Java Version 2 (requires 2.20 or above) and requires Java 11 or later.
 
+The language-agnostic feature contracts are maintained in [`feature-specs`](feature-specs/README.md):
+
+- [Compression](feature-specs/compression.md)
+- [Header optimization](feature-specs/header-optimization.md)
+- [Key-route affinity](feature-specs/key-route-affinity.md)
+- [Node health](feature-specs/node-health.md)
+- [Query plans](feature-specs/query-plan.md)
+
 ## Add `load-balancing` to your project
 
 ### Maven Dependency
@@ -431,6 +439,9 @@ mvn exec:java -Dexec.mainClass=com.scylladb.alternator.demo.Demo5 -Dexec.classpa
 
 ### HTTP Compression
 
+The normative, language-agnostic behavior is defined in the
+[compression feature specification](feature-specs/compression.md).
+
 #### Response compression
 
 Response compression is disabled by default. To negotiate compressed responses,
@@ -487,6 +498,12 @@ Request compression is separate and remains opt-in.
 The library supports optional GZIP compression for HTTP request bodies, which can
 reduce network bandwidth usage when sending large payloads to Alternator.
 
+> **Known issue:** Request compression is not currently safe in the real AWS SDK pipeline. The
+> interceptor adds `Content-Encoding: gzip` after its opportunity to replace the request body has
+> already passed, so an above-threshold request can send uncompressed JSON under a gzip header.
+> Keep request compression disabled until this is fixed. See the
+> [compression implementation's conformance gaps](feature-specs/implementation/compression.md#known-conformance-gaps).
+
 ##### Why not use AWS SDK's built-in compression?
 
 AWS SDK for Java v2 includes a `CompressionConfiguration` feature, but it **only works
@@ -541,6 +558,9 @@ Request compression may not be beneficial for:
 
 ### Headers Optimization
 
+The normative, language-agnostic behavior is defined in the
+[header-optimization feature specification](feature-specs/header-optimization.md).
+
 The library supports optional HTTP headers optimization, which reduces network bandwidth by
 removing headers that Alternator does not use. According to benchmarks, this can reduce
 outgoing traffic by up to 56% depending on workload and encryption.
@@ -571,6 +591,8 @@ the active configuration:
 - `Content-Encoding` - For request compression (when enabled)
 - `Authorization` - AWS SigV4 signature (when authentication is enabled)
 - `X-Amz-Date` - Timestamp for AWS signature (when authentication is enabled)
+- `X-Amz-Security-Token` - Required with temporary session credentials; currently missing from the
+  computed whitelist (see the known gaps below)
 - `User-Agent` - Reports the ScyllaDB Alternator client version
 
 All other headers (such as `X-Amz-Sdk-Invocation-Id`, `amz-sdk-request`, `X-Amz-Content-Sha256`) are removed.
@@ -594,9 +616,15 @@ DynamoDbClient client = AlternatorDynamoDbClient.builder()
 ```
 
 **Important:** When using a custom whitelist, make sure to include all headers required for
-authentication (`Authorization`, `X-Amz-Date`), operation (`Host`, `X-Amz-Target`,
+authentication (`Authorization`, `X-Amz-Date`, and `X-Amz-Security-Token` for temporary
+credentials), operation (`Host`, `X-Amz-Target`,
 `Content-Type`, `Content-Length`), response compression when enabled (`Accept-Encoding`),
 connection reuse (`Connection`), and client reporting (`User-Agent`).
+
+The computed default whitelist currently supports basic credentials only. Do not combine header
+optimization with temporary session credentials until `X-Amz-Security-Token` is included
+automatically. See the
+[header-optimization implementation's conformance gaps](feature-specs/implementation/header-optimization.md#known-conformance-gaps).
 
 #### User-Agent customization
 
@@ -901,6 +929,9 @@ The default configuration works well for most use cases. Consider adjusting sett
 
 ### Node Health
 
+The normative, language-agnostic behavior is defined in the
+[node-health feature specification](feature-specs/node-health.md).
+
 The client tracks active, quarantined, and down nodes while routing requests:
 
 - configured seeds and newly discovered nodes start quarantined
@@ -997,9 +1028,14 @@ Node health, including background probes, can be disabled with
 
 ### Key Route Affinity (LWT Optimization)
 
+The normative, language-agnostic behavior is defined in the
+[key-route-affinity feature specification](feature-specs/key-route-affinity.md). Candidate ordering
+and retry traversal are defined separately in the [query-plan specification](feature-specs/query-plan.md).
+
 Key route affinity is an optimization for Lightweight Transactions (LWT) that use Paxos
-consensus. By routing all requests with the same partition key to the same coordinator node,
-it reduces Paxos round-trips and improves latency for conditional writes.
+consensus. It gives requests with the same partition key the same deterministic coordinator
+preference, which can reduce Paxos round-trips and improve latency for conditional writes. Health
+changes, topology changes, and retries can still select another endpoint.
 
 **Note:** Synchronous clients automatically discover missing partition-key names via
 `DescribeTable`. Async clients can use key route affinity with pre-configured partition-key

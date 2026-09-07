@@ -142,6 +142,7 @@ public class LazyQueryPlanTest {
   }
 
   @Test
+  @CoversRequirements("QUERY-REQ-002")
   public void testNodesAreNotDuplicated() {
     LazyQueryPlan plan = new LazyQueryPlan(liveNodes);
 
@@ -190,6 +191,7 @@ public class LazyQueryPlanTest {
   }
 
   @Test
+  @CoversRequirements("QUERY-REQ-001")
   public void testLazyBehaviorReadsCurrentNodes() throws URISyntaxException {
     // Start with 3 nodes
     List<URI> initialNodes = createUriList("initial", 3);
@@ -226,6 +228,7 @@ public class LazyQueryPlanTest {
   }
 
   @Test
+  @CoversRequirements("QUERY-REQ-004")
   public void testPreferredNodesAreReturnedBeforeSortedRemaining() {
     LazyQueryPlan plan = new LazyQueryPlan(liveNodes, Arrays.asList(nodes.get(2), nodes.get(4)));
 

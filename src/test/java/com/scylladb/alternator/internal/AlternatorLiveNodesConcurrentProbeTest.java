@@ -18,6 +18,7 @@ package com.scylladb.alternator.internal;
 import static org.junit.Assert.*;
 
 import com.scylladb.alternator.AlternatorConfig;
+import com.scylladb.alternator.CoversRequirements;
 import com.scylladb.alternator.NodeHealthConfig;
 import com.scylladb.alternator.NodeHealthObservation;
 import com.scylladb.alternator.NodeHealthState;
@@ -48,6 +49,7 @@ import software.amazon.awssdk.http.SdkHttpRequest;
 
 public class AlternatorLiveNodesConcurrentProbeTest {
   @Test
+  @CoversRequirements("HEALTH-REQ-007")
   public void explicitProbesRespectConfiguredConcurrencyAndReturnSnapshotOrder() throws Exception {
     GateHttpClient client = new GateHttpClient(2);
     AlternatorLiveNodes liveNodes =

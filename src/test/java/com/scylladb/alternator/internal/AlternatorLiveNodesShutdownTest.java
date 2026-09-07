@@ -21,6 +21,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import com.scylladb.alternator.AlternatorConfig;
+import com.scylladb.alternator.CoversRequirements;
 import com.scylladb.alternator.NodeHealthConfig;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -113,6 +114,7 @@ public class AlternatorLiveNodesShutdownTest {
   }
 
   @Test
+  @CoversRequirements("HEALTH-REQ-009")
   public void testShutdownAndWaitClosesOwnedPollingClientWhenThreadNeverStarted() throws Exception {
     CloseCountingHttpClient client = new CloseCountingHttpClient();
     AlternatorLiveNodes liveNodes = newOwnedLiveNodes(client);

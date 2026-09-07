@@ -20,6 +20,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import com.scylladb.alternator.AlternatorConfig;
+import com.scylladb.alternator.CoversRequirements;
 import com.scylladb.alternator.NodeHealthConfig;
 import com.scylladb.alternator.NodeHealthObservation;
 import java.io.IOException;
@@ -28,6 +29,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.stream.Collectors;
 import org.junit.Test;
 import software.amazon.awssdk.http.ExecutableHttpRequest;
 import software.amazon.awssdk.http.HttpExecuteRequest;
@@ -41,6 +43,7 @@ public class NodeHealthQueryPlanTest {
   private static final URI DOWN = node("down.local");
 
   @Test
+  @CoversRequirements({"QUERY-REQ-006", "HEALTH-REQ-006"})
   public void regularPlanReturnsActiveThenQuarantineInSourceRelativeOrder() {
     AlternatorLiveNodes liveNodes =
         liveNodes(Arrays.asList(ACTIVE_A, ACTIVE_B, QUARANTINED_A, QUARANTINED_B));
@@ -131,6 +134,22 @@ public class NodeHealthQueryPlanTest {
 
     assertEquals(implicitPort, plan.nextRouteCandidate());
     assertEquals(implicitPort, plan.nextRouteCandidate());
+  }
+
+  @Test
+  public void seededOrderIsIndependentOfEquivalentDefaultPortInputOrder() {
+    URI implicitPort = URI.create("http://a");
+    URI explicitPort = URI.create("http://a:80");
+    URI neighboringNode = URI.create("http://a.example");
+
+    List<URI> implicitFirst =
+        AlternatorLiveNodes.drainSeeded(
+            Arrays.asList(implicitPort, explicitPort, neighboringNode), 42L);
+    List<URI> explicitFirst =
+        AlternatorLiveNodes.drainSeeded(
+            Arrays.asList(explicitPort, implicitPort, neighboringNode), 42L);
+
+    assertEquals(canonicalKeys(implicitFirst), canonicalKeys(explicitFirst));
   }
 
   @Test
@@ -228,6 +247,10 @@ public class NodeHealthQueryPlanTest {
 
   private static URI node(String host) {
     return URI.create("http://" + host + ":8080");
+  }
+
+  private static List<URI> canonicalKeys(List<URI> nodes) {
+    return nodes.stream().map(NodeHealthStore::canonicalNodeKey).collect(Collectors.toList());
   }
 
   private static final class NoopHttpClient implements SdkHttpClient {

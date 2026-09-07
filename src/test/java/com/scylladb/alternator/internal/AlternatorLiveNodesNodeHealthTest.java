@@ -18,6 +18,7 @@ package com.scylladb.alternator.internal;
 import static org.junit.Assert.*;
 
 import com.scylladb.alternator.AlternatorConfig;
+import com.scylladb.alternator.CoversRequirements;
 import com.scylladb.alternator.NodeHealthConfig;
 import com.scylladb.alternator.NodeHealthObservation;
 import com.scylladb.alternator.NodeHealthState;
@@ -44,6 +45,7 @@ import software.amazon.awssdk.http.SdkHttpRequest;
 
 public class AlternatorLiveNodesNodeHealthTest {
   @Test
+  @CoversRequirements("HEALTH-REQ-005")
   public void discoveryActivatesContactedSeedButQuarantinesNewNodesUntilDirectProbe()
       throws Exception {
     LocalNodesHttpClient httpClient = new LocalNodesHttpClient("[\"seed.local\",\"new.local\"]");
@@ -121,6 +123,7 @@ public class AlternatorLiveNodesNodeHealthTest {
   }
 
   @Test
+  @CoversRequirements("HEALTH-REQ-008")
   public void topologyRefreshUsesHealthBucketsAndDownFallbackIsHealthNeutral() throws Exception {
     LocalNodesHttpClient httpClient = new LocalNodesHttpClient("[]");
     AlternatorConfig config =

@@ -229,6 +229,7 @@ public class AffinityQueryPlanInterceptorTest {
   // --- Simple PutItem (no conditions) ---
 
   @Test
+  @CoversRequirements("AFF-REQ-004")
   public void testPutItemSimple_AnyWrite_Affinity() {
     DynamoDbClient client = createClient(buildConfig(KeyRouteAffinity.ANY_WRITE));
     try {
@@ -1888,6 +1889,7 @@ public class AffinityQueryPlanInterceptorTest {
   }
 
   @Test
+  @CoversRequirements("AFF-REQ-006")
   public void testBatchWriteItemSkipsDownPreferredNodeUsingStableKnownOrder() {
     URI downNode = testNodeUris.get(1);
     MockAlternatorLiveNodes liveNodes =

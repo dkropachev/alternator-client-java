@@ -169,6 +169,7 @@ public class GzipRequestInterceptorTest {
   }
 
   @Test
+  @CoversRequirements("COMP-REQ-002")
   public void testCompressedBodyIsValidGzip() throws IOException {
     GzipRequestInterceptor interceptor = new GzipRequestInterceptor(DEFAULT_MIN_COMPRESSION_SIZE);
     byte[] testData = generateTestData(1024);

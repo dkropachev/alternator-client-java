@@ -30,6 +30,7 @@ import software.amazon.awssdk.services.dynamodb.model.DynamoDbException;
 import software.amazon.awssdk.services.dynamodb.model.KeySchemaElement;
 import software.amazon.awssdk.services.dynamodb.model.KeyType;
 import software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException;
+import software.amazon.awssdk.utils.builder.ToCopyableBuilder;
 
 /**
  * Resolves partition key attribute names for DynamoDB tables.
@@ -316,11 +317,28 @@ public class PartitionKeyResolver implements AutoCloseable {
     }
     if (e.awsErrorDetails() != null) {
       String errorCode = e.awsErrorDetails().errorCode();
-      // AccessDeniedException and ValidationException are permanent
-      return "AccessDeniedException".equals(errorCode) || "ValidationException".equals(errorCode);
+      if (isPermanentErrorCode(errorCode)) {
+        return true;
+      }
+      if (errorCode != null && !errorCode.isEmpty()) {
+        return false;
+      }
+    }
+    // SDK-modeled exceptions still carry structured error classification when AwsErrorDetails is
+    // absent. Custom subclasses do not, so let them fall through to HTTP status classification.
+    if (e instanceof ToCopyableBuilder<?, ?>) {
+      String errorCode = e.getClass().getSimpleName();
+      return isPermanentErrorCode(errorCode);
     }
     // 4xx errors (except 429 throttling) are generally permanent
     return e.statusCode() >= 400 && e.statusCode() < 500 && e.statusCode() != 429;
+  }
+
+  private static boolean isPermanentErrorCode(String errorCode) {
+    return "AccessDeniedException".equals(errorCode)
+        || "ValidationException".equals(errorCode)
+        || "ResourceNotFoundException".equals(errorCode)
+        || "TableNotFoundException".equals(errorCode);
   }
 
   /**
