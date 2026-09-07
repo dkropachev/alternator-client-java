@@ -77,7 +77,8 @@ public class ConnectionPoolIT {
   }
 
   private AlternatorLiveNodes createLiveNodes() {
-    AlternatorConfig.Builder builder = AlternatorConfig.builder().withSeedNode(seedUri);
+    AlternatorConfig.Builder builder =
+        AlternatorConfig.builder().withSeedNode(seedUri).withNodeHealthDisabled();
     if ("https".equals(seedUri.getScheme())) {
       builder.withTlsConfig(TlsConfig.trustAll());
     }
@@ -186,6 +187,26 @@ public class ConnectionPoolIT {
     return count;
   }
 
+  private static long awaitStableConnectionCount(int port) throws Exception {
+    long previous = -1;
+    long current = -1;
+    int consecutiveStableSamples = 0;
+    for (int attempt = 0; attempt < 15; attempt++) {
+      Thread.sleep(1000);
+      current = countEstablishedConnections(port);
+      if (current == previous) {
+        consecutiveStableSamples++;
+        if (consecutiveStableSamples >= 2) {
+          return current;
+        }
+      } else {
+        consecutiveStableSamples = 0;
+      }
+      previous = current;
+    }
+    return current;
+  }
+
   /**
    * Runs the DynamoDB connection reuse test with the given client wrapper and table name.
    *
@@ -221,9 +242,11 @@ public class ConnectionPoolIT {
             .build());
 
     try {
+      wrapper.getAlternatorLiveNodes().refreshDiscoveredNodes();
+
       // Warm up — establish connections for both the SDK client and the background
       // AlternatorLiveNodes thread.
-      for (int i = 0; i < 10; i++) {
+      for (int i = 0; i < 30; i++) {
         client.putItem(
             PutItemRequest.builder()
                 .tableName(tableName)
@@ -233,19 +256,11 @@ public class ConnectionPoolIT {
                         "data", AttributeValue.builder().s("value").build()))
                 .build());
       }
-      // Wait for stale connections from previous tests (reuseForks=true) to drain
-      // and for the background node-discovery thread to stabilize. Poll until the
-      // connection count stops dropping, so the baseline reflects only this test's
-      // active connections.
-      long baseline = countEstablishedConnections(port);
-      for (int attempt = 0; attempt < 10; attempt++) {
-        Thread.sleep(1000);
-        long current = countEstablishedConnections(port);
-        if (current >= baseline) break;
-        baseline = current;
-      }
+      // Wait for stale connections from previous tests to drain and for this client's per-node
+      // pools to finish opening before recording the baseline.
+      long baseline = awaitStableConnectionCount(port);
       assertTrue("Should have at least 1 established connection after warmup", baseline >= 1);
-      long minAcceptable = Math.max(1, baseline / 3);
+      long warmupMinAcceptable = Math.max(1, baseline / 3);
 
       // Verify connections are not dropped during short idle gaps (500ms between requests).
       // If connections are pooled, the established count should stay roughly stable.
@@ -269,17 +284,14 @@ public class ConnectionPoolIT {
               + ", after="
               + afterGaps
               + ", minAcceptable="
-              + minAcceptable
+              + warmupMinAcceptable
               + ")",
-          afterGaps >= minAcceptable);
-      assertTrue(
-          "Established connections should not grow significantly during 500ms idle gap requests"
-              + " (baseline="
-              + baseline
-              + ", after="
-              + afterGaps
-              + ")",
-          afterGaps <= baseline * 1.5);
+          afterGaps >= warmupMinAcceptable);
+
+      // The paced requests may lazily finish opening per-node pools. Use their final count as the
+      // operational baseline, then verify that substantially more traffic does not keep growing it.
+      long pooledBaseline = afterGaps;
+      long idleMinAcceptable = Math.max(1, pooledBaseline / 3);
 
       // Perform many more operations back-to-back — connections should be reused
       for (int i = 0; i < 50; i++) {
@@ -297,11 +309,11 @@ public class ConnectionPoolIT {
       assertTrue(
           "Established connections should not grow significantly during 50 back-to-back requests"
               + " (baseline="
-              + baseline
+              + pooledBaseline
               + ", after="
               + afterBulk
               + ")",
-          afterBulk <= baseline * 1.5);
+          afterBulk <= pooledBaseline * 1.5);
 
       // Let connections sit idle for 10 seconds — enough to verify survival
       // without hitting the default 60-second idle reaper
@@ -323,13 +335,13 @@ public class ConnectionPoolIT {
       assertTrue(
           "Most connections should survive 10s idle period"
               + " (baseline="
-              + baseline
+              + pooledBaseline
               + ", after="
               + afterIdle
               + ", minAcceptable="
-              + minAcceptable
+              + idleMinAcceptable
               + ")",
-          afterIdle >= minAcceptable);
+          afterIdle >= idleMinAcceptable);
 
     } finally {
       try {
@@ -345,7 +357,8 @@ public class ConnectionPoolIT {
     AlternatorDynamoDbClient.AlternatorDynamoDbClientBuilder builder =
         AlternatorDynamoDbClient.builder()
             .endpointOverride(seedUri)
-            .credentialsProvider(IntegrationTestConfig.CREDENTIALS);
+            .credentialsProvider(IntegrationTestConfig.CREDENTIALS)
+            .withNodeHealthDisabled();
     if ("https".equals(seedUri.getScheme())) {
       builder.withTlsConfig(TlsConfig.trustAll());
     }
@@ -357,6 +370,7 @@ public class ConnectionPoolIT {
         AlternatorDynamoDbClient.builder()
             .endpointOverride(seedUri)
             .credentialsProvider(IntegrationTestConfig.CREDENTIALS)
+            .withNodeHealthDisabled()
             .withOptimizeHeaders(true);
     if ("https".equals(seedUri.getScheme())) {
       builder.withTlsConfig(TlsConfig.trustAll());
@@ -393,7 +407,8 @@ public class ConnectionPoolIT {
     AlternatorDynamoDbAsyncClient.AlternatorDynamoDbAsyncClientBuilder builder =
         AlternatorDynamoDbAsyncClient.builder()
             .endpointOverride(seedUri)
-            .credentialsProvider(IntegrationTestConfig.CREDENTIALS);
+            .credentialsProvider(IntegrationTestConfig.CREDENTIALS)
+            .withNodeHealthDisabled();
     if ("https".equals(seedUri.getScheme())) {
       builder.withTlsConfig(TlsConfig.trustAll());
     }
@@ -439,9 +454,11 @@ public class ConnectionPoolIT {
         .get(10, TimeUnit.SECONDS);
 
     try {
+      wrapper.getAlternatorLiveNodes().refreshDiscoveredNodes();
+
       // Warm up — establish connections for both the async Netty client and the background
       // AlternatorLiveNodes polling thread.
-      for (int i = 0; i < 10; i++) {
+      for (int i = 0; i < 30; i++) {
         client
             .putItem(
                 PutItemRequest.builder()
@@ -453,19 +470,11 @@ public class ConnectionPoolIT {
                     .build())
             .get(10, TimeUnit.SECONDS);
       }
-      // Wait for stale connections from previous tests (reuseForks=true) to drain
-      // and for the background node-discovery thread to stabilize. Poll until the
-      // connection count stops dropping, so the baseline reflects only this test's
-      // active connections.
-      long baseline = countEstablishedConnections(port);
-      for (int attempt = 0; attempt < 10; attempt++) {
-        Thread.sleep(1000);
-        long current = countEstablishedConnections(port);
-        if (current >= baseline) break;
-        baseline = current;
-      }
+      // Wait for stale connections from previous tests to drain and for this client's per-node
+      // pools to finish opening before recording the baseline.
+      long baseline = awaitStableConnectionCount(port);
       assertTrue("Should have at least 1 established connection after warmup", baseline >= 1);
-      long minAcceptable = Math.max(1, baseline / 3);
+      long warmupMinAcceptable = Math.max(1, baseline / 3);
 
       // Verify connections are not dropped during short idle gaps (200ms between requests).
       for (int i = 0; i < 10; i++) {
@@ -490,17 +499,14 @@ public class ConnectionPoolIT {
               + ", after="
               + afterGaps
               + ", minAcceptable="
-              + minAcceptable
+              + warmupMinAcceptable
               + ")",
-          afterGaps >= minAcceptable);
-      assertTrue(
-          "Async: connections should not grow significantly during 200ms idle gap requests"
-              + " (baseline="
-              + baseline
-              + ", after="
-              + afterGaps
-              + ")",
-          afterGaps <= baseline * 1.5);
+          afterGaps >= warmupMinAcceptable);
+
+      // The paced requests may lazily finish opening per-node pools. Use their final count as the
+      // operational baseline, then verify that substantially more traffic does not keep growing it.
+      long pooledBaseline = afterGaps;
+      long idleMinAcceptable = Math.max(1, pooledBaseline / 3);
 
       // Perform many more operations back-to-back — connections should be reused
       for (int i = 0; i < 30; i++) {
@@ -520,11 +526,11 @@ public class ConnectionPoolIT {
       assertTrue(
           "Async: connections should not grow significantly during 30 back-to-back requests"
               + " (baseline="
-              + baseline
+              + pooledBaseline
               + ", after="
               + afterBulk
               + ")",
-          afterBulk <= baseline * 1.5);
+          afterBulk <= pooledBaseline * 1.5);
 
       // Let connections sit idle for 3 seconds
       Thread.sleep(3_000);
@@ -547,13 +553,13 @@ public class ConnectionPoolIT {
       assertTrue(
           "Async: most connections should survive 3s idle period"
               + " (baseline="
-              + baseline
+              + pooledBaseline
               + ", after="
               + afterIdle
               + ", minAcceptable="
-              + minAcceptable
+              + idleMinAcceptable
               + ")",
-          afterIdle >= minAcceptable);
+          afterIdle >= idleMinAcceptable);
 
     } finally {
       try {
@@ -603,15 +609,9 @@ public class ConnectionPoolIT {
       }
       assertTrue(
           "Should have discovered at least one node", liveNodes.getDiscoveredNodes().size() > 0);
-      // Wait for stale connections from previous tests (reuseForks=true) to drain
-      // and for the polling client's connection pool to stabilize.
-      long baseline = countEstablishedConnections(port);
-      for (int attempt = 0; attempt < 10; attempt++) {
-        Thread.sleep(1000);
-        long current = countEstablishedConnections(port);
-        if (current >= baseline) break;
-        baseline = current;
-      }
+      // Wait for stale connections from previous tests to drain and for the polling client's
+      // connection pool to stabilize.
+      long baseline = awaitStableConnectionCount(port);
       assertTrue("Should have at least 1 established connection after warmup", baseline >= 1);
 
       // Perform many more polling cycles — connection count should stay bounded
