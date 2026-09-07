@@ -85,21 +85,25 @@ public class ConnectionPoolIT {
   }
 
   /**
-   * Verifies that connections are pooled and reused. After many {@code updateLiveNodes()} calls,
+   * Verifies that connections are pooled and reused. After many {@code refreshDiscoveredNodes()} calls,
    * all requests should succeed without hanging (which would indicate connection leaks).
    */
   @Test(timeout = 10_000)
   public void testConnectionsArePooledAndReused() throws Exception {
     AlternatorLiveNodes liveNodes = createLiveNodes();
 
-    // Make many requests — enough to round-robin through all nodes multiple times.
-    // If connections are leaked, this will hang due to pool exhaustion.
-    for (int i = 0; i < 30; i++) {
-      liveNodes.updateLiveNodes();
-    }
+    try {
+      // Make many requests — enough to use all nodes multiple times.
+      // If connections are leaked, this will hang due to pool exhaustion.
+      for (int i = 0; i < 30; i++) {
+        liveNodes.refreshDiscoveredNodes();
+      }
 
-    int nodeCount = liveNodes.getLiveNodes().size();
-    assertTrue("Should have discovered at least one node", nodeCount > 0);
+      int nodeCount = liveNodes.getDiscoveredNodes().size();
+      assertTrue("Should have discovered at least one node", nodeCount > 0);
+    } finally {
+      liveNodes.shutdownAndWait();
+    }
   }
 
   /**
@@ -117,26 +121,30 @@ public class ConnectionPoolIT {
   public void testConnectionSurvivesIdlePeriod() throws Exception {
     AlternatorLiveNodes liveNodes = createLiveNodes();
 
-    // Establish pooled connections by round-robining through all nodes
-    for (int i = 0; i < 30; i++) {
-      liveNodes.updateLiveNodes();
-    }
-    int nodesBefore = liveNodes.getLiveNodes().size();
-    assertTrue("Should have discovered at least one node", nodesBefore > 0);
+    try {
+      // Establish pooled connections by using all nodes
+      for (int i = 0; i < 30; i++) {
+        liveNodes.refreshDiscoveredNodes();
+      }
+      int nodesBefore = liveNodes.getDiscoveredNodes().size();
+      assertTrue("Should have discovered at least one node", nodesBefore > 0);
 
-    // Let connections sit idle for 10 seconds — enough to verify survival
-    // without hitting the default 60-second idle reaper
-    Thread.sleep(10_000);
+      // Let connections sit idle for 10 seconds — enough to verify survival
+      // without hitting the default 60-second idle reaper
+      Thread.sleep(10_000);
 
-    // Use the connections again — they should be reused from the pool.
-    // If connections were dropped, these requests would still succeed
-    // but would need new connections. If connections are leaked,
-    // this would hang due to pool exhaustion.
-    for (int i = 0; i < 30; i++) {
-      liveNodes.updateLiveNodes();
+      // Use the connections again — they should be reused from the pool.
+      // If connections were dropped, these requests would still succeed
+      // but would need new connections. If connections are leaked,
+      // this would hang due to pool exhaustion.
+      for (int i = 0; i < 30; i++) {
+        liveNodes.refreshDiscoveredNodes();
+      }
+      int nodesAfter = liveNodes.getDiscoveredNodes().size();
+      assertEquals("Node count should remain consistent after idle period", nodesBefore, nodesAfter);
+    } finally {
+      liveNodes.shutdownAndWait();
     }
-    int nodesAfter = liveNodes.getLiveNodes().size();
-    assertEquals("Node count should remain consistent after idle period", nodesBefore, nodesAfter);
   }
 
   /**
@@ -588,56 +596,60 @@ public class ConnectionPoolIT {
     AlternatorLiveNodes liveNodes = createLiveNodes();
     int port = seedUri.getPort();
 
-    // Warm up — establish pooled connections to all discovered nodes
-    for (int i = 0; i < 10; i++) {
-      liveNodes.updateLiveNodes();
+    try {
+      // Warm up — establish pooled connections to all discovered nodes
+      for (int i = 0; i < 10; i++) {
+        liveNodes.refreshDiscoveredNodes();
+      }
+      assertTrue(
+          "Should have discovered at least one node", liveNodes.getDiscoveredNodes().size() > 0);
+      // Wait for stale connections from previous tests (reuseForks=true) to drain
+      // and for the polling client's connection pool to stabilize.
+      long baseline = countEstablishedConnections(port);
+      for (int attempt = 0; attempt < 10; attempt++) {
+        Thread.sleep(1000);
+        long current = countEstablishedConnections(port);
+        if (current >= baseline) break;
+        baseline = current;
+      }
+      assertTrue("Should have at least 1 established connection after warmup", baseline >= 1);
+
+      // Perform many more polling cycles — connection count should stay bounded
+      for (int i = 0; i < 50; i++) {
+        liveNodes.refreshDiscoveredNodes();
+      }
+
+      long afterBulk = countEstablishedConnections(port);
+      assertTrue(
+          "Polling connections should not grow significantly during 50 polling cycles"
+              + " (baseline="
+              + baseline
+              + ", after="
+              + afterBulk
+              + ")",
+          afterBulk <= baseline * 1.5);
+
+      // Verify connections survive a short idle period
+      Thread.sleep(3_000);
+
+      for (int i = 0; i < 10; i++) {
+        liveNodes.refreshDiscoveredNodes();
+      }
+
+      long afterIdle = countEstablishedConnections(port);
+      long minAcceptable = Math.max(1, baseline / 3);
+      assertTrue(
+          "Polling connections should survive 3s idle period"
+              + " (baseline="
+              + baseline
+              + ", after="
+              + afterIdle
+              + ", minAcceptable="
+              + minAcceptable
+              + ")",
+          afterIdle >= minAcceptable);
+    } finally {
+      liveNodes.shutdownAndWait();
     }
-    assertTrue(
-        "Should have discovered at least one node", liveNodes.getLiveNodes().size() > 0);
-    // Wait for stale connections from previous tests (reuseForks=true) to drain
-    // and for the polling client's connection pool to stabilize.
-    long baseline = countEstablishedConnections(port);
-    for (int attempt = 0; attempt < 10; attempt++) {
-      Thread.sleep(1000);
-      long current = countEstablishedConnections(port);
-      if (current >= baseline) break;
-      baseline = current;
-    }
-    assertTrue("Should have at least 1 established connection after warmup", baseline >= 1);
-
-    // Perform many more polling cycles — connection count should stay bounded
-    for (int i = 0; i < 50; i++) {
-      liveNodes.updateLiveNodes();
-    }
-
-    long afterBulk = countEstablishedConnections(port);
-    assertTrue(
-        "Polling connections should not grow significantly during 50 polling cycles"
-            + " (baseline="
-            + baseline
-            + ", after="
-            + afterBulk
-            + ")",
-        afterBulk <= baseline * 1.5);
-
-    // Verify connections survive a short idle period
-    Thread.sleep(3_000);
-
-    for (int i = 0; i < 10; i++) {
-      liveNodes.updateLiveNodes();
-    }
-
-    long afterIdle = countEstablishedConnections(port);
-    long minAcceptable = Math.max(1, baseline / 3);
-    assertTrue(
-        "Polling connections should survive 3s idle period"
-            + " (baseline="
-            + baseline
-            + ", after="
-            + afterIdle
-            + ", minAcceptable="
-            + minAcceptable
-            + ")",
-        afterIdle >= minAcceptable);
   }
 }

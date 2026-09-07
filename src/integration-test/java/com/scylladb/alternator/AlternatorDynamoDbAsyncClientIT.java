@@ -19,6 +19,7 @@ import static org.junit.Assert.*;
 import static org.junit.Assume.*;
 
 import com.scylladb.alternator.internal.AlternatorLiveNodes;
+import com.scylladb.alternator.internal.LazyQueryPlan;
 import com.scylladb.alternator.routing.ClusterScope;
 import com.scylladb.alternator.routing.DatacenterScope;
 import com.scylladb.alternator.routing.RackScope;
@@ -190,99 +191,123 @@ public class AlternatorDynamoDbAsyncClientIT {
   }
 
   @Test
-  public void testNodeDiscoveryWithRoundRobin() throws Exception {
+  public void testNodeDiscoveryWithRandomQueryPlan() throws Exception {
     AlternatorDynamoDbAsyncClientWrapper client = buildClient(IntegrationTestConfig.DATACENTER, "");
 
     // Wait for node discovery
     Thread.sleep(1000);
 
-    Set<URI> meetNodes = new HashSet<>();
     List<URI> allNodes = client.getLiveNodes();
+    assertFalse("Should have at least one live node", allNodes.isEmpty());
 
-    // Call nextAsURI more times than there are nodes to verify round-robin
-    for (int i = 0; i < allNodes.size() * 2; i++) {
-      meetNodes.add(client.nextAsURI());
+    Set<URI> metNodes = new HashSet<>();
+    LazyQueryPlan queryPlan = new LazyQueryPlan(client.getAlternatorLiveNodes());
+    while (queryPlan.hasNext()) {
+      metNodes.add(queryPlan.next());
     }
 
-    assertEquals("Should visit all nodes via round-robin", allNodes.size(), meetNodes.size());
+    assertEquals("Should visit all live nodes via random query plan", new HashSet<>(allNodes), metNodes);
 
     client.close();
   }
 
   @Test
   public void testDynamoDBOperations() throws Exception {
-    String tableName = "java_async_client_test_table";
+    String tableName = "java_async_client_test_table_" + seedUri.getScheme();
 
     AlternatorDynamoDbAsyncClientWrapper wrapper = buildClient();
     DynamoDbAsyncClient client = wrapper.getClient();
 
-    // Clean up if table exists
     try {
+      // Clean up if table exists
+      try {
+        client.deleteTable(DeleteTableRequest.builder().tableName(tableName).build()).get();
+        Thread.sleep(500);
+      } catch (Exception e) {
+        // Table doesn't exist, that's fine
+      }
+
+      // Create table
+      client
+          .createTable(
+              CreateTableRequest.builder()
+                  .tableName(tableName)
+                  .keySchema(
+                      KeySchemaElement.builder().attributeName("ID").keyType(KeyType.HASH).build())
+                  .attributeDefinitions(
+                      AttributeDefinition.builder()
+                          .attributeName("ID")
+                          .attributeType(ScalarAttributeType.S)
+                          .build())
+                  .provisionedThroughput(
+                      ProvisionedThroughput.builder()
+                          .readCapacityUnits(1L)
+                          .writeCapacityUnits(1L)
+                          .build())
+                  .build())
+          .get();
+
+      // Put item
+      client
+          .putItem(
+              PutItemRequest.builder()
+                  .tableName(tableName)
+                  .item(
+                      java.util.Map.of(
+                          "ID", AttributeValue.builder().s("123").build(),
+                          "Name", AttributeValue.builder().s("test-value").build()))
+                  .build())
+          .get();
+
+      GetItemResponse getResult = getItemEventually(client, tableName, "123");
+      java.util.Map<String, AttributeValue> item = getResult.item();
+
+      assertNotNull("Should get item back", item);
+      assertTrue("Should get ID attribute back", item.containsKey("ID"));
+      assertTrue("Should get Name attribute back", item.containsKey("Name"));
+      assertEquals("123", item.get("ID").s());
+      assertEquals("test-value", item.get("Name").s());
+
+      // Delete item
+      client
+          .deleteItem(
+              DeleteItemRequest.builder()
+                  .tableName(tableName)
+                  .key(java.util.Map.of("ID", AttributeValue.builder().s("123").build()))
+                  .build())
+          .get();
+
+      // Clean up
       client.deleteTable(DeleteTableRequest.builder().tableName(tableName).build()).get();
-      Thread.sleep(500);
-    } catch (Exception e) {
-      // Table doesn't exist, that's fine
+    } finally {
+      try {
+        client.deleteTable(DeleteTableRequest.builder().tableName(tableName).build()).get();
+      } catch (Exception e) {
+        // Best effort cleanup
+      }
+
+      wrapper.close();
     }
+  }
 
-    // Create table
-    client
-        .createTable(
-            CreateTableRequest.builder()
-                .tableName(tableName)
-                .keySchema(
-                    KeySchemaElement.builder().attributeName("ID").keyType(KeyType.HASH).build())
-                .attributeDefinitions(
-                    AttributeDefinition.builder()
-                        .attributeName("ID")
-                        .attributeType(ScalarAttributeType.S)
-                        .build())
-                .provisionedThroughput(
-                    ProvisionedThroughput.builder()
-                        .readCapacityUnits(1L)
-                        .writeCapacityUnits(1L)
-                        .build())
-                .build())
-        .get();
-
-    // Put item
-    client
-        .putItem(
-            PutItemRequest.builder()
-                .tableName(tableName)
-                .item(
-                    java.util.Map.of(
-                        "ID", AttributeValue.builder().s("123").build(),
-                        "Name", AttributeValue.builder().s("test-value").build()))
-                .build())
-        .get();
-
-    // Get item
-    GetItemResponse getResult =
-        client
-            .getItem(
-                GetItemRequest.builder()
-                    .tableName(tableName)
-                    .key(java.util.Map.of("ID", AttributeValue.builder().s("123").build()))
-                    .build())
-            .get();
-
-    assertNotNull("Should get item back", getResult.item());
-    assertEquals("123", getResult.item().get("ID").s());
-    assertEquals("test-value", getResult.item().get("Name").s());
-
-    // Delete item
-    client
-        .deleteItem(
-            DeleteItemRequest.builder()
-                .tableName(tableName)
-                .key(java.util.Map.of("ID", AttributeValue.builder().s("123").build()))
-                .build())
-        .get();
-
-    // Clean up
-    client.deleteTable(DeleteTableRequest.builder().tableName(tableName).build()).get();
-
-    wrapper.close();
+  private GetItemResponse getItemEventually(
+      DynamoDbAsyncClient client, String tableName, String id) throws Exception {
+    GetItemRequest request =
+        GetItemRequest.builder()
+            .tableName(tableName)
+            .key(java.util.Map.of("ID", AttributeValue.builder().s(id).build()))
+            .consistentRead(true)
+            .build();
+    GetItemResponse response = null;
+    for (int attempt = 0; attempt < 10; attempt++) {
+      response = client.getItem(request).get();
+      java.util.Map<String, AttributeValue> item = response.item();
+      if (item != null && item.containsKey("ID") && item.containsKey("Name")) {
+        return response;
+      }
+      Thread.sleep(200);
+    }
+    return response;
   }
 
   @Test

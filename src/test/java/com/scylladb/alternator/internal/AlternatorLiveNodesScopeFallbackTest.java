@@ -27,7 +27,9 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Test;
@@ -43,9 +45,8 @@ import software.amazon.awssdk.http.SdkHttpRequest;
  * Tests for GitHub issue #83: Fallback behavior when all nodes in a scope become unreachable.
  *
  * <p>When all nodes in the client's current scope become unreachable (IOException), the scope
- * fallback chain should still be traversed. Currently, the IOException propagates out of
- * updateLiveNodes() and the fallback never happens. These tests assert the correct/desired behavior
- * and are expected to FAIL until the fix is implemented.
+ * fallback chain should still be traversed. These tests assert that fallback behavior and that
+ * configured seed nodes remain discovery candidates without being leaked into scoped routing.
  *
  * @see <a href="https://github.com/scylladb/alternator-client-java/issues/83">Issue #83</a>
  */
@@ -123,8 +124,8 @@ public class AlternatorLiveNodesScopeFallbackTest {
   }
 
   /**
-   * Verifies that when all nodes are unreachable, updateLiveNodes() should traverse the entire
-   * scope fallback chain (Rack -&gt; DC -&gt; Cluster) before giving up.
+   * Verifies that when all nodes are unreachable, refreshDiscoveredNodes() should traverse the
+   * entire scope fallback chain (Rack -&gt; DC -&gt; Cluster) before giving up.
    *
    * <p>With a 3-level fallback chain, all 3 scope levels should be attempted even when nodes throw
    * IOException. The method should not throw IOException until all scopes have been exhausted.
@@ -145,11 +146,11 @@ public class AlternatorLiveNodesScopeFallbackTest {
 
     AlternatorLiveNodes liveNodes = new AlternatorLiveNodes(config, unreachableClient);
 
-    // updateLiveNodes() should attempt all 3 scope levels before giving up.
+    // refreshDiscoveredNodes() should attempt all 3 scope levels before giving up.
     // It may throw IOException after exhausting all scopes, but the key assertion is
     // that all 3 scopes were tried.
     try {
-      liveNodes.updateLiveNodes();
+      liveNodes.refreshDiscoveredNodes();
     } catch (IOException e) {
       // Acceptable to throw after exhausting all scopes
     }
@@ -164,17 +165,17 @@ public class AlternatorLiveNodesScopeFallbackTest {
   }
 
   /**
-   * Verifies that when all discovered nodes become unreachable, the client should fall back to the
-   * original seed nodes for re-discovery.
+   * Verifies that seed nodes remain available as discovery candidates without being published into
+   * the discovered routing ring.
    *
-   * <p>After a successful discovery replaces liveNodes with new nodes, if those live nodes cannot
-   * return a usable /localnodes response, the client should fall back to the original seed URLs so
-   * it can recover through the configured entry points.
+   * <p>After a successful discovery replaces discovered nodes with new nodes, the seed URL should
+   * stay out of the routable discovered-node list unless it was returned by discovery. Later
+   * discovery cycles should still use the original seed entry point.
    *
    * @throws Exception if an unexpected error occurs
    */
   @Test
-  public void testSeedNodesReusedWhenDiscoveredNodesUnreachable() throws Exception {
+  public void testSeedNodesUsedForDiscoveryButNotPublishedAfterRefresh() throws Exception {
     // Phase 1: Successful discovery returns nodes B,C (not the seed A)
     ReachableHttpClient reachableClient = new ReachableHttpClient("[\"10.0.0.2\",\"10.0.0.3\"]");
 
@@ -183,24 +184,33 @@ public class AlternatorLiveNodesScopeFallbackTest {
 
     AlternatorLiveNodes liveNodes = new AlternatorLiveNodes(config, reachableClient);
 
-    // Initial liveNodes should contain seed (10.0.0.1)
-    List<URI> initialList = liveNodes.getLiveNodes();
+    // Initial discovered nodes should contain seed (10.0.0.1)
+    List<URI> initialList = liveNodes.getDiscoveredNodes();
     assertEquals(1, initialList.size());
     assertEquals("10.0.0.1", initialList.get(0).getHost());
 
-    // After a successful update, liveNodes should contain discovered nodes without injecting seeds
-    liveNodes.updateLiveNodes();
-    List<URI> updatedList = liveNodes.getLiveNodes();
+    // After a successful update, discovered nodes should contain only discovered routing nodes.
+    liveNodes.refreshDiscoveredNodes();
+    List<URI> updatedList = liveNodes.getDiscoveredNodes();
     List<String> hosts = new ArrayList<>();
     for (URI uri : updatedList) {
       hosts.add(uri.getHost());
     }
     assertTrue("Should contain discovered node 10.0.0.2", hosts.contains("10.0.0.2"));
     assertTrue("Should contain discovered node 10.0.0.3", hosts.contains("10.0.0.3"));
-
     assertFalse(
-        "Seed node 10.0.0.1 should remain a discovery candidate, not a routing target",
+        "Seed node 10.0.0.1 should not be published as a discovered routing node",
         hosts.contains("10.0.0.1"));
+
+    reachableClient.capturedRequests.clear();
+    liveNodes.refreshDiscoveredNodes();
+
+    assertEquals(2, reachableClient.capturedRequests.size());
+    Set<String> contactedHosts = new HashSet<>();
+    for (SdkHttpRequest request : reachableClient.capturedRequests) {
+      contactedHosts.add(request.host());
+    }
+    assertEquals(new HashSet<>(Arrays.asList("10.0.0.2", "10.0.0.3")), contactedHosts);
   }
 
   /**
@@ -266,7 +276,7 @@ public class AlternatorLiveNodesScopeFallbackTest {
     AlternatorLiveNodes liveNodes = new AlternatorLiveNodes(config, scopeAwareClient);
 
     // This should NOT throw - the fallback chain should traverse Rack -> DC -> Cluster
-    liveNodes.updateLiveNodes();
+    liveNodes.refreshDiscoveredNodes();
 
     // All 3 scopes should have been queried (rack returned empty, dc returned empty,
     // cluster returned a node)
@@ -275,21 +285,21 @@ public class AlternatorLiveNodesScopeFallbackTest {
         3,
         requestCount.get());
 
-    // liveNodes should now contain only the cluster-scope node
-    List<URI> nodes = liveNodes.getLiveNodes();
+    // Discovered nodes should now contain the cluster-scope routing node. The seed remains a
+    // discovery fallback, but is not published unless returned by discovery.
+    List<URI> nodes = liveNodes.getDiscoveredNodes();
     List<String> nodeHosts = new ArrayList<>();
     for (URI uri : nodes) {
       nodeHosts.add(uri.getHost());
     }
     assertTrue("Should contain cluster-scope node 10.0.0.5", nodeHosts.contains("10.0.0.5"));
     assertFalse(
-        "Seed node 10.0.0.1 should not be added to the routing list",
-        nodeHosts.contains("10.0.0.1"));
+        "Should not publish seed node 10.0.0.1 as routing node", nodeHosts.contains("10.0.0.1"));
   }
 
   /**
-   * Verifies that repeated updateLiveNodes() calls with all-unreachable discovered nodes should
-   * eventually try the seed nodes, allowing recovery if the seeds are still alive.
+   * Verifies that repeated refreshDiscoveredNodes() calls with all-unreachable discovered nodes
+   * should eventually try the seed nodes, allowing recovery if the seeds are still alive.
    *
    * @throws Exception if an unexpected error occurs
    */
@@ -311,7 +321,7 @@ public class AlternatorLiveNodesScopeFallbackTest {
     // Simulate multiple update cycles
     for (int i = 0; i < 9; i++) {
       try {
-        liveNodes.updateLiveNodes();
+        liveNodes.refreshDiscoveredNodes();
       } catch (IOException e) {
         // May throw, that's fine for this test
       }
@@ -319,11 +329,11 @@ public class AlternatorLiveNodesScopeFallbackTest {
 
     // The liveNodes list should remain unchanged (the unreachable nodes should not be removed
     // without replacement)
-    List<URI> currentNodes = liveNodes.getLiveNodes();
+    List<URI> currentNodes = liveNodes.getDiscoveredNodes();
     assertEquals(
         "liveNodes list should remain unchanged after failed updates", 3, currentNodes.size());
 
-    // Verify the requests cycled through all 3 nodes via round-robin
+    // Verify the requests contacted all 3 seed nodes
     List<String> contactedHosts = new ArrayList<>();
     for (SdkHttpRequest req : unreachableClient.capturedRequests) {
       contactedHosts.add(req.host());
@@ -386,7 +396,7 @@ public class AlternatorLiveNodesScopeFallbackTest {
     AlternatorLiveNodes liveNodesEmptyCase =
         new AlternatorLiveNodes(configBuilder.build(), emptyListClient);
 
-    liveNodesEmptyCase.updateLiveNodes();
+    liveNodesEmptyCase.refreshDiscoveredNodes();
     int emptyListScopeAttempts = emptyListRequestCount.get();
 
     // --- Case 2: IOException responses ---
@@ -396,7 +406,7 @@ public class AlternatorLiveNodesScopeFallbackTest {
         new AlternatorLiveNodes(configBuilder.build(), ioExceptionClient);
 
     try {
-      liveNodesIOExceptionCase.updateLiveNodes();
+      liveNodesIOExceptionCase.refreshDiscoveredNodes();
     } catch (IOException e) {
       // May throw after exhausting all scopes
     }

@@ -114,4 +114,17 @@ public final class SyncClientDetector {
         throw new IllegalStateException("Unknown sync client type: " + type);
     }
   }
+
+  /** Creates a polling client with the requested connection-pool size. */
+  public static SdkHttpClient createPollingClient(
+      SyncClientType type, TlsConfig tlsConfig, int maxConnections) {
+    switch (type) {
+      case APACHE:
+        return ApacheSyncClientFactory.createPollingClient(tlsConfig, maxConnections);
+      case CRT:
+        return CrtSyncClientFactory.createPollingClient(tlsConfig, maxConnections);
+      default:
+        throw new IllegalStateException("Unknown sync client type: " + type);
+    }
+  }
 }

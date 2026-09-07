@@ -22,6 +22,7 @@ import com.scylladb.alternator.internal.SyncClientDetector;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinity;
 import com.scylladb.alternator.keyrouting.KeyRouteAffinityConfig;
 import com.scylladb.alternator.queryplan.AffinityQueryPlanInterceptor;
+import com.scylladb.alternator.queryplan.AttemptRoutingSdkHttpClient;
 import com.scylladb.alternator.queryplan.BasicQueryPlanInterceptor;
 import com.scylladb.alternator.routing.RoutingScope;
 import java.net.URI;
@@ -40,6 +41,7 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClientBuilder;
 import software.amazon.awssdk.services.dynamodb.endpoints.DynamoDbEndpointProvider;
+import software.amazon.awssdk.utils.AttributeMap;
 
 /**
  * Factory class for creating DynamoDB clients with Alternator load balancing support.
@@ -70,7 +72,6 @@ import software.amazon.awssdk.services.dynamodb.endpoints.DynamoDbEndpointProvid
  *
  * // Access Alternator-specific functionality
  * List<URI> nodes = client.getLiveNodes();
- * URI nextNode = client.nextAsURI();
  * }</pre>
  *
  * @author dmitry.kropachev
@@ -424,6 +425,29 @@ public class AlternatorDynamoDbClient {
     }
 
     /**
+     * Sets the node health tracking configuration.
+     *
+     * @param nodeHealthConfig the node health configuration, or null to use defaults
+     * @return this builder instance
+     * @since 2.0.6
+     */
+    public AlternatorDynamoDbClientBuilder withNodeHealthConfig(NodeHealthConfig nodeHealthConfig) {
+      configBuilder.withNodeHealthConfig(nodeHealthConfig);
+      return this;
+    }
+
+    /**
+     * Disables node health tracking.
+     *
+     * @return this builder instance
+     * @since 2.0.6
+     */
+    public AlternatorDynamoDbClientBuilder withNodeHealthDisabled() {
+      configBuilder.withNodeHealthDisabled();
+      return this;
+    }
+
+    /**
      * Sets the maximum number of connections in the HTTP client connection pool.
      *
      * @param maxConnections the maximum number of connections (must be positive)
@@ -522,6 +546,7 @@ public class AlternatorDynamoDbClient {
         configBuilder.withKeyRouteAffinity(config.getKeyRouteAffinityConfig());
         configBuilder.withActiveRefreshIntervalMs(config.getActiveRefreshIntervalMs());
         configBuilder.withIdleRefreshIntervalMs(config.getIdleRefreshIntervalMs());
+        configBuilder.withNodeHealthConfig(config.getNodeHealthConfig());
         configBuilder.withMaxConnections(config.getMaxConnections());
         configBuilder.withConnectionMaxIdleTimeMs(config.getConnectionMaxIdleTimeMs());
         configBuilder.withConnectionTimeToLiveMs(config.getConnectionTimeToLiveMs());
@@ -784,16 +809,30 @@ public class AlternatorDynamoDbClient {
       delegate.overrideConfiguration(compressionOverrideBuilder.build());
 
       TlsConfig tlsConfig = alternatorConfig.getTlsConfig();
-      SdkHttpClient pollingClient = null;
+      SdkHttpClient mainClient = null;
+      SdkHttpClient pollingClient;
       if (!httpClientSet) {
-        SdkHttpClient mainClient = createMainSyncClient(clientType, alternatorConfig, tlsConfig);
-        delegate.httpClient(configureMainSyncClient(mainClient, alternatorConfig));
-
-        pollingClient = SyncClientDetector.createPollingClient(clientType, tlsConfig);
-      } else {
-        configureCustomSyncClient(alternatorConfig);
+        mainClient = createMainSyncClient(clientType, alternatorConfig, tlsConfig);
+        pollingClient =
+            SyncClientDetector.createPollingClient(
+                clientType,
+                tlsConfig,
+                alternatorConfig.getNodeHealthConfig().getHealthProbeConcurrency() + 1);
+      } else if (customHttpClient != null) {
+        mainClient = customHttpClient;
         SyncClientDetector.SyncClientType pollingType = SyncClientDetector.detect();
-        pollingClient = SyncClientDetector.createPollingClient(pollingType, tlsConfig);
+        pollingClient =
+            SyncClientDetector.createPollingClient(
+                pollingType,
+                tlsConfig,
+                alternatorConfig.getNodeHealthConfig().getHealthProbeConcurrency() + 1);
+      } else {
+        SyncClientDetector.SyncClientType pollingType = SyncClientDetector.detect();
+        pollingClient =
+            SyncClientDetector.createPollingClient(
+                pollingType,
+                tlsConfig,
+                alternatorConfig.getNodeHealthConfig().getHealthProbeConcurrency() + 1);
       }
 
       pollingClient = configurePollingSyncClient(pollingClient, alternatorConfig);
@@ -806,16 +845,26 @@ public class AlternatorDynamoDbClient {
               : ClientOverrideConfiguration.builder();
 
       AffinityQueryPlanInterceptor affinityInterceptor = null;
+      BasicQueryPlanInterceptor queryPlanInterceptor;
       KeyRouteAffinityConfig keyAffinityConfig = alternatorConfig.getKeyRouteAffinityConfig();
       if (keyAffinityConfig != null
           && keyAffinityConfig.getType() != null
           && keyAffinityConfig.getType() != KeyRouteAffinity.NONE) {
         affinityInterceptor = new AffinityQueryPlanInterceptor(keyAffinityConfig, liveNodes);
-        overrideBuilder.addExecutionInterceptor(affinityInterceptor);
+        queryPlanInterceptor = affinityInterceptor;
       } else {
-        overrideBuilder.addExecutionInterceptor(new BasicQueryPlanInterceptor(liveNodes));
+        queryPlanInterceptor = new BasicQueryPlanInterceptor(liveNodes);
       }
+      overrideBuilder.addExecutionInterceptor(queryPlanInterceptor);
       delegate.overrideConfiguration(overrideBuilder.build());
+      if (customHttpClientBuilder != null) {
+        delegate.httpClientBuilder(
+            new RoutingSdkHttpClientBuilder(
+                customHttpClientBuilder, alternatorConfig, queryPlanInterceptor));
+      } else {
+        delegate.httpClient(
+            configureMainSyncClient(mainClient, alternatorConfig, queryPlanInterceptor));
+      }
 
       delegate.endpointOverride(seedUri);
 
@@ -911,7 +960,9 @@ public class AlternatorDynamoDbClient {
     }
 
     private SdkHttpClient configureMainSyncClient(
-        SdkHttpClient mainClient, AlternatorConfig alternatorConfig) {
+        SdkHttpClient mainClient,
+        AlternatorConfig alternatorConfig,
+        BasicQueryPlanInterceptor queryPlanInterceptor) {
       SdkHttpClient configuredClient = mainClient;
       if (userAgentTransformer != null) {
         configuredClient = new UserAgentSdkHttpClient(configuredClient, userAgentTransformer);
@@ -921,7 +972,7 @@ public class AlternatorDynamoDbClient {
             new HeadersFilteringSdkHttpClient(
                 configuredClient, alternatorConfig.getHeadersWhitelist());
       }
-      return configuredClient;
+      return new AttemptRoutingSdkHttpClient(configuredClient, queryPlanInterceptor);
     }
 
     private SdkHttpClient configurePollingSyncClient(
@@ -932,26 +983,34 @@ public class AlternatorDynamoDbClient {
       return pollingClient;
     }
 
-    private void configureCustomSyncClient(AlternatorConfig alternatorConfig) {
-      if (customHttpClient != null) {
-        delegate.httpClient(configureMainSyncClient(customHttpClient, alternatorConfig));
-        return;
+    private final class RoutingSdkHttpClientBuilder
+        implements SdkHttpClient.Builder<RoutingSdkHttpClientBuilder> {
+      private final SdkHttpClient.Builder delegateBuilder;
+      private final AlternatorConfig alternatorConfig;
+      private final BasicQueryPlanInterceptor queryPlanInterceptor;
+
+      private RoutingSdkHttpClientBuilder(
+          SdkHttpClient.Builder delegateBuilder,
+          AlternatorConfig alternatorConfig,
+          BasicQueryPlanInterceptor queryPlanInterceptor) {
+        this.delegateBuilder = delegateBuilder;
+        this.alternatorConfig = alternatorConfig;
+        this.queryPlanInterceptor = queryPlanInterceptor;
       }
 
-      if (customHttpClientBuilder == null) {
-        return;
+      @Override
+      public SdkHttpClient build() {
+        return configureMainSyncClient(
+            delegateBuilder.build(), alternatorConfig, queryPlanInterceptor);
       }
 
-      if (needsHttpClientWrapper(alternatorConfig)) {
-        delegate.httpClient(
-            configureMainSyncClient(customHttpClientBuilder.build(), alternatorConfig));
-      } else {
-        delegate.httpClientBuilder(customHttpClientBuilder);
+      @Override
+      public SdkHttpClient buildWithDefaults(AttributeMap serviceDefaults) {
+        return configureMainSyncClient(
+            delegateBuilder.buildWithDefaults(serviceDefaults),
+            alternatorConfig,
+            queryPlanInterceptor);
       }
-    }
-
-    private boolean needsHttpClientWrapper(AlternatorConfig alternatorConfig) {
-      return userAgentTransformer != null || alternatorConfig.isOptimizeHeaders();
     }
 
     private void applyEndpointToConfig() {

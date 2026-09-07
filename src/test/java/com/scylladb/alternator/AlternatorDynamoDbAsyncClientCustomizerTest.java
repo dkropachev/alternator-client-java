@@ -481,6 +481,25 @@ public class AlternatorDynamoDbAsyncClientCustomizerTest {
         delegate.capturedRequest.firstMatchingHeader("User-Agent").get());
   }
 
+  @Test
+  @SuppressWarnings("deprecation")
+  public void testWithAlternatorConfigCopiesNodeHealthConfig() throws Exception {
+    NodeHealthConfig nodeHealthConfig =
+        NodeHealthConfig.builder().withDownNodeProbePeriodMs(1234).build();
+    AlternatorConfig config =
+        AlternatorConfig.builder().withNodeHealthConfig(nodeHealthConfig).build();
+    var builder = AlternatorDynamoDbAsyncClient.builder().withAlternatorConfig(config);
+
+    assertSame(nodeHealthConfig, alternatorConfig(builder).getNodeHealthConfig());
+  }
+
+  @Test
+  public void testWithNodeHealthDisabledConfiguresBuilder() throws Exception {
+    var builder = AlternatorDynamoDbAsyncClient.builder().withNodeHealthDisabled();
+
+    assertTrue(alternatorConfig(builder).getNodeHealthConfig().isDisabled());
+  }
+
   @Test(expected = IllegalStateException.class)
   public void testHttpClientTypeConflictsWithHttpClientBuilder() {
     AlternatorDynamoDbAsyncClient.builder()
@@ -555,5 +574,12 @@ public class AlternatorDynamoDbAsyncClientCustomizerTest {
     public String clientName() {
       return "capturing";
     }
+  }
+
+  private AlternatorConfig alternatorConfig(
+      AlternatorDynamoDbAsyncClient.AlternatorDynamoDbAsyncClientBuilder builder) throws Exception {
+    Field field = builder.getClass().getDeclaredField("configBuilder");
+    field.setAccessible(true);
+    return ((AlternatorConfig.Builder) field.get(builder)).build();
   }
 }

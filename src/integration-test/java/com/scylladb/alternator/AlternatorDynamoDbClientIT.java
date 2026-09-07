@@ -19,6 +19,7 @@ import static org.junit.Assert.*;
 import static org.junit.Assume.*;
 
 import com.scylladb.alternator.internal.AlternatorLiveNodes;
+import com.scylladb.alternator.internal.LazyQueryPlan;
 import com.scylladb.alternator.routing.ClusterScope;
 import com.scylladb.alternator.routing.DatacenterScope;
 import com.scylladb.alternator.routing.RackScope;
@@ -190,21 +191,22 @@ public class AlternatorDynamoDbClientIT {
   }
 
   @Test
-  public void testNodeDiscoveryWithRoundRobin() throws Exception {
+  public void testNodeDiscoveryWithRandomQueryPlan() throws Exception {
     AlternatorDynamoDbClientWrapper client = buildClient(IntegrationTestConfig.DATACENTER, "");
 
     // Wait for node discovery
     Thread.sleep(1000);
 
-    Set<URI> meetNodes = new HashSet<>();
     List<URI> allNodes = client.getLiveNodes();
+    assertFalse("Should have at least one live node", allNodes.isEmpty());
 
-    // Call nextAsURI more times than there are nodes to verify round-robin
-    for (int i = 0; i < allNodes.size() * 2; i++) {
-      meetNodes.add(client.nextAsURI());
+    Set<URI> metNodes = new HashSet<>();
+    LazyQueryPlan queryPlan = new LazyQueryPlan(client.getAlternatorLiveNodes());
+    while (queryPlan.hasNext()) {
+      metNodes.add(queryPlan.next());
     }
 
-    assertEquals("Should visit all nodes via round-robin", allNodes.size(), meetNodes.size());
+    assertEquals("Should visit all live nodes via random query plan", new HashSet<>(allNodes), metNodes);
 
     client.close();
   }

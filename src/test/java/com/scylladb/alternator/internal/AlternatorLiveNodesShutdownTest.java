@@ -15,11 +15,16 @@
  */
 package com.scylladb.alternator.internal;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import com.scylladb.alternator.AlternatorConfig;
+import com.scylladb.alternator.NodeHealthConfig;
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
@@ -35,6 +40,37 @@ import software.amazon.awssdk.http.SdkHttpClient;
 import software.amazon.awssdk.http.SdkHttpFullResponse;
 
 public class AlternatorLiveNodesShutdownTest {
+
+  @Test
+  public void testPollingFailureRespectsRefreshInterval() throws Exception {
+    FailingRefreshLiveNodes liveNodes = new FailingRefreshLiveNodes();
+
+    try {
+      liveNodes.start();
+      assertTrue(
+          "initial polling request should start", liveNodes.firstCall.await(5, TimeUnit.SECONDS));
+
+      assertFalse(
+          "failed polling should wait for the refresh interval before retrying",
+          liveNodes.secondCall.await(500, TimeUnit.MILLISECONDS));
+    } finally {
+      liveNodes.shutdownAndWait(5_000);
+    }
+  }
+
+  @Test
+  public void testDownNodeProbeRunsWhenRefreshFails() throws Exception {
+    FailingRefreshWithProbeLiveNodes liveNodes = new FailingRefreshWithProbeLiveNodes();
+
+    try {
+      liveNodes.start();
+      assertTrue(
+          "down-node probe should run even when refresh keeps failing",
+          liveNodes.probeCall.await(5, TimeUnit.SECONDS));
+    } finally {
+      liveNodes.shutdownAndWait(5_000);
+    }
+  }
 
   @Test
   public void testShutdownPathPollingFailureDoesNotEscapeThread() throws Exception {
@@ -74,6 +110,125 @@ public class AlternatorLiveNodesShutdownTest {
     assertTrue("live-node thread should still be running", liveNodes.isRunning());
     assertNull("runtime polling failure should not escape", uncaught.get());
     assertTrue("live-node thread should stop", liveNodes.shutdownAndWait(5_000));
+  }
+
+  @Test
+  public void testShutdownAndWaitClosesOwnedPollingClientWhenThreadNeverStarted() throws Exception {
+    CloseCountingHttpClient client = new CloseCountingHttpClient();
+    AlternatorLiveNodes liveNodes = newOwnedLiveNodes(client);
+
+    assertTrue("never-started live-node thread should be stopped", liveNodes.shutdownAndWait(0));
+    assertTrue(
+        "second shutdown should remain stopped and close should be idempotent",
+        liveNodes.shutdownAndWait(0));
+
+    assertEquals("owned polling client should close exactly once", 1, client.closeCount.get());
+  }
+
+  private static AlternatorLiveNodes newOwnedLiveNodes(SdkHttpClient client) throws Exception {
+    Constructor<AlternatorLiveNodes> constructor =
+        AlternatorLiveNodes.class.getDeclaredConstructor(
+            AlternatorConfig.class, SdkHttpClient.class, boolean.class);
+    constructor.setAccessible(true);
+    return constructor.newInstance(
+        AlternatorConfig.builder().withSeedNode(URI.create("http://127.0.0.1:8000")).build(),
+        client,
+        true);
+  }
+
+  private static final class FailingRefreshLiveNodes extends AlternatorLiveNodes {
+    private static final long REFRESH_INTERVAL_MS = 10_000;
+
+    private final AtomicInteger callCount = new AtomicInteger(0);
+    private final CountDownLatch firstCall = new CountDownLatch(1);
+    private final CountDownLatch secondCall = new CountDownLatch(1);
+
+    private FailingRefreshLiveNodes() {
+      super(failingRefreshConfig(), new UnusedHttpClient());
+    }
+
+    @Override
+    void refreshDiscoveredNodes() throws IOException {
+      int attempt = callCount.incrementAndGet();
+      if (attempt == 1) {
+        firstCall.countDown();
+      } else if (attempt == 2) {
+        secondCall.countDown();
+      }
+      throw new IOException("simulated polling failure");
+    }
+
+    private static AlternatorConfig failingRefreshConfig() {
+      return AlternatorConfig.builder()
+          .withSeedNode(URI.create("http://127.0.0.1:8000"))
+          .withActiveRefreshIntervalMs(REFRESH_INTERVAL_MS)
+          .withIdleRefreshIntervalMs(REFRESH_INTERVAL_MS)
+          .build();
+    }
+  }
+
+  private static final class FailingRefreshWithProbeLiveNodes extends AlternatorLiveNodes {
+    private static final long PERIOD_MS = 10;
+
+    private final CountDownLatch probeCall = new CountDownLatch(1);
+
+    private FailingRefreshWithProbeLiveNodes() {
+      super(config(), new UnusedHttpClient());
+    }
+
+    @Override
+    void refreshDiscoveredNodes() throws IOException {
+      throw new IOException("simulated polling failure");
+    }
+
+    @Override
+    void scheduleBackgroundHealthProbes() {
+      probeCall.countDown();
+    }
+
+    private static AlternatorConfig config() {
+      return AlternatorConfig.builder()
+          .withSeedNode(URI.create("http://127.0.0.1:8000"))
+          .withActiveRefreshIntervalMs(PERIOD_MS)
+          .withIdleRefreshIntervalMs(PERIOD_MS)
+          .withNodeHealthConfig(
+              NodeHealthConfig.builder().withDownNodeProbePeriodMs(PERIOD_MS).build())
+          .build();
+    }
+  }
+
+  private static final class UnusedHttpClient implements SdkHttpClient {
+    @Override
+    public ExecutableHttpRequest prepareRequest(HttpExecuteRequest request) {
+      throw new AssertionError("polling client should not be used by this test");
+    }
+
+    @Override
+    public void close() {}
+
+    @Override
+    public String clientName() {
+      return "unused";
+    }
+  }
+
+  private static final class CloseCountingHttpClient implements SdkHttpClient {
+    private final AtomicInteger closeCount = new AtomicInteger();
+
+    @Override
+    public ExecutableHttpRequest prepareRequest(HttpExecuteRequest request) {
+      throw new AssertionError("polling client should not be used by this test");
+    }
+
+    @Override
+    public void close() {
+      closeCount.incrementAndGet();
+    }
+
+    @Override
+    public String clientName() {
+      return "close-counting";
+    }
   }
 
   private static final class BlockingShutdownHttpClient implements SdkHttpClient {

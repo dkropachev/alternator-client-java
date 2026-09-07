@@ -56,7 +56,7 @@ public class LazyQueryPlanCrossLanguageTest {
 
   private static AlternatorLiveNodes createLiveNodes(int activeCount, int quarantinedCount)
       throws URISyntaxException {
-    // Only active nodes are in the live nodes list; quarantined nodes are excluded
+    // Cross-language vectors use only the canonical known-node list.
     List<URI> active = createNodes("node", activeCount);
     return new AlternatorLiveNodes(active, SCHEME, PORT, "", "");
   }

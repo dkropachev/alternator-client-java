@@ -94,9 +94,10 @@ public class AlternatorLiveNodesDnsDiscoveryTest {
       liveNodes.updateLiveNodes();
 
       assertEquals("DNS seed should be contacted", 1, requestCount.get());
-      assertEquals(2, liveNodes.getLiveNodes().size());
+      assertEquals(2, liveNodes.getDiscoveredNodes().size());
+      assertEquals(1, liveNodes.getLiveNodes().size());
       assertEquals("localhost", liveNodes.getLiveNodes().get(0).getHost());
-      assertEquals("node-a.internal", liveNodes.getLiveNodes().get(1).getHost());
+      assertEquals("node-a.internal", liveNodes.getQuarantinedNodes().get(0).getHost());
     } finally {
       liveNodes.shutdownAndWait();
     }

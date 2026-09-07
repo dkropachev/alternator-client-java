@@ -240,6 +240,22 @@ public class LazyQueryPlanTest {
   }
 
   @Test
+  @SuppressWarnings("deprecation")
+  public void testDeprecatedSortedAffinityNodesForwardsToLiveNodes() {
+    assertEquals(liveNodes.getQueryPlanNodes(), LazyQueryPlan.sortedAffinityNodes(liveNodes));
+  }
+
+  @Test
+  @SuppressWarnings("deprecation")
+  public void testDeprecatedPreferredNodeForHashForwardsToLiveNodes() {
+    long seed = 42L;
+
+    assertEquals(
+        liveNodes.getPreferredQueryPlanNodeForHash(seed),
+        LazyQueryPlan.preferredNodeForHash(liveNodes, seed));
+  }
+
+  @Test
   public void testSeededAffinityUsesSortedNodeOrder() throws URISyntaxException {
     List<URI> unsortedNodes =
         Arrays.asList(
@@ -269,5 +285,63 @@ public class LazyQueryPlanTest {
     }
 
     assertEquals(sortedSequence, unsortedSequence);
+  }
+
+  @Test
+  public void testSeededAffinityKeepsDownPreferredNodeInStableKnownOrder() {
+    URI downNode = nodes.get(2);
+    long seed = seedWhereFirstNodeIs(nodes, downNode);
+    List<URI> allHealthyOrder = collectNodes(new LazyQueryPlan(liveNodes, seed));
+
+    markNodeDown(liveNodes, downNode);
+
+    List<URI> degradedOrder = collectNodes(new LazyQueryPlan(liveNodes, seed));
+    assertEquals("Health must not change seeded candidate order", allHealthyOrder, degradedOrder);
+    assertEquals("Down preferred node stays in the plan", downNode, degradedOrder.get(0));
+  }
+
+  @Test
+  public void testSeededAffinityDoesNotRemapUnaffectedHealthyPreferredNode() {
+    URI preferredNode = nodes.get(0);
+    URI unrelatedDownNode = nodes.get(1);
+    long seed = seedWhereFirstNodeIs(nodes, preferredNode);
+
+    markNodeDown(liveNodes, unrelatedDownNode);
+
+    LazyQueryPlan degradedPlan = new LazyQueryPlan(liveNodes, seed);
+    assertEquals(
+        "Healthy preferred node should remain first when another node is down",
+        preferredNode,
+        degradedPlan.next());
+  }
+
+  private long seedWhereFirstNodeIs(List<URI> candidates, URI expected) {
+    for (long seed = -1000; seed < 1000; seed++) {
+      if (expected.equals(firstNodeForSeed(candidates, seed))) {
+        return seed;
+      }
+    }
+    fail("Could not find seed for " + expected);
+    return 0;
+  }
+
+  private URI firstNodeForSeed(List<URI> candidates, long seed) {
+    LazyQueryPlan plan =
+        new LazyQueryPlan(new AlternatorLiveNodes(candidates, "http", 8000, "", ""), seed);
+    return plan.hasNext() ? plan.next() : null;
+  }
+
+  private List<URI> collectNodes(LazyQueryPlan plan) {
+    List<URI> collected = new ArrayList<>();
+    while (plan.hasNext()) {
+      collected.add(plan.next());
+    }
+    return collected;
+  }
+
+  private void markNodeDown(AlternatorLiveNodes liveNodes, URI node) {
+    for (int i = 0; i < NodeHealthConfig.DEFAULT_CONSECUTIVE_FAILURE_THRESHOLD; i++) {
+      liveNodes.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    }
   }
 }

@@ -322,7 +322,7 @@ public class KeyRouteAffinityClientTest {
     try {
       String partitionKeyValue = "user-123";
 
-      // Simple PutItem without conditions - uses round-robin, may hit different nodes
+      // Simple PutItem without conditions - uses random query-plan routing, may hit different nodes
       Set<URI> nodesForSimplePut = new HashSet<>();
       for (int i = 0; i < 10; i++) {
         Map<String, AttributeValue> item = new HashMap<>();
@@ -367,9 +367,9 @@ public class KeyRouteAffinityClientTest {
       // Verify conditional writes go to one consistent node
       assertNotNull("Conditional writes should have a target node", expectedNodeForConditional);
 
-      // Simple puts should use round-robin (multiple nodes) since RMW doesn't apply
+      // Simple puts should use random query-plan routing (multiple nodes) since RMW doesn't apply
       assertTrue(
-          "Simple puts in RMW mode should use round-robin (got "
+          "Simple puts in RMW mode should use random query-plan routing (got "
               + nodesForSimplePut.size()
               + " nodes)",
           nodesForSimplePut.size() > 1);
@@ -570,7 +570,7 @@ public class KeyRouteAffinityClientTest {
   // ========== Tests for NONE mode ==========
 
   @Test
-  public void testNoneModeUsesRoundRobin() {
+  public void testNoneModeUsesRandomRouting() {
     KeyRouteAffinityConfig keyAffinity =
         KeyRouteAffinityConfig.builder()
             .withType(KeyRouteAffinity.NONE)
@@ -580,7 +580,7 @@ public class KeyRouteAffinityClientTest {
     DynamoDbClient client = createClientWithKeyAffinity(keyAffinity);
 
     try {
-      // In NONE mode, same key should use round-robin across nodes
+      // In NONE mode, same key should use random query-plan routing across nodes
       Set<URI> nodesUsed = new HashSet<>();
       String partitionKey = "user-same-key";
 
@@ -596,9 +596,11 @@ public class KeyRouteAffinityClientTest {
         nodesUsed.add(mockHttpClient.getLastRequestUri());
       }
 
-      // With 20 requests in round-robin mode across 5 nodes, we should see multiple nodes
+      // With 20 requests in random query-plan mode across 5 nodes, we should see multiple nodes
       assertTrue(
-          "NONE mode should use round-robin across multiple nodes (got " + nodesUsed.size() + ")",
+          "NONE mode should use random query-plan routing across multiple nodes (got "
+              + nodesUsed.size()
+              + ")",
           nodesUsed.size() > 1);
     } finally {
       client.close();
@@ -870,8 +872,8 @@ public class KeyRouteAffinityClientTest {
   }
 
   @Test
-  public void testRmwModeSimpleDeleteUsesRoundRobin() {
-    // Simple DeleteItem without conditions should use round-robin in RMW mode
+  public void testRmwModeSimpleDeleteUsesRandomRouting() {
+    // Simple DeleteItem without conditions should use random query-plan routing in RMW mode
     KeyRouteAffinityConfig keyAffinity =
         KeyRouteAffinityConfig.builder()
             .withType(KeyRouteAffinity.RMW)
@@ -897,9 +899,11 @@ public class KeyRouteAffinityClientTest {
         nodesUsed.add(mockHttpClient.getLastRequestUri());
       }
 
-      // Simple deletes in RMW mode should use round-robin
+      // Simple deletes in RMW mode should use random query-plan routing
       assertTrue(
-          "Simple delete in RMW mode should use round-robin (got " + nodesUsed.size() + " nodes)",
+          "Simple delete in RMW mode should use random query-plan routing (got "
+              + nodesUsed.size()
+              + " nodes)",
           nodesUsed.size() > 1);
     } finally {
       client.close();
@@ -938,9 +942,11 @@ public class KeyRouteAffinityClientTest {
         nodesUsed.add(mockHttpClient.getLastRequestUri());
       }
 
-      // UPDATED_NEW alone doesn't trigger RMW, should use round-robin
+      // UPDATED_NEW alone doesn't trigger RMW, should use random query-plan routing
       assertTrue(
-          "UPDATED_NEW alone in RMW mode should use round-robin (got " + nodesUsed.size() + ")",
+          "UPDATED_NEW alone in RMW mode should use random query-plan routing (got "
+              + nodesUsed.size()
+              + ")",
           nodesUsed.size() > 1);
     } finally {
       client.close();
@@ -1003,33 +1009,27 @@ public class KeyRouteAffinityClientTest {
    *   <li>Does not start any background threads
    *   <li>Provides a fixed list of test nodes
    *   <li>Supports LazyQueryPlan creation for key affinity (via base class)
-   *   <li>Implements round-robin across all test nodes
    * </ul>
    */
   private static class MockAlternatorLiveNodes extends AlternatorLiveNodes {
     private final List<URI> nodes;
-    private final java.util.concurrent.atomic.AtomicInteger counter =
-        new java.util.concurrent.atomic.AtomicInteger(0);
 
     MockAlternatorLiveNodes(List<URI> nodes) {
       super(
           AlternatorConfig.builder()
-              .withSeedHosts(Collections.singletonList(nodes.get(0).getHost()))
+              .withSeedHosts(nodeHosts(nodes))
               .withScheme(nodes.get(0).getScheme())
               .withPort(nodes.get(0).getPort())
               .build());
       this.nodes = new ArrayList<>(nodes);
+      for (URI node : nodes) {
+        reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
+      }
     }
 
     @Override
-    protected List<URI> getLiveNodesInternal() {
+    protected List<URI> getDiscoveredNodesInternal() {
       return nodes;
-    }
-
-    @Override
-    public URI nextAsURI() {
-      // Round-robin through all test nodes (not just seed node)
-      return nodes.get(Math.abs(counter.getAndIncrement() % nodes.size()));
     }
 
     @Override
@@ -1037,9 +1037,12 @@ public class KeyRouteAffinityClientTest {
       // Don't start background thread in tests
     }
 
-    @Override
-    public List<URI> getLiveNodes() {
-      return Collections.unmodifiableList(new ArrayList<>(nodes));
+    private static List<String> nodeHosts(List<URI> nodes) {
+      List<String> hosts = new ArrayList<>();
+      for (URI node : nodes) {
+        hosts.add(node.getHost());
+      }
+      return hosts;
     }
   }
 

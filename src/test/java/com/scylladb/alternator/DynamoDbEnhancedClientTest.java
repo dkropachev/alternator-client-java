@@ -112,13 +112,25 @@ public class DynamoDbEnhancedClientTest {
         new URI("http://127.0.0.3:" + port));
   }
 
+  private static AlternatorLiveNodes liveNodesWithHealthDisabled(List<URI> nodes) {
+    AlternatorConfig config =
+        AlternatorConfig.builder()
+            .withSeedHosts(
+                Arrays.asList(
+                    nodes.get(0).getHost(), nodes.get(1).getHost(), nodes.get(2).getHost()))
+            .withScheme(nodes.get(0).getScheme())
+            .withPort(nodes.get(0).getPort())
+            .withNodeHealthConfig(NodeHealthConfig.disabled())
+            .build();
+    return new AlternatorLiveNodes(config);
+  }
+
   @Test
   public void testEnhancedClientCanBeBuiltFromAlternatorClient()
       throws URISyntaxException, IOException {
     List<URI> nodes = createLocalNodes();
 
-    AlternatorLiveNodes liveNodes =
-        new AlternatorLiveNodes(nodes, "http", nodes.get(0).getPort(), "", "");
+    AlternatorLiveNodes liveNodes = liveNodesWithHealthDisabled(nodes);
     BasicQueryPlanInterceptor interceptor = new BasicQueryPlanInterceptor(liveNodes);
 
     ClientOverrideConfiguration overrideConfig =
@@ -151,8 +163,7 @@ public class DynamoDbEnhancedClientTest {
       throws URISyntaxException, IOException {
     List<URI> nodes = createLocalNodes();
 
-    AlternatorLiveNodes liveNodes =
-        new AlternatorLiveNodes(nodes, "http", nodes.get(0).getPort(), "", "");
+    AlternatorLiveNodes liveNodes = liveNodesWithHealthDisabled(nodes);
     BasicQueryPlanInterceptor interceptor = new BasicQueryPlanInterceptor(liveNodes);
 
     ClientOverrideConfiguration overrideConfig =
@@ -179,8 +190,7 @@ public class DynamoDbEnhancedClientTest {
   public void testLoadBalancingWorksWithEnhancedClient() throws URISyntaxException, IOException {
     List<URI> nodes = createLocalNodes();
 
-    AlternatorLiveNodes liveNodes =
-        new AlternatorLiveNodes(nodes, "http", nodes.get(0).getPort(), "", "");
+    AlternatorLiveNodes liveNodes = liveNodesWithHealthDisabled(nodes);
     BasicQueryPlanInterceptor interceptor = new BasicQueryPlanInterceptor(liveNodes);
 
     // Track which hosts are being targeted
