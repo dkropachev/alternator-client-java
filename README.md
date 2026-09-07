@@ -21,14 +21,6 @@ it do the right thing for Alternator.
 
 This library supports AWS SDK for Java Version 2 (requires 2.20 or above) and requires Java 11 or later.
 
-The language-agnostic feature contracts are maintained in [`feature-specs`](feature-specs/README.md):
-
-- [Compression](feature-specs/compression.md)
-- [Header optimization](feature-specs/header-optimization.md)
-- [Key-route affinity](feature-specs/key-route-affinity.md)
-- [Node health](feature-specs/node-health.md)
-- [Query plans](feature-specs/query-plan.md)
-
 ## Add `load-balancing` to your project
 
 ### Maven Dependency
@@ -439,9 +431,6 @@ mvn exec:java -Dexec.mainClass=com.scylladb.alternator.demo.Demo5 -Dexec.classpa
 
 ### HTTP Compression
 
-The normative, language-agnostic behavior is defined in the
-[compression feature specification](feature-specs/compression.md).
-
 #### Response compression
 
 Response compression is disabled by default. To negotiate compressed responses,
@@ -551,9 +540,6 @@ Request compression may not be beneficial for:
 - Low-latency requirements where CPU overhead matters
 
 ### Headers Optimization
-
-The normative, language-agnostic behavior is defined in the
-[header-optimization feature specification](feature-specs/header-optimization.md).
 
 The library supports optional HTTP headers optimization, which reduces network bandwidth by
 removing headers that Alternator does not use. According to benchmarks, this can reduce
@@ -915,9 +901,6 @@ The default configuration works well for most use cases. Consider adjusting sett
 
 ### Node Health
 
-The normative, language-agnostic behavior is defined in the
-[node-health feature specification](feature-specs/node-health.md).
-
 The client tracks active, quarantined, and down nodes while routing requests:
 
 - configured seeds and newly discovered nodes start quarantined
@@ -1013,10 +996,6 @@ Node health, including background probes, can be disabled with
 `AlternatorConfig.builder().withNodeHealthDisabled()`.
 
 ### Key Route Affinity (LWT Optimization)
-
-The normative, language-agnostic behavior is defined in the
-[key-route-affinity feature specification](feature-specs/key-route-affinity.md). Candidate ordering
-and retry traversal are defined separately in the [query-plan specification](feature-specs/query-plan.md).
 
 Key route affinity is an optimization for Lightweight Transactions (LWT) that use Paxos
 consensus. By routing all requests with the same partition key to the same coordinator node,
