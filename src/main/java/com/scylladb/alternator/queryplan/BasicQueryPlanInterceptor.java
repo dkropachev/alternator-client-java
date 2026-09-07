@@ -51,20 +51,8 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
   protected static final ExecutionAttribute<LazyQueryPlan> QUERY_PLAN =
       new ExecutionAttribute<>("QueryPlanInterceptor.queryPlan");
 
-  private static final ExecutionAttribute<InFlightNode> IN_FLIGHT_NODE =
-      new ExecutionAttribute<>("QueryPlanInterceptor.inFlightNode");
-
-  private static final ExecutionAttribute<NodeHealthQueryPlan> HEALTH_QUERY_PLAN =
-      new ExecutionAttribute<>("QueryPlanInterceptor.healthQueryPlan");
-
-  private static final ExecutionAttribute<LazyQueryPlan> HEALTH_QUERY_PLAN_SOURCE =
-      new ExecutionAttribute<>("QueryPlanInterceptor.healthQueryPlanSource");
-
-  private static final ExecutionAttribute<Integer> ROUTED_ATTEMPTS =
-      new ExecutionAttribute<>("QueryPlanInterceptor.routedAttempts");
-
-  private static final ExecutionAttribute<String> ROUTING_EXECUTION_ID =
-      new ExecutionAttribute<>("QueryPlanInterceptor.routingExecutionId");
+  private static final ExecutionAttribute<RoutingState> ROUTING_STATE =
+      new ExecutionAttribute<>("QueryPlanInterceptor.routingState");
 
   private static final String SDK_INVOCATION_ID_HEADER = "amz-sdk-invocation-id";
 
@@ -85,7 +73,6 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
   public void beforeExecution(
       Context.BeforeExecution context, ExecutionAttributes executionAttributes) {
     initializeQueryPlan(context, executionAttributes);
-    executionAttributes.putAttribute(ROUTED_ATTEMPTS, 0);
   }
 
   /** Creates the request's lazy plan and health-aware regular-routing wrapper. */
@@ -99,9 +86,10 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
       ExecutionAttributes executionAttributes, LazyQueryPlan plan, boolean affinity) {
     executionAttributes.putAttribute(QUERY_PLAN, plan);
     executionAttributes.putAttribute(
-        HEALTH_QUERY_PLAN,
-        affinity ? liveNodes.newAffinityQueryPlan(plan) : liveNodes.newRegularQueryPlan(plan));
-    executionAttributes.putAttribute(HEALTH_QUERY_PLAN_SOURCE, plan);
+        ROUTING_STATE,
+        new RoutingState(
+            affinity ? liveNodes.newAffinityQueryPlan(plan) : liveNodes.newRegularQueryPlan(plan),
+            plan));
   }
 
   @Override
@@ -117,18 +105,19 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
       return originalRequest;
     }
 
-    NodeHealthQueryPlan healthQueryPlan = executionAttributes.getAttribute(HEALTH_QUERY_PLAN);
-    LazyQueryPlan healthQueryPlanSource =
-        executionAttributes.getAttribute(HEALTH_QUERY_PLAN_SOURCE);
-    if (healthQueryPlan == null || healthQueryPlanSource != plan) {
+    RoutingState routingState = executionAttributes.getAttribute(ROUTING_STATE);
+    if (routingState == null || routingState.healthPlanSource != plan) {
       // Preserve compatibility for subclasses that directly replace the protected QUERY_PLAN
       // attribute instead of using the plan-construction hook.
-      healthQueryPlan = liveNodes.newRegularQueryPlan(plan);
-      executionAttributes.putAttribute(HEALTH_QUERY_PLAN, healthQueryPlan);
-      executionAttributes.putAttribute(HEALTH_QUERY_PLAN_SOURCE, plan);
+      if (routingState == null) {
+        routingState = new RoutingState(liveNodes.newRegularQueryPlan(plan), plan);
+        executionAttributes.putAttribute(ROUTING_STATE, routingState);
+      } else {
+        routingState.replaceHealthPlan(liveNodes.newRegularQueryPlan(plan), plan);
+      }
     }
 
-    URI targetUri = healthQueryPlan.nextRouteCandidate();
+    URI targetUri = routingState.healthPlan.nextRouteCandidate();
     if (targetUri == null) {
       throw new IllegalStateException("No live nodes available");
     }
@@ -150,15 +139,14 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
       return request;
     }
 
-    reportInFlightTransportFailure(executionAttributes);
-    Integer routedAttempts = executionAttributes.getAttribute(ROUTED_ATTEMPTS);
+    RoutingState routingState = requireRoutingState(executionAttributes);
+    reportInFlightTransportFailure(routingState);
     RoutedAttempt routedAttempt =
-        routedAttempts == null || routedAttempts == 0
+        routingState.firstAttempt
             ? revalidateFirstRoute(request, executionAttributes)
             : selectFinalRoute(request, executionAttributes);
-    executionAttributes.putAttribute(
-        ROUTED_ATTEMPTS, routedAttempts == null ? 1 : routedAttempts + 1);
-    executionAttributes.putAttribute(IN_FLIGHT_NODE, routedAttempt.inFlightNode);
+    routingState.firstAttempt = false;
+    routingState.inFlightNode = routedAttempt.inFlightNode;
     return routedAttempt.request;
   }
 
@@ -200,22 +188,30 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
     }
   }
 
-  private void reportInFlightTransportFailure(ExecutionAttributes executionAttributes) {
-    reportInFlightNodeResult(executionAttributes, NodeHealthObservation.TRAFFIC_FAILURE);
+  private void reportInFlightTransportFailure(RoutingState routingState) {
+    reportInFlightNodeResult(routingState, NodeHealthObservation.TRAFFIC_FAILURE);
   }
 
   private void reportInFlightNodeResult(
       ExecutionAttributes executionAttributes, NodeHealthObservation observation) {
-    InFlightNode inFlightNode = clearInFlightNode(executionAttributes);
+    RoutingState routingState = executionAttributes.getAttribute(ROUTING_STATE);
+    if (routingState != null) {
+      reportInFlightNodeResult(routingState, observation);
+    }
+  }
+
+  private void reportInFlightNodeResult(
+      RoutingState routingState, NodeHealthObservation observation) {
+    InFlightNode inFlightNode = clearInFlightNode(routingState);
     if (inFlightNode == null) {
       return;
     }
     liveNodes.reportNodeResult(inFlightNode.node, observation, inFlightNode.healthGeneration);
   }
 
-  private InFlightNode clearInFlightNode(ExecutionAttributes executionAttributes) {
-    InFlightNode node = executionAttributes.getAttribute(IN_FLIGHT_NODE);
-    executionAttributes.putAttribute(IN_FLIGHT_NODE, null);
+  private InFlightNode clearInFlightNode(RoutingState routingState) {
+    InFlightNode node = routingState.inFlightNode;
+    routingState.inFlightNode = null;
     return node;
   }
 
@@ -230,18 +226,19 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
         context.httpRequest().firstMatchingHeader(SDK_INVOCATION_ID_HEADER).orElse(null);
     if (executionId == null) {
       // Preserve the direct-interceptor lifecycle used by custom integrations and older tests.
-      reportInFlightTransportFailure(executionAttributes);
+      RoutingState routingState = requireRoutingState(executionAttributes);
+      reportInFlightTransportFailure(routingState);
       URI routedNode = requestEndpoint(context.httpRequest());
-      executionAttributes.putAttribute(
-          IN_FLIGHT_NODE,
-          new InFlightNode(routedNode, liveNodes.getNodeHealthGeneration(routedNode)));
+      routingState.inFlightNode =
+          new InFlightNode(routedNode, liveNodes.getNodeHealthGeneration(routedNode));
       return;
     }
-    String previousExecutionId = executionAttributes.getAttribute(ROUTING_EXECUTION_ID);
+    RoutingState routingState = requireRoutingState(executionAttributes);
+    String previousExecutionId = routingState.executionId;
     if (previousExecutionId != null && !previousExecutionId.equals(executionId)) {
       routingExecutions.remove(previousExecutionId, executionAttributes);
     }
-    executionAttributes.putAttribute(ROUTING_EXECUTION_ID, executionId);
+    routingState.executionId = executionId;
     routingExecutions.put(executionId, executionAttributes);
   }
 
@@ -252,7 +249,10 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
       // Alternator reports coordinator timeouts and unrelated internal failures with the same
       // InternalServerError type. Clear transmission bookkeeping, but do not let an ambiguous 5xx
       // either advance or reset node-health counters.
-      clearInFlightNode(executionAttributes);
+      RoutingState routingState = executionAttributes.getAttribute(ROUTING_STATE);
+      if (routingState != null) {
+        clearInFlightNode(routingState);
+      }
     } else {
       // Authentication and application errors prove that the node handled the request and are not
       // node-health failures.
@@ -279,11 +279,24 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
   }
 
   private void unregisterRoutingExecution(ExecutionAttributes executionAttributes) {
-    String executionId = executionAttributes.getAttribute(ROUTING_EXECUTION_ID);
-    if (executionId != null) {
-      routingExecutions.remove(executionId, executionAttributes);
-      executionAttributes.putAttribute(ROUTING_EXECUTION_ID, null);
+    RoutingState routingState = executionAttributes.getAttribute(ROUTING_STATE);
+    if (routingState != null && routingState.executionId != null) {
+      routingExecutions.remove(routingState.executionId, executionAttributes);
+      routingState.executionId = null;
     }
+  }
+
+  private RoutingState requireRoutingState(ExecutionAttributes executionAttributes) {
+    RoutingState routingState = executionAttributes.getAttribute(ROUTING_STATE);
+    if (routingState == null) {
+      LazyQueryPlan plan = executionAttributes.getAttribute(QUERY_PLAN);
+      if (plan == null) {
+        throw new IllegalStateException("query plan routing state is not initialized");
+      }
+      routingState = new RoutingState(liveNodes.newRegularQueryPlan(plan), plan);
+      executionAttributes.putAttribute(ROUTING_STATE, routingState);
+    }
+    return routingState;
   }
 
   /**
@@ -302,6 +315,24 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
     private InFlightNode(URI node, long healthGeneration) {
       this.node = node;
       this.healthGeneration = healthGeneration;
+    }
+  }
+
+  private static final class RoutingState {
+    private NodeHealthQueryPlan healthPlan;
+    private LazyQueryPlan healthPlanSource;
+    private InFlightNode inFlightNode;
+    private boolean firstAttempt = true;
+    private String executionId;
+
+    private RoutingState(NodeHealthQueryPlan healthPlan, LazyQueryPlan healthPlanSource) {
+      this.healthPlan = healthPlan;
+      this.healthPlanSource = healthPlanSource;
+    }
+
+    private void replaceHealthPlan(NodeHealthQueryPlan healthPlan, LazyQueryPlan healthPlanSource) {
+      this.healthPlan = healthPlan;
+      this.healthPlanSource = healthPlanSource;
     }
   }
 

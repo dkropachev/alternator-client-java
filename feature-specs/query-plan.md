@@ -37,7 +37,8 @@ health-aware routing layer described in [Node health](node-health.md).
 | Preferred plan | Listed preferred endpoints first, followed by remaining endpoints in canonical order. | Preferred-node `LazyQueryPlan` |
 | Affinity plan | Seeded or preferred plan whose order represents key-route affinity. | Plan built by [`AffinityQueryPlanInterceptor`](../src/main/java/com/scylladb/alternator/queryplan/AffinityQueryPlanInterceptor.java) |
 | Health wrapper | Request-scoped final eligibility layer around the base plan. | [`NodeHealthQueryPlan`](../src/main/java/com/scylladb/alternator/internal/NodeHealthQueryPlan.java) |
-| In-flight endpoint | Endpoint associated with the current transmission until a response or transport failure is observed. | `IN_FLIGHT_NODE` execution attribute |
+| Routing state | Request-scoped mutable state containing the health wrapper, its base-plan identity, the current in-flight endpoint, first-attempt status, and execution identifier. | One private `RoutingState` stored in the `ROUTING_STATE` execution attribute |
+| In-flight endpoint | Endpoint associated with the current transmission until a response or transport failure is observed. | `RoutingState.inFlightNode` |
 | Execution identifier | SDK-provided identifier connecting transport attempts to request-scoped state. | `amz-sdk-invocation-id` and `routingExecutions` |
 
 ## Plan construction
