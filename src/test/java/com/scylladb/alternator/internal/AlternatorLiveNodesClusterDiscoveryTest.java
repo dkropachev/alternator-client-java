@@ -355,7 +355,8 @@ public class AlternatorLiveNodesClusterDiscoveryTest {
 
     assertEquals(
         new LinkedHashSet<>(Arrays.asList("node1.example.com", "node2.example.com")),
-        hostSet(liveNodes.getLiveNodes()));
+        hostSet(liveNodes.getDiscoveredNodes()));
+    assertEquals(2, liveNodes.getQuarantinedNodes().size());
   }
 
   @Test

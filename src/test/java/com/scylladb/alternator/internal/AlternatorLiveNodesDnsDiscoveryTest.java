@@ -357,7 +357,8 @@ public class AlternatorLiveNodesDnsDiscoveryTest {
       liveNodes.updateLiveNodes();
       long elapsedMillis = Duration.ofNanos(System.nanoTime() - startNanos).toMillis();
 
-      assertEquals(1, liveNodes.getLiveNodes().size());
+      assertEquals(1, liveNodes.getDiscoveredNodes().size());
+      assertEquals(1, liveNodes.getQuarantinedNodes().size());
       assertEquals("dual.test", liveNodes.nextAsURI().getHost());
       assertTrue("Unavailable DNS records must return promptly", elapsedMillis < 5000);
     } finally {
