@@ -18,6 +18,7 @@ package com.scylladb.alternator.keyrouting;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
+import com.scylladb.alternator.CoversRequirements;
 import com.scylladb.alternator.internal.AlternatorLiveNodes;
 import com.scylladb.alternator.keyrouting.KeyAffinityRequestClassifier.BatchWriteRoutingTarget;
 import java.net.URI;
@@ -62,6 +63,7 @@ public class BatchWriteItemKeyRouteAffinityCrossLanguageTest {
   }
 
   @Test
+  @CoversRequirements("AFF-REQ-005")
   public void testVotePreferenceIgnoresNonKeyAttributes() throws URISyntaxException {
     Map<String, String> pkInfo = pkInfo("orders", "pk");
     BatchWriteItemRequest first =

@@ -438,6 +438,7 @@ public class AlternatorDynamoDbClientCustomizerTest {
   }
 
   @Test
+  @CoversRequirements("HEAD-REQ-004")
   @SuppressWarnings("deprecation")
   public void testWithAlternatorConfigEnablesDefaultUserAgentTransformer() throws Exception {
     AlternatorConfig config = AlternatorConfig.builder().withUserAgentEnabled(true).build();

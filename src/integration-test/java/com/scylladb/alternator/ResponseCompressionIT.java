@@ -65,6 +65,7 @@ public class ResponseCompressionIT {
   }
 
   @Test
+  @CoversRequirements("COMP-REQ-008")
   public void testAsyncSdkClientParsesGzipResponse() throws Exception {
     verifyAsyncResponse("gzip", gzip(RESPONSE_JSON));
   }

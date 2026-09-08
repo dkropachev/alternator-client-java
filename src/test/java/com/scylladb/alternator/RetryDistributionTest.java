@@ -75,6 +75,7 @@ import software.amazon.awssdk.services.dynamodb.model.ListTablesRequest;
 public class RetryDistributionTest {
 
   @Test
+  @CoversRequirements("QUERY-REQ-005")
   public void testSdkRetryPipelineRoutesEachAttemptToDifferentNode() throws Exception {
     List<URI> nodes = createNodes(2);
     RetryingSdkHttpClient httpClient = new RetryingSdkHttpClient();
@@ -98,6 +99,7 @@ public class RetryDistributionTest {
   }
 
   @Test
+  @CoversRequirements("QUERY-REQ-007")
   public void testAsyncSdkRetryPipelineRoutesEachAttemptToDifferentNode() throws Exception {
     List<URI> nodes = createNodes(2);
     RetryingSdkAsyncHttpClient httpClient = new RetryingSdkAsyncHttpClient();
@@ -424,6 +426,7 @@ public class RetryDistributionTest {
   }
 
   @Test
+  @CoversRequirements("HEALTH-REQ-002")
   public void testRetryableServerErrorsDoNotReportHealthResults() throws Exception {
     for (int statusCode : Arrays.asList(500, 502, 503, 504)) {
       List<URI> nodes = createNodes(2);

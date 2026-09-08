@@ -111,6 +111,7 @@ public class AlternatorConfigHeadersTest {
   }
 
   @Test
+  @CoversRequirements("COMP-REQ-007")
   public void testHeadersOptimizationWithCompression() {
     AlternatorConfig config =
         AlternatorConfig.builder()
@@ -149,6 +150,7 @@ public class AlternatorConfigHeadersTest {
   }
 
   @Test
+  @CoversRequirements("HEAD-REQ-002")
   public void testFullHeadersWhitelistContents() {
     // Config with request compression, response compression, and auth should have all headers
     AlternatorConfig config =
@@ -420,6 +422,7 @@ public class AlternatorConfigHeadersTest {
   }
 
   @Test(expected = IllegalArgumentException.class)
+  @CoversRequirements("HEAD-REQ-003")
   public void testCustomWhitelistMissingRequiredHeadersThrows() {
     // This should throw because we're missing required headers
     Set<String> incompleteHeaders = new HashSet<>(Arrays.asList("Host", "Authorization"));

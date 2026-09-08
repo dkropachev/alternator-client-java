@@ -82,6 +82,7 @@ public class HeadersFilteringSdkAsyncHttpClientTest {
   }
 
   @Test
+  @CoversRequirements("HEAD-REQ-006")
   public void testFiltersNonWhitelistedHeaders() {
     Set<String> whitelist = new HashSet<>(Arrays.asList("Host", "Authorization"));
     MockSdkAsyncHttpClient mockClient = new MockSdkAsyncHttpClient();
@@ -339,6 +340,7 @@ public class HeadersFilteringSdkAsyncHttpClientTest {
   }
 
   @Test
+  @CoversRequirements("HEAD-REQ-005")
   public void testPreservesMetricCollector() {
     Set<String> whitelist = new HashSet<>(Arrays.asList("Host"));
     MockSdkAsyncHttpClient mockClient = new MockSdkAsyncHttpClient();
