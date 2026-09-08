@@ -378,6 +378,64 @@ public class AlternatorLiveNodesDnsDiscoveryTest {
     }
   }
 
+  /** Verifies refresh retries the original DNS seed after every learned node is unavailable. */
+  @Test(timeout = 10000)
+  public void testRefreshReresolvesInitialDnsEntrypoint() throws Exception {
+    InetAddress initialSeedAddress = InetAddress.getByName("127.0.0.2");
+    InetAddress oldNodeAddress = InetAddress.getByName("127.0.0.3");
+    InetAddress recoveredAddress = InetAddress.getByName("127.0.0.4");
+    AtomicInteger recoveryRequests = new AtomicInteger();
+    AtomicReference<String> recoveryHostHeader = new AtomicReference<>();
+
+    HttpServer initialSeedServer =
+        startServer(
+            initialSeedAddress,
+            "[\"127.0.0.3\"]",
+            exchange -> exchange.getResponseHeaders().add("Connection", "close"));
+    int dnsPort = initialSeedServer.getAddress().getPort();
+    HttpServer oldNodeServer =
+        startServer(oldNodeAddress, dnsPort, "[\"127.0.0.3\"]", exchange -> {});
+    HttpServer recoveredServer =
+        startServer(
+            recoveredAddress,
+            dnsPort,
+            "[\"127.0.0.4\"]",
+            exchange -> {
+              recoveryRequests.incrementAndGet();
+              recoveryHostHeader.set(exchange.getRequestHeaders().getFirst("Host"));
+            });
+
+    AtomicReference<InetAddress[]> dnsAnswers =
+        new AtomicReference<>(new InetAddress[] {initialSeedAddress});
+    SdkHttpClient httpClient =
+        apacheClient(
+            hostname ->
+                "dual.test".equals(hostname)
+                    ? dnsAnswers.get()
+                    : InetAddress.getAllByName(hostname));
+    try {
+      AlternatorLiveNodes liveNodes = new AlternatorLiveNodes(dnsConfig(dnsPort), httpClient);
+
+      liveNodes.updateLiveNodes();
+      assertEquals("127.0.0.3", liveNodes.nextAsURI().getHost());
+
+      initialSeedServer.stop(0);
+      oldNodeServer.stop(0);
+      dnsAnswers.set(new InetAddress[] {oldNodeAddress, recoveredAddress});
+
+      liveNodes.updateLiveNodes();
+
+      assertEquals("127.0.0.4", liveNodes.nextAsURI().getHost());
+      assertEquals(1, recoveryRequests.get());
+      assertEquals("dual.test:" + dnsPort, recoveryHostHeader.get());
+    } finally {
+      httpClient.close();
+      initialSeedServer.stop(0);
+      oldNodeServer.stop(0);
+      recoveredServer.stop(0);
+    }
+  }
+
   private void assertDnsDiscovery(InetAddress listenAddress, InetAddress... resolvedAddresses)
       throws Exception {
     AtomicReference<String> hostHeader = new AtomicReference<>();
