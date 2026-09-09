@@ -15,6 +15,7 @@ on:
 
 env:
   IS_CICD: 1
+  SCYLLA_VERSION: release:2025.2
 
 jobs:
   lint:
@@ -50,6 +51,8 @@ jobs:
           java-version: ${{ matrix.java-version }}
           cache: maven
 
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+
       - name: Compile main code
         run: make compile
 
@@ -69,30 +72,18 @@ jobs:
           name: unit-test-results-java-${{ matrix.java-version }}
           path: target/surefire-reports/*.xml
 
-      - name: Cache Docker image
-        id: docker-cache
+      - name: Install pinned scylla-ccm
+        run: make ccm-install
+
+      - name: Cache Scylla relocatable package
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          path: .docker-cache
-          key: scylla-docker-${{ hashFiles('test/docker-compose.yml') }}
+          path: ~/.ccm/scylla-repository
+          key: scylla-ccm-relocatable-${{ runner.os }}-${{ runner.arch }}-${{ env.SCYLLA_VERSION }}
 
-      - name: Save Docker image to cache
-        if: steps.docker-cache.outputs.cache-hit != 'true'
-        run: make docker-cache-save
-
-      - name: Cache certificates
-        id: cert-cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: .cert-cache
-          key: scylla-certs-${{ hashFiles('Makefile') }}
-
-      - name: Save certificates to cache
-        if: steps.cert-cache.outputs.cache-hit != 'true'
-        run: make cert-cache-save
-
-      - name: Run integration tests and demo apps
-        run: make test-all
+      - name: Run integration tests
+        timeout-minutes: 30
+        run: make test-integration
 
       - name: Upload integration test results
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -100,3 +91,11 @@ jobs:
         with:
           name: integration-test-results-java-${{ matrix.java-version }}
           path: target/surefire-reports/*.xml
+
+      - name: Upload CCM diagnostics
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: ccm-diagnostics-java-${{ matrix.java-version }}
+          path: target/ccm/ccm-runtime.*/diagnostics/**
+          if-no-files-found: ignore

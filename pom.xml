@@ -13,6 +13,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.source>11</maven.compiler.source>
         <maven.compiler.target>11</maven.compiler.target>
+        <test.forkCount>2</test.forkCount>
         <release.autopublish>false</release.autopublish>
     </properties>
 
@@ -67,6 +68,12 @@
             <groupId>org.mockito</groupId>
             <artifactId>mockito-core</artifactId>
             <version>4.11.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.snakeyaml</groupId>
+            <artifactId>snakeyaml-engine</artifactId>
+            <version>2.9</version>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -163,8 +170,14 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
                 <configuration>
-                    <forkCount>2</forkCount>
+                    <forkCount>${test.forkCount}</forkCount>
                     <reuseForks>true</reuseForks>
+                    <properties>
+                        <property>
+                            <name>listener</name>
+                            <value>com.scylladb.alternator.testinfra.IntegrationTestRunListener</value>
+                        </property>
+                    </properties>
                     <excludes>
                         <exclude>**/*IT.java</exclude>
                     </excludes>

@@ -23,6 +23,7 @@ This library supports AWS SDK for Java Version 2 (requires 2.20 or above) and re
 
 The language-agnostic feature contracts are maintained in [`feature-specs`](feature-specs/README.md):
 
+- [CCM integration](feature-specs/ccm-integration.md)
 - [Compression](feature-specs/compression.md)
 - [Header optimization](feature-specs/header-optimization.md)
 - [Key-route affinity](feature-specs/key-route-affinity.md)
@@ -1107,3 +1108,60 @@ Key route affinity may not be beneficial for:
 - Read-heavy workloads (reads don't use Paxos)
 - Workloads with uniformly distributed writes across many keys
 - Async clients where partition-key names cannot be pre-configured
+
+## Integration testing with CCM
+
+Integration tests use [scylla-ccm](https://github.com/scylladb/scylla-ccm) and native Scylla
+relocatable packages. They require Linux, Python 3.9 or newer, OpenSSL, and
+[`uv`](https://docs.astral.sh/uv/). Install the repository-pinned CCM revision and run the suite
+with:
+
+```sh
+make ccm-install
+make test-integration
+```
+
+The test harness provisions and reuses matching clusters within the test process. HTTP and HTTPS
+certificates, endpoint discovery, readiness checks, per-lease table namespaces, diagnostics, and
+cluster cleanup are managed by the harness. CCM commands and Maven tests run in isolated process
+groups so cancellation can reap their descendants before rollback. The Makefile owns the outer
+test process group, stale-run detection, diagnostics transfer, and emergency cleanup if a test JVM
+exits abnormally.
+
+The default cluster uses Scylla `release:2025.2`. Override the resolved version or CCM executable
+with `SCYLLA_VERSION` or `SCYLLA_CCM_PATH`. The scheduler detects host and cgroup-available memory,
+reserves one quarter (clamped between 512 MiB and 4 GiB), and admits at most nine physical Scylla
+nodes. `SCYLLA_CCM_MAX_NODES` may lower that ceiling, and `SCYLLA_CCM_AVAILABLE_MEMORY_MB` may
+override memory detection for unusual environments.
+
+Live CCM state and address locks reside in the private per-user namespace
+`/tmp/alternator-client-java-ccm-<uid>`. Operational runs are separated by checkout while the ID
+reservations are shared host-wide. Owner PID, process start time, and boot identity distinguish an
+active run from a stale or PID-reused run. Diagnostics remain under `target/ccm` for CI artifact
+collection. `SCYLLA_CCM_STATE_ROOT` and `SCYLLA_CCM_ID_LOCK_ROOT` may select other private roots when
+`/tmp` is unsuitable.
+
+Tests can acquire reusable or private cluster leases directly:
+
+```java
+try (ReusableClusterLease shared = TestClusters.acquireReusable(ClusterSpecs.defaultSpec())) {
+  String tableName = shared.resources().newTableName("example");
+  DynamoDbClient client = shared.cluster().clientBuilder(AlternatorTransport.HTTP).build();
+}
+
+ClusterSpec privateSpec =
+    ClusterSpecs.defaultSpec()
+        .withTopology(ClusterTopology.singleDatacenter(1))
+        .withTransports(AlternatorTransport.HTTP);
+try (PrivateClusterLease privateCluster = TestClusters.provisionPrivate(privateSpec)) {
+  privateCluster.control().stopNode(privateCluster.cluster().nodes().get(0));
+}
+```
+
+Reusable leases may share a matching healthy physical cluster concurrently but expose no node
+controls. Tests that stop, start, add, or remove nodes must request a private cluster. Each lease
+supplies unique table names and removes every table in its namespace when released. Private node
+expansion evicts idle reusable clusters when possible and fails immediately when active leases hold
+the required capacity, avoiding admission deadlocks. Private controls are serialized with lease and
+pool shutdown, reject stale or foreign node handles, and never permit removal of the final live
+node.

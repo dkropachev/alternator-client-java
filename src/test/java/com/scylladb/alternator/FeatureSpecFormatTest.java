@@ -309,7 +309,8 @@ public class FeatureSpecFormatTest {
         errors.add(relative(file) + ": unknown or cross-feature requirement: " + id);
       }
       if (!"not-applicable".equals(status)) {
-        requireMappedLink(file, id, code, "src/main", errors);
+        String requiredCodePath = feature.equals("ccm-integration") ? "src/test" : "src/main";
+        requireMappedLink(file, id, code, requiredCodePath, errors);
       }
       boolean hasTestEvidence = LINK.matcher(evidence).find();
       if ("conformant".equals(status) || hasTestEvidence) {

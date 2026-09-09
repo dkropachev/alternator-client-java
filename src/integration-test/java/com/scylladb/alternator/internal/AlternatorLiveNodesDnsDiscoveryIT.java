@@ -15,6 +15,7 @@
  */
 package com.scylladb.alternator.internal;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
@@ -105,9 +106,7 @@ public class AlternatorLiveNodesDnsDiscoveryIT {
 
   @Test
   public void testDnsEntrypointSupportsDynamoDbOperationsAfterDiscovery() throws Exception {
-    InetAddress ipv4 = InetAddress.getByName("127.0.0.1");
-    try (DnsEntrypointProxy proxy =
-            new DnsEntrypointProxy(ipv4, IntegrationTestConfig.HTTP_PORT);
+    try (DnsEntrypointProxy proxy = new DnsEntrypointProxy(0);
         AlternatorDynamoDbClientWrapper wrapper =
             AlternatorDynamoDbClient.builder()
                 .endpointOverride(URI.create("http://localhost:" + proxy.getPort()))
@@ -118,7 +117,16 @@ public class AlternatorLiveNodesDnsDiscoveryIT {
 
       assertSuccessfulDiscovery(proxy, wrapper.getLiveNodes(), seedUri);
 
+      int seedRequests = proxy.getSeedDataRequestCount();
+      int discoveredNodeRequests = proxy.getDiscoveredNodeDataRequestCount();
       wrapper.getClient().listTables(ListTablesRequest.builder().limit(1).build());
+      assertEquals(
+          "DynamoDB request must not fall back to the DNS seed",
+          seedRequests,
+          proxy.getSeedDataRequestCount());
+      assertTrue(
+          "DynamoDB request must use a discovered node",
+          proxy.getDiscoveredNodeDataRequestCount() > discoveredNodeRequests);
     }
   }
 
@@ -161,14 +169,24 @@ public class AlternatorLiveNodesDnsDiscoveryIT {
   private static class DnsEntrypointProxy implements AutoCloseable {
     private final HttpServer server;
     private final AtomicInteger requestCount = new AtomicInteger(0);
+    private final AtomicInteger seedDataRequestCount = new AtomicInteger(0);
+    private final AtomicInteger discoveredNodeDataRequestCount = new AtomicInteger(0);
 
     DnsEntrypointProxy() throws IOException {
       this(InetAddress.getLoopbackAddress(), 0);
     }
 
+    DnsEntrypointProxy(int port) throws IOException {
+      this(new InetSocketAddress(port));
+    }
+
     DnsEntrypointProxy(InetAddress listenAddress, int port) throws IOException {
-      server = HttpServer.create(new InetSocketAddress(listenAddress, port), 0);
-      server.createContext("/localnodes", this::handleLocalNodes);
+      this(new InetSocketAddress(listenAddress, port));
+    }
+
+    private DnsEntrypointProxy(InetSocketAddress listenAddress) throws IOException {
+      server = HttpServer.create(listenAddress, 0);
+      server.createContext("/", this::handleRequest);
       server.start();
     }
 
@@ -180,36 +198,82 @@ public class AlternatorLiveNodesDnsDiscoveryIT {
       return requestCount.get();
     }
 
+    int getSeedDataRequestCount() {
+      return seedDataRequestCount.get();
+    }
+
+    int getDiscoveredNodeDataRequestCount() {
+      return discoveredNodeDataRequestCount.get();
+    }
+
     @Override
     public void close() {
       server.stop(0);
     }
 
-    private void handleLocalNodes(com.sun.net.httpserver.HttpExchange exchange) throws IOException {
+    private void handleRequest(com.sun.net.httpserver.HttpExchange exchange) throws IOException {
       requestCount.incrementAndGet();
+      String path = exchange.getRequestURI().toASCIIString();
+      if (!exchange.getRequestURI().getPath().equals("/localnodes")) {
+        String host = exchange.getRequestHeaders().getFirst("Host");
+        String normalizedHost = host == null ? "" : host.toLowerCase(java.util.Locale.ROOT);
+        if (normalizedHost.equals("localhost")
+            || normalizedHost.startsWith("localhost:")
+            || normalizedHost.equals("[::1]")
+            || normalizedHost.startsWith("[::1]:")
+            || normalizedHost.equals("127.0.0.1")
+            || normalizedHost.startsWith("127.0.0.1:")) {
+          seedDataRequestCount.incrementAndGet();
+        } else {
+          discoveredNodeDataRequestCount.incrementAndGet();
+        }
+      }
       URI upstream =
           URI.create(
               "http://"
                   + IntegrationTestConfig.HOST
                   + ":"
                   + IntegrationTestConfig.HTTP_PORT
-                  + "/localnodes");
+                  + path);
       HttpURLConnection connection = (HttpURLConnection) upstream.toURL().openConnection();
       connection.setConnectTimeout(5000);
       connection.setReadTimeout(5000);
-
-      int status = connection.getResponseCode();
-      byte[] body;
-      try (InputStream input = connection.getInputStream()) {
-        body = input.readAllBytes();
-      } finally {
-        connection.disconnect();
+      connection.setRequestMethod(exchange.getRequestMethod());
+      exchange
+          .getRequestHeaders()
+          .forEach(
+              (name, values) -> {
+                if (!"Host".equalsIgnoreCase(name) && !"Content-Length".equalsIgnoreCase(name)) {
+                  connection.setRequestProperty(name, String.join(",", values));
+                }
+              });
+      byte[] requestBody = exchange.getRequestBody().readAllBytes();
+      if (requestBody.length > 0) {
+        connection.setDoOutput(true);
+        try (OutputStream output = connection.getOutputStream()) {
+          output.write(requestBody);
+        }
       }
 
-      exchange.getResponseHeaders().add("Content-Type", "application/json");
-      exchange.sendResponseHeaders(status, body.length);
-      try (OutputStream output = exchange.getResponseBody()) {
-        output.write(body);
+      int status = connection.getResponseCode();
+      byte[] body = new byte[0];
+      InputStream responseBody = status >= 400 ? connection.getErrorStream() : connection.getInputStream();
+      if (responseBody != null) {
+        try (InputStream input = responseBody) {
+          body = input.readAllBytes();
+        }
+      }
+      String contentType = connection.getHeaderField("Content-Type");
+      if (contentType != null) {
+        exchange.getResponseHeaders().add("Content-Type", contentType);
+      }
+      try {
+        exchange.sendResponseHeaders(status, body.length);
+        try (OutputStream output = exchange.getResponseBody()) {
+          output.write(body);
+        }
+      } finally {
+        connection.disconnect();
       }
     }
   }
