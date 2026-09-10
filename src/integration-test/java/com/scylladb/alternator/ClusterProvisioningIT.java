@@ -16,11 +16,12 @@
 package com.scylladb.alternator;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 
+import com.scylladb.alternator.internal.TlsContextFactory;
 import com.scylladb.alternator.testinfra.AlternatorConnection;
 import com.scylladb.alternator.testinfra.AlternatorTransport;
 import com.scylladb.alternator.testinfra.ClusterSecuritySpec;
@@ -30,11 +31,17 @@ import com.scylladb.alternator.testinfra.PrivateClusterLease;
 import com.scylladb.alternator.testinfra.ReusableClusterLease;
 import com.scylladb.alternator.testinfra.TestClusterNode;
 import com.scylladb.alternator.testinfra.TestClusters;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import javax.net.ssl.HttpsURLConnection;
 import org.junit.Before;
 import org.junit.Test;
 import org.snakeyaml.engine.v2.api.Load;
@@ -43,7 +50,15 @@ import org.snakeyaml.engine.v2.schema.CoreSchema;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.AttributeDefinition;
+import software.amazon.awssdk.services.dynamodb.model.CreateTableRequest;
+import software.amazon.awssdk.services.dynamodb.model.DescribeTableRequest;
 import software.amazon.awssdk.services.dynamodb.model.DynamoDbException;
+import software.amazon.awssdk.services.dynamodb.model.KeySchemaElement;
+import software.amazon.awssdk.services.dynamodb.model.KeyType;
+import software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughput;
+import software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException;
+import software.amazon.awssdk.services.dynamodb.model.ScalarAttributeType;
 
 /** Real-cluster contract tests for the CCM test infrastructure. */
 public class ClusterProvisioningIT {
@@ -57,13 +72,28 @@ public class ClusterProvisioningIT {
   @Test
   @CoversRequirements("CCM-REQ-003")
   public void sameSpecReusesClusterWithIndependentResourceScopes() throws Exception {
-    try (ReusableClusterLease first =
-            TestClusters.acquireReusable(ClusterSpecs.defaultSpec());
-        ReusableClusterLease second =
-            TestClusters.acquireReusable(ClusterSpecs.defaultSpec())) {
+    try (ReusableClusterLease first = TestClusters.acquireReusable(ClusterSpecs.defaultSpec());
+        ReusableClusterLease second = TestClusters.acquireReusable(ClusterSpecs.defaultSpec())) {
       assertEquals(first.cluster().instanceId(), second.cluster().instanceId());
-      assertNotEquals(
-          first.resources().newTableName("table"), second.resources().newTableName("table"));
+      String firstTable = first.resources().newTableName("first");
+      String secondTable = second.resources().newTableName("second");
+      try (AlternatorDynamoDbClientWrapper wrapper =
+          second.cluster().clientBuilder(AlternatorTransport.HTTP).buildWithAlternatorAPI()) {
+        DynamoDbClient client = wrapper.getClient();
+        createTable(client, firstTable);
+        createTable(client, secondTable);
+        assertEquals(firstTable, describeTable(client, firstTable));
+        assertEquals(secondTable, describeTable(client, secondTable));
+
+        first.close();
+
+        assertThrows(
+            ResourceNotFoundException.class,
+            () ->
+                client.describeTable(DescribeTableRequest.builder().tableName(firstTable).build()));
+        assertEquals(secondTable, describeTable(client, secondTable));
+      }
+      second.close();
     }
   }
 
@@ -85,10 +115,7 @@ public class ClusterProvisioningIT {
                           AwsBasicCredentials.create("wrong-user", "wrong-password")))
                   .buildWithAlternatorAPI();
           AlternatorDynamoDbClientWrapper authorizedWrapper =
-              lease
-                  .cluster()
-                  .clientBuilder(AlternatorTransport.HTTP)
-                  .buildWithAlternatorAPI()) {
+              lease.cluster().clientBuilder(AlternatorTransport.HTTP).buildWithAlternatorAPI()) {
         DynamoDbClient unauthorized = unauthorizedWrapper.getClient();
         DynamoDbClient authorized = authorizedWrapper.getClient();
         boolean rejected = false;
@@ -111,41 +138,94 @@ public class ClusterProvisioningIT {
             ClusterSpecs.defaultSpec()
                 .withTopology(ClusterTopology.singleDatacenter(1))
                 .withTransports(AlternatorTransport.HTTPS))) {
+      TestClusterNode original = lease.cluster().nodes().get(0);
       TestClusterNode added = lease.control().addNode("dc1", "RAC1");
       assertEquals(2, lease.cluster().nodes().size());
-      try (AlternatorDynamoDbClientWrapper wrapper =
-          AlternatorDynamoDbClient.builder()
-              .endpointOverride(URI.create("https://" + added.address() + ":8043"))
-              .withTlsConfig(
-                  TlsConfig.builder()
-                      .withCaCertPath(
-                          lease
-                              .cluster()
-                              .connection(AlternatorTransport.HTTPS)
-                              .caCertificatePath())
-                      .withTrustSystemCaCerts(false)
-                      .build())
-              .buildWithAlternatorAPI()) {
-        assertNotNull(wrapper.getClient().listTables().tableNames());
-      }
+      AlternatorConnection https = lease.cluster().connection(AlternatorTransport.HTTPS);
+      URI addedEndpoint = URI.create("https://" + added.address() + ":8043");
+      assertHttpsEndpointWorks(addedEndpoint, https.caCertificatePath());
+
+      lease.control().stop();
+      awaitEndpointClosed(https.seedEndpoint());
+      awaitEndpointClosed(addedEndpoint);
+      lease.control().start();
+      assertHttpsEndpointWorks(https.seedEndpoint(), https.caCertificatePath());
+      assertHttpsEndpointWorks(addedEndpoint, https.caCertificatePath());
 
       lease.control().stopNode(added);
+      awaitEndpointClosed(addedEndpoint);
       lease.control().startNode(added);
-      lease.control().removeNode(added);
+      assertHttpsEndpointWorks(addedEndpoint, https.caCertificatePath());
+      lease.control().removeNode(original);
       assertEquals(1, lease.cluster().nodes().size());
 
       TestClusterNode replacement = lease.control().addNode("dc1", "RAC1");
-      assertEquals(added.address(), replacement.address());
+      assertEquals(original.address(), replacement.address());
+      assertHttpsEndpointWorks(
+          URI.create("https://" + replacement.address() + ":8043"), https.caCertificatePath());
       lease.control().removeNode(replacement);
     }
   }
 
+  private static void createTable(DynamoDbClient client, String tableName) {
+    client.createTable(
+        CreateTableRequest.builder()
+            .tableName(tableName)
+            .keySchema(KeySchemaElement.builder().attributeName("pk").keyType(KeyType.HASH).build())
+            .attributeDefinitions(
+                AttributeDefinition.builder()
+                    .attributeName("pk")
+                    .attributeType(ScalarAttributeType.S)
+                    .build())
+            .provisionedThroughput(
+                ProvisionedThroughput.builder()
+                    .readCapacityUnits(1L)
+                    .writeCapacityUnits(1L)
+                    .build())
+            .build());
+  }
+
+  private static String describeTable(DynamoDbClient client, String tableName) {
+    return client
+        .describeTable(DescribeTableRequest.builder().tableName(tableName).build())
+        .table()
+        .tableName();
+  }
+
+  private static void assertHttpsEndpointWorks(URI endpoint, Path caCertificate) throws Exception {
+    HttpsURLConnection connection =
+        (HttpsURLConnection) endpoint.toURL().openConnection(Proxy.NO_PROXY);
+    connection.setSSLSocketFactory(
+        TlsContextFactory.createSslContext(
+                TlsConfig.builder()
+                    .withCaCertPath(caCertificate)
+                    .withTrustSystemCaCerts(false)
+                    .build())
+            .getSocketFactory());
+    connection.setConnectTimeout(1000);
+    connection.setReadTimeout(1000);
+    try {
+      assertTrue("Added node HTTPS endpoint failed", connection.getResponseCode() / 100 == 2);
+    } finally {
+      connection.disconnect();
+    }
+  }
+
+  private static void awaitEndpointClosed(URI endpoint) throws Exception {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    while (System.nanoTime() < deadline) {
+      try (Socket socket = new Socket()) {
+        socket.connect(new InetSocketAddress(endpoint.getHost(), endpoint.getPort()), 500);
+      } catch (IOException closed) {
+        return;
+      }
+      Thread.sleep(100);
+    }
+    throw new AssertionError("HTTPS endpoint remained reachable after stop: " + endpoint);
+  }
+
   @Test
   public void yamlOverridesSurviveClusterAndNodeConfigurationUpdates() throws Exception {
-    assumeTrue(
-        "YAML diagnostics assertions require the CCM integration runner.",
-        System.getenv("SCYLLA_CCM_DIAGNOSTICS_DIR") != null
-            || System.getenv("SCYLLA_CCM_RUN_DIR") != null);
     String instanceId;
     try (PrivateClusterLease lease =
         TestClusters.provisionPrivate(
@@ -183,16 +263,13 @@ public class ClusterProvisioningIT {
     if (configured != null && !configured.trim().isEmpty()) {
       return Path.of(configured);
     }
-    return Path.of(System.getenv("SCYLLA_CCM_RUN_DIR")).resolve("diagnostics");
+    return Path.of("target", "ccm").toAbsolutePath();
   }
 
   @SuppressWarnings("unchecked")
   private static Map<String, Object> readYaml(Path path) throws Exception {
     LoadSettings options =
-        LoadSettings.builder()
-            .setAllowDuplicateKeys(false)
-            .setSchema(new CoreSchema())
-            .build();
+        LoadSettings.builder().setAllowDuplicateKeys(false).setSchema(new CoreSchema()).build();
     Object parsed =
         new Load(options).loadFromString(Files.readString(path, StandardCharsets.UTF_8));
     assertTrue("Expected YAML mapping in " + path, parsed instanceof Map);

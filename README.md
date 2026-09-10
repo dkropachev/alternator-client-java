@@ -1112,34 +1112,36 @@ Key route affinity may not be beneficial for:
 ## Integration testing with CCM
 
 Integration tests use [scylla-ccm](https://github.com/scylladb/scylla-ccm) and native Scylla
-relocatable packages. They require Linux, Python 3.9 or newer, OpenSSL, and
-[`uv`](https://docs.astral.sh/uv/). Install the repository-pinned CCM revision and run the suite
-with:
+relocatable packages. They require Linux, Python 3.9 or newer, OpenSSL, `setsid` from util-linux,
+external `kill` and `ps` executables from procps, and [`uv`](https://docs.astral.sh/uv/). Install the
+repository-pinned CCM revision and run the suite with:
 
 ```sh
 make ccm-install
 make test-integration
 ```
 
-The test harness provisions and reuses matching clusters within the test process. HTTP and HTTPS
-certificates, endpoint discovery, readiness checks, per-lease table namespaces, diagnostics, and
-cluster cleanup are managed by the harness. CCM commands and Maven tests run in isolated process
-groups so cancellation can reap their descendants before rollback. The Makefile owns the outer
-test process group, stale-run detection, diagnostics transfer, and emergency cleanup if a test JVM
-exits abnormally.
+The Java test harness owns provisioning, endpoint readiness, per-lease table namespaces,
+diagnostics, and cleanup. It keeps at most one physical cluster in a JVM. Matching reusable leases
+share that cluster and receive independent resource prefixes. An idle incompatible cluster is
+replaced; an incompatible or private request made while another lease is active fails immediately.
+Private leases are exclusive.
 
-The default cluster uses Scylla `release:2025.2`. Override the resolved version or CCM executable
-with `SCYLLA_VERSION` or `SCYLLA_CCM_PATH`. The scheduler detects host and cgroup-available memory,
-reserves one quarter (clamped between 512 MiB and 4 GiB), and admits at most nine physical Scylla
-nodes. `SCYLLA_CCM_MAX_NODES` may lower that ceiling, and `SCYLLA_CCM_AVAILABLE_MEMORY_MB` may
-override memory detection for unusual environments.
+The default cluster uses Scylla `release:2025.2.5`. Override the package selector or CCM executable
+with `SCYLLA_VERSION` or `SCYLLA_CCM_PATH`. A cluster may have at most nine nodes;
+`SCYLLA_CCM_MAX_NODES` may lower that limit. The harness does not schedule clusters from detected
+host or cgroup memory.
 
-Live CCM state and address locks reside in the private per-user namespace
-`/tmp/alternator-client-java-ccm-<uid>`. Operational runs are separated by checkout while the ID
-reservations are shared host-wide. Owner PID, process start time, and boot identity distinguish an
-active run from a stale or PID-reused run. Diagnostics remain under `target/ccm` for CI artifact
-collection. `SCYLLA_CCM_STATE_ROOT` and `SCYLLA_CCM_ID_LOCK_ROOT` may select other private roots when
-`/tmp` is unsuitable.
+Java stores live CCM runs and address reservations beneath the private, host-shared per-user root
+`/tmp/alternator-client-java-ccm-<uid>`. Set `SCYLLA_CCM_ROOT` to use another private root, and use
+the same override for concurrent processes that must coordinate addresses; distinct roots do not
+share reservations. Normal JVM shutdown attempts to remove the current run and retains it for
+recovery if cleanup fails. After a hard kill, the next test JVM detects the stale run,
+collects diagnostics under `target/ccm`, and attempts cleanup before provisioning. State that is
+malformed or cannot be removed remains quarantined with its address ID reserved, and provisioning
+continues with another ID. Direct IDE or Maven execution uses the same best-effort shutdown and
+next-run recovery; cleanup is not immediate after an uncatchable process kill. Set
+`SCYLLA_CCM_DIAGNOSTICS_DIR` to choose a different external diagnostics directory.
 
 Tests can acquire reusable or private cluster leases directly:
 
@@ -1158,10 +1160,9 @@ try (PrivateClusterLease privateCluster = TestClusters.provisionPrivate(privateS
 }
 ```
 
-Reusable leases may share a matching healthy physical cluster concurrently but expose no node
-controls. Tests that stop, start, add, or remove nodes must request a private cluster. Each lease
-supplies unique table names and removes every table in its namespace when released. Private node
-expansion evicts idle reusable clusters when possible and fails immediately when active leases hold
-the required capacity, avoiding admission deadlocks. Private controls are serialized with lease and
-pool shutdown, reject stale or foreign node handles, and never permit removal of the final live
-node.
+Reusable leases may share a matching healthy physical cluster but expose no node controls. Tests
+that stop, start, add, or remove nodes must request a private cluster. Each lease supplies unique
+table names and removes every table in its namespace when released. Private controls are
+serialized with lease and pool shutdown, reject stale or foreign node handles, and never permit
+removal of the final live node. A command with an ambiguous result makes the private cluster dirty;
+further mutation is rejected and whole-cluster cleanup is required.

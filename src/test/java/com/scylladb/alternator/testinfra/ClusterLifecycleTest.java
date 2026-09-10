@@ -20,377 +20,295 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
+import static org.junit.Assume.assumeTrue;
 
 import java.nio.file.Files;
-import java.time.Duration;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Test;
-import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
-import software.amazon.awssdk.services.dynamodb.model.DescribeTableResponse;
-import software.amazon.awssdk.services.dynamodb.model.ListTablesRequest;
-import software.amazon.awssdk.services.dynamodb.model.ListTablesResponse;
 
-/** Failure and concurrency tests for physical-cluster ownership. */
+/** Lifecycle tests for cached state and the dirty-cluster fail-safe. */
 public class ClusterLifecycleTest {
   @Test
-  public void nodeHandlesUseIdentityAndFinalNodeCannotBeRemoved() throws Exception {
+  public void repeatedNodeControlsUseCachedState() throws Exception {
     LifecycleProvisioner provisioner = new LifecycleProvisioner();
-    PhysicalTestCluster single = provisioner.newCluster(oneNodeSpec("single"), "single", 1);
-
-    assertThrows(IllegalStateException.class, () -> single.removeNode(single.nodes().get(0)));
-    assertEquals(0, provisioner.decommissionCount.get());
-    assertEquals(0, provisioner.deleteNodeCount.get());
-
-    PhysicalTestCluster cluster = provisioner.newCluster(twoNodeSpec("identity"), "identity", 2);
-    TestClusterNode original = cluster.nodes().get(1);
-    TestClusterNode foreign =
-        new TestClusterNode(
-            original.name(), original.address(), original.datacenter(), original.rack());
-    assertThrows(IllegalArgumentException.class, () -> cluster.removeNode(foreign));
-
-    cluster.removeNode(original);
-    TestClusterNode replacement = cluster.addNode("dc1", "RAC1");
-    assertEquals(original.name(), replacement.name());
-    assertNotSame(original, replacement);
-    assertThrows(IllegalArgumentException.class, () -> cluster.removeNode(original));
-  }
-
-  @Test
-  public void ambiguousStartIsProbedBeforeItCanBeRepeated() throws Exception {
-    LifecycleProvisioner provisioner = new LifecycleProvisioner();
-    PhysicalTestCluster cluster = provisioner.newCluster(oneNodeSpec("start"), "start", 3);
-    TestClusterNode node = cluster.nodes().get(0);
-    cluster.stopNode(node);
-    provisioner.failStartAfterEffect.set(true);
-    provisioner.nodeReady.set(false);
-
-    assertThrows(IllegalStateException.class, () -> cluster.startNode(node));
-    assertThrows(IllegalStateException.class, () -> cluster.startNode(node));
-    provisioner.nodeReady.set(true);
-    cluster.startNode(node);
-
-    assertEquals(1, provisioner.startNodeCount.get());
-    assertEquals(5, provisioner.runningProbeCount.get());
-    assertEquals(2, provisioner.readinessWaitCount.get());
-  }
-
-  @Test
-  public void nodeControlsRefreshCachedStateBeforeNoOp() throws Exception {
-    LifecycleProvisioner provisioner = new LifecycleProvisioner();
-    PhysicalTestCluster cluster = provisioner.newCluster(oneNodeSpec("drift"), "drift", 6);
+    PhysicalTestCluster cluster = provisioner.newCluster(oneNodeSpec(), "cached", 1);
     TestClusterNode node = cluster.nodes().get(0);
 
-    provisioner.running.remove(node);
     cluster.startNode(node);
-    assertEquals(1, provisioner.startNodeCount.get());
-
     cluster.stopNode(node);
-    provisioner.running.add(node);
     cluster.stopNode(node);
-    assertEquals(2, provisioner.stopNodeCount.get());
-  }
+    cluster.startNode(node);
+    cluster.startNode(node);
 
-  @Test
-  public void ambiguouslyCompletedDecommissionContinuesWithStateDeletion() throws Exception {
-    LifecycleProvisioner provisioner = new LifecycleProvisioner();
-    provisioner.failDecommissionAfterEffect.set(true);
-    PhysicalTestCluster cluster =
-        provisioner.newCluster(twoNodeSpec("decommission"), "decommission", 4);
-
-    cluster.removeNode(cluster.nodes().get(1));
-
-    assertEquals(1, provisioner.decommissionCount.get());
-    assertEquals(1, provisioner.decommissionProbeCount.get());
-    assertEquals(1, provisioner.deleteNodeCount.get());
-    assertEquals(1, cluster.nodes().size());
-  }
-
-  @Test
-  public void decommissionedNodeAwaitingDeletionDoesNotCountAsAReplacement() throws Exception {
-    LifecycleProvisioner provisioner = new LifecycleProvisioner();
-    provisioner.failNextDelete.set(true);
-    PhysicalTestCluster cluster =
-        provisioner.newCluster(twoNodeSpec("logical-count"), "logical-count", 5);
-    TestClusterNode first = cluster.nodes().get(0);
-    TestClusterNode second = cluster.nodes().get(1);
-
-    assertThrows(IllegalStateException.class, () -> cluster.removeNode(second));
-    assertThrows(IllegalStateException.class, () -> cluster.removeNode(first));
-
-    assertEquals(1, provisioner.decommissionCount.get());
-  }
-
-  @Test
-  public void unhealthyAlternatorEndpointDoesNotPreventDecommission() throws Exception {
-    LifecycleProvisioner provisioner = new LifecycleProvisioner();
-    provisioner.nodeReady.set(false);
-    PhysicalTestCluster cluster = provisioner.newCluster(twoNodeSpec("unhealthy"), "unhealthy", 7);
-
-    cluster.removeNode(cluster.nodes().get(1));
-
-    assertEquals(1, provisioner.decommissionCount.get());
-    assertEquals(0, provisioner.readinessWaitCount.get());
-  }
-
-  @Test
-  public void clusterStartDoesNotResurrectADecommissionedNodeAwaitingDeletion() throws Exception {
-    LifecycleProvisioner provisioner = new LifecycleProvisioner();
-    provisioner.failNextDelete.set(true);
-    PhysicalTestCluster cluster = provisioner.newCluster(twoNodeSpec("restart"), "restart", 8);
-    TestClusterNode active = cluster.nodes().get(0);
-    TestClusterNode retained = cluster.nodes().get(1);
-    assertThrows(IllegalStateException.class, () -> cluster.removeNode(retained));
-
-    cluster.stop();
-    cluster.start();
-
-    assertTrue(provisioner.running.contains(active));
-    assertFalse(provisioner.running.contains(retained));
+    assertEquals(1, provisioner.stopNodeCount.get());
     assertEquals(1, provisioner.startNodeCount.get());
+    assertFalse(cluster.isDirty());
   }
 
   @Test
-  public void privateCloseSerializesWithAddAndReleasesEveryReservation() throws Exception {
+  public void ambiguousLifecycleFailureMakesOnlyWholeRemovalAvailable() throws Exception {
     LifecycleProvisioner provisioner = new LifecycleProvisioner();
-    provisioner.blockAdds.set(true);
-    TestClusterPool pool =
-        new TestClusterPool(
-            provisioner, ClusterCapacity.fromAvailableMemory(8192), 2, resources -> {});
-    ExecutorService executor = Executors.newFixedThreadPool(2);
-    try {
-      PrivateClusterLease lease = pool.provisionPrivate(oneNodeSpec("private"));
-      Future<TestClusterNode> adding =
-          executor.submit(() -> lease.control().addNode("dc1", "RAC1"));
-      assertTrue(provisioner.addStarted.await(5, TimeUnit.SECONDS));
-      Future<?> closing =
-          executor.submit(
-              () -> {
-                lease.close();
-                return null;
-              });
+    PhysicalTestCluster cluster = provisioner.newCluster(oneNodeSpec(), "dirty", 2);
+    TestClusterNode node = cluster.nodes().get(0);
+    provisioner.failNextStop.set(true);
 
-      Thread.sleep(100);
-      assertFalse("Close must wait for the in-flight control", closing.isDone());
-      provisioner.allowAdd.countDown();
-      adding.get(5, TimeUnit.SECONDS);
-      closing.get(5, TimeUnit.SECONDS);
-      assertThrows(IllegalStateException.class, lease.control()::start);
+    assertThrows(IllegalStateException.class, () -> cluster.stopNode(node));
+    assertTrue(cluster.isDirty());
+    assertThrows(IllegalStateException.class, () -> cluster.startNode(node));
+    assertThrows(IllegalStateException.class, cluster::stop);
 
-      try (ReusableClusterLease replacement = pool.acquireReusable(twoNodeSpec("replacement"))) {
-        assertEquals(2, replacement.cluster().nodes().size());
-      }
-    } finally {
-      provisioner.allowAdd.countDown();
-      executor.shutdownNow();
-      pool.close();
-    }
+    cluster.removePhysical();
+    cluster.removePhysical();
+    assertEquals(1, provisioner.removeCount.get());
   }
 
   @Test
-  public void failedPrivateCloseCanBeRetriedButControlsRemainDisabled() throws Exception {
+  public void successfulAddRollbackLeavesClusterUsable() throws Exception {
     LifecycleProvisioner provisioner = new LifecycleProvisioner();
-    TestClusterPool pool =
-        new TestClusterPool(
-            provisioner, ClusterCapacity.fromAvailableMemory(8192), 2, resources -> {});
-    try {
-      try (ReusableClusterLease ignored = pool.acquireReusable(oneNodeSpec("idle"))) {}
-      PrivateClusterLease lease = pool.provisionPrivate(oneNodeSpec("retry"));
-      provisioner.failNextRemoval.set(true);
-
-      assertThrows(IllegalStateException.class, lease::close);
-      assertThrows(IllegalStateException.class, lease.control()::stop);
-      assertThrows(IllegalStateException.class, () -> lease.control().addNode("dc1", "RAC1"));
-      assertEquals("Rejected control must not retry removal", 1, provisioner.removeCount.get());
-      lease.close();
-
-      assertEquals(2, provisioner.removeCount.get());
-    } finally {
-      pool.close();
-    }
-  }
-
-  @Test
-  public void shutdownOwnsAnEvictionAfterItLeavesTheReuseIndex() throws Exception {
-    LifecycleProvisioner provisioner = new LifecycleProvisioner();
-    provisioner.blockRemovals.set(true);
-    TestClusterPool pool =
-        new TestClusterPool(
-            provisioner, ClusterCapacity.fromAvailableMemory(8192), 1, resources -> {});
-    ExecutorService executor = Executors.newFixedThreadPool(2);
-    try {
-      try (ReusableClusterLease ignored = pool.acquireReusable(oneNodeSpec("first"))) {}
-      Future<ReusableClusterLease> eviction =
-          executor.submit(() -> pool.acquireReusable(oneNodeSpec("second")));
-      assertTrue(provisioner.removalStarted.await(5, TimeUnit.SECONDS));
-
-      Future<?> closing =
-          executor.submit(
-              () -> {
-                pool.close();
-                return null;
-              });
-      Thread.sleep(100);
-      assertFalse("Shutdown must retain and join the evicted cluster", closing.isDone());
-
-      provisioner.allowRemoval.countDown();
-      closing.get(5, TimeUnit.SECONDS);
-      ExecutionException acquisitionFailure =
-          assertThrows(ExecutionException.class, () -> eviction.get(5, TimeUnit.SECONDS));
-      assertTrue(acquisitionFailure.getCause() instanceof IllegalStateException);
-      assertEquals(1, provisioner.removeCount.get());
-    } finally {
-      provisioner.allowRemoval.countDown();
-      executor.shutdownNow();
-      pool.close();
-    }
-  }
-
-  @Test
-  public void failedEvictionWakesAdmissionWaitingForItsRetry() throws Exception {
-    LifecycleProvisioner provisioner = new LifecycleProvisioner();
-    provisioner.blockRemovals.set(true);
-    provisioner.failNextRemoval.set(true);
-    TestClusterPool pool =
-        new TestClusterPool(
-            provisioner, ClusterCapacity.fromAvailableMemory(8192), 1, resources -> {});
-    ExecutorService executor = Executors.newFixedThreadPool(2);
-    try {
-      try (ReusableClusterLease ignored = pool.acquireReusable(oneNodeSpec("first"))) {}
-      Future<ReusableClusterLease> failingEviction =
-          executor.submit(() -> pool.acquireReusable(oneNodeSpec("second")));
-      assertTrue(provisioner.removalStarted.await(5, TimeUnit.SECONDS));
-      Future<ReusableClusterLease> waiting =
-          executor.submit(() -> pool.acquireReusable(oneNodeSpec("third")));
-      Thread.sleep(100);
-      assertFalse(waiting.isDone());
-
-      provisioner.allowRemoval.countDown();
-      assertThrows(ExecutionException.class, () -> failingEviction.get(5, TimeUnit.SECONDS));
-      try (ReusableClusterLease admitted = waiting.get(5, TimeUnit.SECONDS)) {
-        assertEquals(1, admitted.cluster().nodes().size());
-      }
-      assertEquals(2, provisioner.removeCount.get());
-    } finally {
-      provisioner.allowRemoval.countDown();
-      executor.shutdownNow();
-      pool.close();
-    }
-  }
-
-  @Test
-  public void shutdownWaitsForCleanupThatAlreadyStarted() throws Exception {
-    LifecycleProvisioner provisioner = new LifecycleProvisioner();
-    CountDownLatch cleanupStarted = new CountDownLatch(1);
-    CountDownLatch allowCleanup = new CountDownLatch(1);
-    TestClusterPool pool =
-        new TestClusterPool(
-            provisioner,
-            ClusterCapacity.fromAvailableMemory(8192),
-            1,
-            resources -> {
-              cleanupStarted.countDown();
-              allowCleanup.await();
-            });
-    ExecutorService executor = Executors.newFixedThreadPool(2);
-    try {
-      ReusableClusterLease lease = pool.acquireReusable(oneNodeSpec("cleanup"));
-      Future<?> releasing =
-          executor.submit(
-              () -> {
-                lease.close();
-                return null;
-              });
-      assertTrue(cleanupStarted.await(5, TimeUnit.SECONDS));
-      Future<?> closing =
-          executor.submit(
-              () -> {
-                pool.close();
-                return null;
-              });
-
-      Thread.sleep(100);
-      assertFalse(closing.isDone());
-      assertEquals(0, provisioner.removeCount.get());
-      allowCleanup.countDown();
-      releasing.get(5, TimeUnit.SECONDS);
-      closing.get(5, TimeUnit.SECONDS);
-      assertEquals(1, provisioner.removeCount.get());
-    } finally {
-      allowCleanup.countDown();
-      executor.shutdownNow();
-      pool.close();
-    }
-  }
-
-  @Test
-  public void tableDeletionPollingUsesOneBoundedDeadline() throws Exception {
-    DynamoDbClient client = mock(DynamoDbClient.class);
-    when(client.listTables(any(ListTablesRequest.class)))
-        .thenReturn(
-            ListTablesResponse.builder().tableNames("owned_table", "foreign_table").build());
-    when(client.describeTable(
-            any(software.amazon.awssdk.services.dynamodb.model.DescribeTableRequest.class)))
-        .thenReturn(DescribeTableResponse.builder().build());
+    PhysicalTestCluster cluster = provisioner.newCluster(oneNodeSpec(), "add-rollback", 3);
+    provisioner.failAddWithSuccessfulRollback.set(true);
 
     assertThrows(
-        TimeoutException.class,
-        () -> TestResourceScope.cleanupTables(client, "owned_", Duration.ofMillis(20)));
+        CcmProvisioner.CcmNodeProvisioningException.class, () -> cluster.addNode("dc1", "RAC1"));
+    assertFalse(cluster.isDirty());
+    assertEquals(1, cluster.nodes().size());
+
+    TestClusterNode added = cluster.addNode("dc1", "RAC1");
+    assertEquals("node2", added.name());
+    assertEquals(2, cluster.nodes().size());
   }
 
-  private static ClusterSpec oneNodeSpec(String identity) {
+  @Test
+  public void failedAddRollbackRetainsNodeAndMarksClusterDirty() throws Exception {
+    LifecycleProvisioner provisioner = new LifecycleProvisioner();
+    PhysicalTestCluster cluster = provisioner.newCluster(oneNodeSpec(), "add-dirty", 4);
+    provisioner.failAddWithFailedRollback.set(true);
+
+    assertThrows(
+        CcmProvisioner.CcmNodeProvisioningException.class, () -> cluster.addNode("dc1", "RAC1"));
+    assertEquals(2, cluster.nodes().size());
+    assertTrue(cluster.isDirty());
+    assertThrows(IllegalStateException.class, () -> cluster.addNode("dc1", "RAC1"));
+    cluster.removePhysical();
+  }
+
+  @Test
+  public void nodeHandlesUseIdentityAndTheFinalNodeCannotBeRemoved() throws Exception {
+    LifecycleProvisioner provisioner = new LifecycleProvisioner();
+    PhysicalTestCluster one = provisioner.newCluster(oneNodeSpec(), "one", 5);
+    assertThrows(IllegalStateException.class, () -> one.removeNode(one.nodes().get(0)));
+
+    PhysicalTestCluster two = provisioner.newCluster(twoNodeSpec(), "two", 6);
+    TestClusterNode original = two.nodes().get(1);
+    TestClusterNode copy =
+        new TestClusterNode(
+            original.name(), original.address(), original.datacenter(), original.rack());
+    assertThrows(IllegalArgumentException.class, () -> two.removeNode(copy));
+    two.removeNode(original);
+    TestClusterNode replacement = two.addNode("dc1", "RAC1");
+    assertNotSame(original, replacement);
+    assertEquals(original.name(), replacement.name());
+  }
+
+  @Test
+  public void failedPrivateCloseCanBeRetriedAndControlsStayDisabled() throws Exception {
+    LifecycleProvisioner provisioner = new LifecycleProvisioner();
+    TestClusterPool pool = new TestClusterPool(provisioner, 2, resources -> {});
+    PrivateClusterLease lease = pool.provisionPrivate(oneNodeSpec());
+    provisioner.failNextRemove.set(true);
+
+    assertThrows(IllegalStateException.class, lease::close);
+    assertThrows(IllegalStateException.class, lease.control()::start);
+    lease.close();
+    lease.close();
+    assertEquals(2, provisioner.removeCount.get());
+    pool.close();
+  }
+
+  @Test
+  public void processCleanupFailuresQuarantineStartStopAndAddUntilNextJvm() throws Exception {
+    LifecycleProvisioner startProvisioner = new LifecycleProvisioner();
+    PhysicalTestCluster startCluster =
+        startProvisioner.newCluster(oneNodeSpec(), "start-quarantine", 7);
+    startCluster.stop();
+    startProvisioner.failNextStartWithCleanup.set(true);
+    assertThrows(CcmProvisioner.CcmProcessCleanupException.class, startCluster::start);
+    assertSameJvmRemovalRefused(startCluster, startProvisioner);
+
+    LifecycleProvisioner stopProvisioner = new LifecycleProvisioner();
+    PhysicalTestCluster stopCluster =
+        stopProvisioner.newCluster(oneNodeSpec(), "stop-quarantine", 8);
+    stopProvisioner.failNextStopWithCleanup.set(true);
+    assertThrows(CcmProvisioner.CcmProcessCleanupException.class, stopCluster::stop);
+    assertSameJvmRemovalRefused(stopCluster, stopProvisioner);
+
+    LifecycleProvisioner addProvisioner = new LifecycleProvisioner();
+    PhysicalTestCluster addCluster = addProvisioner.newCluster(oneNodeSpec(), "add-quarantine", 9);
+    addProvisioner.failNextAddWithCleanup.set(true);
+    assertThrows(
+        CcmProvisioner.CcmNodeProvisioningException.class, () -> addCluster.addNode("dc1", "RAC1"));
+    assertSameJvmRemovalRefused(addCluster, addProvisioner);
+  }
+
+  @Test
+  public void processCleanupFailureKeepsDurableOwnershipAcrossRepeatedClose() throws Exception {
+    assumeTrue(
+        "Durable CCM ownership requires Linux",
+        System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux"));
+    Path root = Files.createTempDirectory("ccm-next-jvm-quarantine-");
+    CcmRunState state = CcmRunState.open(root, (run, manifest) -> {});
+    LifecycleProvisioner provisioner = new LifecycleProvisioner(state.runDirectory());
+    TestClusterPool pool = new TestClusterPool(provisioner, 1, resources -> {}, state);
+    PrivateClusterLease lease = pool.provisionPrivate(oneNodeSpec());
+    provisioner.failNextRemoveWithCleanup.set(true);
+
+    assertThrows(CcmProvisioner.CcmProcessCleanupException.class, lease::close);
+    Path manifest = onlyEntry(state.runDirectory().resolve("owned"));
+    Path reservation = onlyOwnerEntry(root.resolve("ccm-id-locks"));
+    assertTrue(Files.isRegularFile(manifest));
+    assertTrue(Files.isRegularFile(reservation));
+
+    assertThrows(IllegalStateException.class, lease::close);
+    assertThrows(IllegalStateException.class, pool::close);
+    assertEquals(1, provisioner.removeCount.get());
+    assertTrue(Files.isRegularFile(manifest));
+    assertTrue(Files.isRegularFile(reservation));
+  }
+
+  @Test
+  public void privateAddHonorsTheConfiguredNodeLimit() throws Exception {
+    LifecycleProvisioner provisioner = new LifecycleProvisioner();
+    TestClusterPool pool = new TestClusterPool(provisioner, 1, resources -> {});
+    try (PrivateClusterLease lease = pool.provisionPrivate(oneNodeSpec())) {
+      assertThrows(IllegalStateException.class, () -> lease.control().addNode("dc1", "RAC1"));
+      assertEquals(0, provisioner.addCount.get());
+    }
+    pool.close();
+  }
+
+  @Test
+  public void privateLeaseCloseAndPoolCloseShareOneRemoval() throws Exception {
+    LifecycleProvisioner provisioner = new LifecycleProvisioner();
+    provisioner.blockRemove.set(true);
+    TestClusterPool pool = new TestClusterPool(provisioner, 1, resources -> {});
+    PrivateClusterLease lease = pool.provisionPrivate(oneNodeSpec());
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    try {
+      Future<?> leaseClose = executor.submit(() -> close(lease));
+      assertTrue(provisioner.removeStarted.await(5, TimeUnit.SECONDS));
+      Future<?> poolClose = executor.submit(() -> close(pool));
+      provisioner.allowRemove.countDown();
+      leaseClose.get(5, TimeUnit.SECONDS);
+      poolClose.get(5, TimeUnit.SECONDS);
+      assertEquals(1, provisioner.removeCount.get());
+    } finally {
+      provisioner.allowRemove.countDown();
+      executor.shutdownNow();
+      pool.close();
+    }
+  }
+
+  @Test
+  public void reusableLeaseReleaseDoesNotRacePoolRemoval() throws Exception {
+    LifecycleProvisioner provisioner = new LifecycleProvisioner();
+    provisioner.blockRemove.set(true);
+    TestClusterPool pool = new TestClusterPool(provisioner, 1, resources -> {});
+    ReusableClusterLease lease = pool.acquireReusable(oneNodeSpec());
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try {
+      Future<?> poolClose = executor.submit(() -> close(pool));
+      assertTrue(provisioner.removeStarted.await(5, TimeUnit.SECONDS));
+      lease.close();
+      provisioner.allowRemove.countDown();
+      poolClose.get(5, TimeUnit.SECONDS);
+      assertEquals(1, provisioner.removeCount.get());
+    } finally {
+      provisioner.allowRemove.countDown();
+      executor.shutdownNow();
+      pool.close();
+    }
+  }
+
+  private static Void close(AutoCloseable closeable) throws Exception {
+    closeable.close();
+    return null;
+  }
+
+  private static void assertSameJvmRemovalRefused(
+      PhysicalTestCluster cluster, LifecycleProvisioner provisioner) {
+    assertThrows(IllegalStateException.class, cluster::removePhysical);
+    assertThrows(IllegalStateException.class, cluster::removePhysical);
+    assertEquals(0, provisioner.removeCount.get());
+  }
+
+  private static Path onlyEntry(Path directory) throws Exception {
+    try (java.util.stream.Stream<Path> entries = Files.list(directory)) {
+      List<Path> paths = entries.collect(java.util.stream.Collectors.toList());
+      assertEquals(1, paths.size());
+      return paths.get(0);
+    }
+  }
+
+  private static Path onlyOwnerEntry(Path directory) throws Exception {
+    try (java.util.stream.Stream<Path> entries = Files.list(directory)) {
+      List<Path> paths =
+          entries
+              .filter(path -> path.getFileName().toString().endsWith(".owner"))
+              .collect(java.util.stream.Collectors.toList());
+      assertEquals(1, paths.size());
+      return paths.get(0);
+    }
+  }
+
+  private static ClusterSpec oneNodeSpec() {
     return new ClusterSpec()
         .withTopology(ClusterTopology.singleDatacenter(1))
-        .withTransports(AlternatorTransport.HTTP)
-        .withYamlOverride("cluster_identity", identity);
+        .withTransports(AlternatorTransport.HTTP);
   }
 
-  private static ClusterSpec twoNodeSpec(String identity) {
+  private static ClusterSpec twoNodeSpec() {
     return new ClusterSpec()
         .withTopology(ClusterTopology.singleDatacenter(2))
-        .withTransports(AlternatorTransport.HTTP)
-        .withYamlOverride("cluster_identity", identity);
+        .withTransports(AlternatorTransport.HTTP);
   }
 
   private static final class LifecycleProvisioner extends CcmProvisioner {
     final AtomicInteger startNodeCount = new AtomicInteger();
     final AtomicInteger stopNodeCount = new AtomicInteger();
-    final AtomicInteger decommissionCount = new AtomicInteger();
-    final AtomicInteger deleteNodeCount = new AtomicInteger();
-    final AtomicInteger runningProbeCount = new AtomicInteger();
-    final AtomicInteger decommissionProbeCount = new AtomicInteger();
-    final AtomicInteger readinessWaitCount = new AtomicInteger();
+    final AtomicInteger addCount = new AtomicInteger();
     final AtomicInteger removeCount = new AtomicInteger();
-    final AtomicBoolean failStartAfterEffect = new AtomicBoolean();
-    final AtomicBoolean failDecommissionAfterEffect = new AtomicBoolean();
-    final AtomicBoolean failNextDelete = new AtomicBoolean();
-    final AtomicBoolean nodeReady = new AtomicBoolean(true);
-    final AtomicBoolean failNextRemoval = new AtomicBoolean();
-    final AtomicBoolean blockAdds = new AtomicBoolean();
-    final AtomicBoolean blockRemovals = new AtomicBoolean();
-    final CountDownLatch addStarted = new CountDownLatch(1);
-    final CountDownLatch allowAdd = new CountDownLatch(1);
-    final CountDownLatch removalStarted = new CountDownLatch(1);
-    final CountDownLatch allowRemoval = new CountDownLatch(1);
-    final java.util.Set<TestClusterNode> running =
-        java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
-    final java.util.Set<TestClusterNode> decommissioned =
-        java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    final AtomicBoolean failNextStop = new AtomicBoolean();
+    final AtomicBoolean failAddWithSuccessfulRollback = new AtomicBoolean();
+    final AtomicBoolean failAddWithFailedRollback = new AtomicBoolean();
+    final AtomicBoolean failNextStartWithCleanup = new AtomicBoolean();
+    final AtomicBoolean failNextStopWithCleanup = new AtomicBoolean();
+    final AtomicBoolean failNextAddWithCleanup = new AtomicBoolean();
+    final AtomicBoolean failNextRemove = new AtomicBoolean();
+    final AtomicBoolean failNextRemoveWithCleanup = new AtomicBoolean();
+    final AtomicBoolean blockRemove = new AtomicBoolean();
+    final CountDownLatch removeStarted = new CountDownLatch(1);
+    final CountDownLatch allowRemove = new CountDownLatch(1);
+    final Set<TestClusterNode> running = Collections.newSetFromMap(new IdentityHashMap<>());
 
     LifecycleProvisioner() throws Exception {
-      super(Files.createTempDirectory("lifecycle-provisioner-"));
+      this(Files.createTempDirectory("lifecycle-provisioner-"));
+    }
+
+    LifecycleProvisioner(Path runDirectory) throws Exception {
+      super(runDirectory, "/bin/true");
     }
 
     PhysicalTestCluster newCluster(ClusterSpec spec, String instanceId, int ccmId) {
@@ -402,7 +320,14 @@ public class ClusterLifecycleTest {
         running.add(node);
       }
       return new PhysicalTestCluster(
-          this, instanceId, ccmId, runDirectory().resolve(instanceId), spec, nodes, null, null);
+          this,
+          instanceId,
+          ccmId,
+          runDirectory().resolve("clusters").resolve(instanceId),
+          spec,
+          nodes,
+          null,
+          null);
     }
 
     @Override
@@ -414,37 +339,38 @@ public class ClusterLifecycleTest {
     void startNode(PhysicalTestCluster cluster, TestClusterNode node) {
       startNodeCount.incrementAndGet();
       running.add(node);
-      if (failStartAfterEffect.getAndSet(false)) {
-        throw new IllegalStateException("start failed after taking effect");
-      }
     }
 
     @Override
     void stopNode(PhysicalTestCluster cluster, TestClusterNode node) {
       stopNodeCount.incrementAndGet();
       running.remove(node);
+      if (failNextStop.getAndSet(false)) {
+        throw new IllegalStateException("ambiguous stop");
+      }
     }
 
     @Override
-    void stop(PhysicalTestCluster cluster) {
+    void stop(PhysicalTestCluster cluster) throws CcmProcessCleanupException {
       running.clear();
+      if (failNextStopWithCleanup.getAndSet(false)) {
+        throw new CcmProcessCleanupException("unproven stop cleanup");
+      }
     }
 
     @Override
-    void waitForNodeReady(PhysicalTestCluster cluster, TestClusterNode node) {
-      readinessWaitCount.incrementAndGet();
-      if (!nodeReady.get()) {
-        throw new IllegalStateException("node is alive but not ready");
+    void start(PhysicalTestCluster cluster, List<TestClusterNode> nodes)
+        throws CcmProcessCleanupException {
+      running.addAll(nodes);
+      if (failNextStartWithCleanup.getAndSet(false)) {
+        throw new CcmProcessCleanupException("unproven start cleanup");
       }
     }
 
     @Override
     TestClusterNode addNode(PhysicalTestCluster cluster, String datacenter, String rack)
-        throws Exception {
-      if (blockAdds.get()) {
-        addStarted.countDown();
-        allowAdd.await();
-      }
+        throws CcmNodeProvisioningException {
+      addCount.incrementAndGet();
       int index = 1;
       while (containsName(cluster.nodes(), "node" + index)) {
         index++;
@@ -452,56 +378,50 @@ public class ClusterLifecycleTest {
       TestClusterNode node =
           new TestClusterNode(
               "node" + index, "127.0." + cluster.ccmId() + "." + index, datacenter, rack);
+      if (failAddWithSuccessfulRollback.getAndSet(false)) {
+        throw new CcmNodeProvisioningException(
+            node, false, new IllegalStateException("add failed"), null);
+      }
+      if (failAddWithFailedRollback.getAndSet(false)) {
+        throw new CcmNodeProvisioningException(
+            node,
+            true,
+            new IllegalStateException("add failed"),
+            new IllegalStateException("rollback failed"));
+      }
+      if (failNextAddWithCleanup.getAndSet(false)) {
+        throw new CcmNodeProvisioningException(
+            node,
+            true,
+            new IllegalStateException("add failed"),
+            new CcmProcessCleanupException("unproven add cleanup"));
+      }
       running.add(node);
       return node;
     }
 
     @Override
     void decommissionNode(PhysicalTestCluster cluster, TestClusterNode node) {
-      decommissionCount.incrementAndGet();
       running.remove(node);
-      decommissioned.add(node);
-      if (failDecommissionAfterEffect.getAndSet(false)) {
-        throw new IllegalStateException("decommission failed after taking effect");
-      }
     }
 
     @Override
     void deleteNodeState(PhysicalTestCluster cluster, TestClusterNode node) {
-      deleteNodeCount.incrementAndGet();
-      if (failNextDelete.getAndSet(false)) {
-        throw new IllegalStateException("node deletion failed");
-      }
       running.remove(node);
-      decommissioned.remove(node);
-    }
-
-    @Override
-    boolean isNodeRunning(PhysicalTestCluster cluster, TestClusterNode node) {
-      runningProbeCount.incrementAndGet();
-      return running.contains(node);
-    }
-
-    @Override
-    boolean isNodeDecommissioned(PhysicalTestCluster cluster, TestClusterNode node) {
-      decommissionProbeCount.incrementAndGet();
-      return decommissioned.contains(node);
-    }
-
-    @Override
-    boolean isHealthy(PhysicalTestCluster cluster) {
-      return true;
     }
 
     @Override
     void remove(PhysicalTestCluster cluster) throws Exception {
       removeCount.incrementAndGet();
-      removalStarted.countDown();
-      if (blockRemovals.get()) {
-        allowRemoval.await();
+      removeStarted.countDown();
+      if (blockRemove.get()) {
+        allowRemove.await();
       }
-      if (failNextRemoval.getAndSet(false)) {
+      if (failNextRemove.getAndSet(false)) {
         throw new IllegalStateException("remove failed");
+      }
+      if (failNextRemoveWithCleanup.getAndSet(false)) {
+        throw new CcmProcessCleanupException("unproven remove cleanup");
       }
     }
 

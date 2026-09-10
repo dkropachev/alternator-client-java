@@ -21,6 +21,7 @@ public final class ClusterSpecs {
 
   public static ClusterSpec defaultSpec() {
     return new ClusterSpec()
-        .withScyllaVersion(System.getenv().getOrDefault("SCYLLA_VERSION", "release:2025.2"));
+        .withScyllaVersion(
+            System.getenv().getOrDefault("SCYLLA_VERSION", ClusterSpec.DEFAULT_SCYLLA_VERSION));
   }
 }

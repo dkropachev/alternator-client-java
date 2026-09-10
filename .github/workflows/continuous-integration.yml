@@ -15,7 +15,7 @@ on:
 
 env:
   IS_CICD: 1
-  SCYLLA_VERSION: release:2025.2
+  SCYLLA_VERSION: release:2025.2.5
 
 jobs:
   lint:
@@ -72,14 +72,11 @@ jobs:
           name: unit-test-results-java-${{ matrix.java-version }}
           path: target/surefire-reports/*.xml
 
-      - name: Install pinned scylla-ccm
-        run: make ccm-install
-
       - name: Cache Scylla relocatable package
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.ccm/scylla-repository
-          key: scylla-ccm-relocatable-${{ runner.os }}-${{ runner.arch }}-${{ env.SCYLLA_VERSION }}
+          key: scylla-ccm-relocatable-${{ runner.os }}-${{ runner.arch }}-release-2025.2.5
 
       - name: Run integration tests
         timeout-minutes: 30
@@ -97,5 +94,5 @@ jobs:
         if: always()
         with:
           name: ccm-diagnostics-java-${{ matrix.java-version }}
-          path: target/ccm/ccm-runtime.*/diagnostics/**
+          path: target/ccm/**
           if-no-files-found: ignore

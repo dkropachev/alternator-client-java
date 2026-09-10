@@ -17,6 +17,7 @@ package com.scylladb.alternator.testinfra;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import com.scylladb.alternator.CoversRequirements;
@@ -131,6 +132,44 @@ public class ClusterSpecValidationTest {
   }
 
   @Test
+  public void scyllaAliasesCannotBypassOwnedYamlRoots() {
+    Map.of("datadir", "data_file_directories", "cql_port", "native_transport_port")
+        .forEach(
+            (alias, canonical) -> {
+              IllegalArgumentException failure =
+                  assertThrows(
+                      IllegalArgumentException.class,
+                      () -> new ClusterSpec().withYamlOverride(alias, "false"));
+              assertTrue(
+                  failure.getMessage(), failure.getMessage().contains("'" + canonical + "'"));
+            });
+  }
+
+  @Test
+  public void additionalOwnedYamlRootsCannotBeOverridden() {
+    for (String key :
+        Arrays.asList(
+            "ignore_dead_nodes_for_replace",
+            "join_ring",
+            "load_ring_state",
+            "maintenance_mode",
+            "maintenance_socket",
+            "maintenance_socket_group",
+            "redis_port",
+            "redis_ssl_port",
+            "replace_address",
+            "replace_address_first_boot",
+            "replace_node_first_boot",
+            "role_manager",
+            "server_encryption_options")) {
+      assertThrows(
+          "Accepted behavior owned by a typed cluster option " + printable(key),
+          IllegalArgumentException.class,
+          () -> new ClusterSpec().withYamlOverride(key, "false"));
+    }
+  }
+
+  @Test
   public void rejectsUnsafeOrUnsupportedYamlKeys() {
     for (String key :
         Arrays.asList(
@@ -168,6 +207,23 @@ public class ClusterSpecValidationTest {
 
     assertEquals(
         Map.of("_custom2", "true", "custom_group.child_2", "42"), spec.scyllaYamlOverrides());
+  }
+
+  @Test
+  public void rejectsNestedYamlOverrideBelowScalarRootBeforeProvisioning() {
+    IllegalArgumentException failure =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                new ClusterSpec()
+                    .withYamlOverride("custom_group", "5")
+                    .withYamlOverride("custom_group.child", "42"));
+
+    assertTrue(failure.getMessage(), failure.getMessage().contains("must be a mapping"));
+
+    new ClusterSpec()
+        .withYamlOverride("custom_group", "{existing: true}")
+        .withYamlOverride("custom_group.child", "42");
   }
 
   @Test

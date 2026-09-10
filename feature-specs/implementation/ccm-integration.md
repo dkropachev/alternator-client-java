@@ -1,55 +1,56 @@
 # CCM integration implementation
 
-This document connects the [CCM-integration specification](../ccm-integration.md) to the
-implementation in this repository. It is informative: deviations recorded here do not weaken the
-generic contract.
+This document connects the [CCM-integration specification](../ccm-integration.md) to this
+repository's Java test harness.
 
 ## Public API
 
 [`TestClusters`](../../src/test/java/com/scylladb/alternator/testinfra/TestClusters.java) exposes
 `acquireReusable(ClusterSpec)` and `provisionPrivate(ClusterSpec)`. Both return `AutoCloseable`
-leases for try-with-resources. `ReusableClusterLease` exposes read-only cluster information and a
-resource scope; `PrivateClusterLease` additionally exposes `PrivateClusterControl`.
+leases. `ReusableClusterLease` exposes read-only cluster information and a resource scope;
+`PrivateClusterLease` additionally exposes `PrivateClusterControl`.
 
 [`ClusterSpec`](../../src/test/java/com/scylladb/alternator/testinfra/ClusterSpec.java) provides
 immutable `with...` methods for version, topology, transports, security, per-node resources, and
-YAML overrides. Override keys are canonicalized, topology/address/startup roots owned by typed
-options are rejected, and values are parsed as YAML 1.2 before admission.
-`ClusterSpecs.defaultSpec()` applies the run's `SCYLLA_VERSION`.
+YAML overrides. Override keys are canonicalized and values are parsed as YAML 1.2.
+`ClusterSpecs.defaultSpec()` applies `SCYLLA_VERSION`, defaulting to `release:2025.2.5`.
+
+The operational environment is intentionally small: `SCYLLA_CCM_PATH` selects CCM,
+`SCYLLA_CCM_ROOT` optionally selects the private state root, `SCYLLA_CCM_MAX_NODES` may lower the
+nine-node ceiling, and `SCYLLA_CCM_DIAGNOSTICS_DIR` selects the external artifact directory. The
+default root is shared per user; concurrently running processes must select the same override root
+to coordinate address reservations.
 
 ## Internal architecture
 
-[`TestClusterPool`](../../src/test/java/com/scylladb/alternator/testinfra/TestClusterPool.java)
-owns admission, matching, LRU eviction, lease reference counts, CCM address locks, failed-removal
-ownership, and process-wide shutdown. It delegates physical operations to
-[`CcmProvisioner`](../../src/test/java/com/scylladb/alternator/testinfra/CcmProvisioner.java).
+[`TestClusterPool`](../../src/test/java/com/scylladb/alternator/testinfra/TestClusterPool.java) owns
+one physical-cluster slot, lease reference counts, resource scopes, CCM address reservations,
+normal shutdown, and next-start stale-run recovery. Matching reusable acquisitions share the slot.
+An idle incompatible cluster is removed and replaced; incompatible acquisitions fail immediately
+while leases are active. Operations are serialized directly rather than through an admission
+scheduler, wait queue, memory budget, or LRU cache.
 
-The provisioner translates topology into CCM create/add operations, supplies typed Scylla YAML,
-generates a CA and node certificates with OpenSSL, waits for HTTP and HTTPS readiness, records every
-command, and copies cluster diagnostics before removal.
-
-[`IntegrationTestConfig`](../../src/test/java/com/scylladb/alternator/IntegrationTestConfig.java)
-holds one reusable default lease for the existing integration suite. Existing tests therefore read
-their endpoints, topology labels, and CA from CCM without per-test Docker configuration.
+[`CcmProvisioner`](../../src/test/java/com/scylladb/alternator/testinfra/CcmProvisioner.java)
+translates topology into CCM create/add operations, supplies typed Scylla YAML, generates a CA and
+node certificates with OpenSSL, waits for HTTP and HTTPS readiness, and writes each command to its
+own durable log. A failed or ambiguous mutation dirties the cluster, which prevents further reuse
+or mutation until whole-cluster cleanup.
 
 ## Lifecycle and concurrency
 
-The pool reserves nodes and memory before invoking CCM. A matching concurrent acquisition joins the
-same completion and increments the lease count. An authoritative ownership registry retains pooled
-clusters after they leave the reuse index and until physical removal, capacity release, and address
-lock release all succeed. Resource cleanup has a bounded deadline; failed cleanup poisons the
-cluster.
+The pool creates each run and address reservation under the single configured root and records its
+owner identity and cluster manifest before invoking CCM. Processes using distinct override roots do
+not coordinate address selection. Startup recovery distinguishes a live owner using PID,
+process start ticks, and boot ID; terminates same-user processes carrying that run's marker; copies
+diagnostics; and performs bounded CCM removal. A run and its address reservation are deleted only
+after cleanup succeeds. Malformed or unremovable runs remain quarantined while a new run selects a
+different ID.
 
-Physical mutation methods and removal share a lifecycle state machine. Private controls reserve
-capacity around node addition and release it only after successful rollback or removal. Ambiguous
-start, stop, and decommission results are reconciled against process and server state. File locks
-under the system temporary directory serialize loopback-range allocation across processes.
-
-CCM commands run in isolated process groups. Failure and cancellation terminate descendants before
-rollback, and retained PID state lets node and cluster cleanup reap processes omitted from CCM
-metadata. The Surefire listener calls `TestClusters.closeAll()` after the run. The Makefile stores
-operational state in a private per-user host namespace, validates owner process identity, retries
-cleanup after abnormal termination, and transfers diagnostics to `target/ccm` for CI artifacts.
+[`IntegrationTestConfig`](../../src/test/java/com/scylladb/alternator/IntegrationTestConfig.java)
+holds one reusable default lease for the existing integration suite. The Makefile only validates
+the pinned CCM entry point and invokes two foreground Maven phases with `forkCount=1`; Java owns all
+run lifecycle and recovery behavior. The Surefire listener calls `TestClusters.closeAll()` during
+normal suite shutdown.
 
 ## Requirement mapping
 
@@ -59,32 +60,30 @@ cleanup after abnormal termination, and transfers diagnostics to `target/ccm` fo
 | `CCM-REQ-002` | [`CcmProvisioner`](../../src/test/java/com/scylladb/alternator/testinfra/CcmProvisioner.java) | [`ClusterProvisioningIT#authorizedClusterProvidesWorkingCredentials`](../../src/integration-test/java/com/scylladb/alternator/ClusterProvisioningIT.java) | `conformant` |
 | `CCM-REQ-003` | [`TestClusterPool`](../../src/test/java/com/scylladb/alternator/testinfra/TestClusterPool.java) | [`ClusterProvisioningIT#sameSpecReusesClusterWithIndependentResourceScopes`](../../src/integration-test/java/com/scylladb/alternator/ClusterProvisioningIT.java) | `conformant` |
 | `CCM-REQ-004` | [`PrivateClusterLease`](../../src/test/java/com/scylladb/alternator/testinfra/PrivateClusterLease.java) | [`ClusterProvisioningIT#privateHttpsClusterCanChangeNodeLifecycleAndTopology`](../../src/integration-test/java/com/scylladb/alternator/ClusterProvisioningIT.java) | `conformant` |
-| `CCM-REQ-005` | [`TestClusterPool`](../../src/test/java/com/scylladb/alternator/testinfra/TestClusterPool.java) | [`ClusterInfrastructureTest#capacityReservesMemoryAndEnforcesLimits`](../../src/test/java/com/scylladb/alternator/testinfra/ClusterInfrastructureTest.java) | `conformant` |
-| `CCM-REQ-006` | [`CcmProvisioner`](../../src/test/java/com/scylladb/alternator/testinfra/CcmProvisioner.java) | [`CcmProvisionerRecoveryTest#timedOutCcmCommandReapsItsProcessGroupBeforeRollback`](../../src/test/java/com/scylladb/alternator/testinfra/CcmProvisionerRecoveryTest.java) | `conformant` |
+| `CCM-REQ-005` | [`TestClusterPool`](../../src/test/java/com/scylladb/alternator/testinfra/TestClusterPool.java) | [`ClusterInfrastructureTest#incompatibleActiveRequestsFailFastAndIdleClustersAreReplaced`](../../src/test/java/com/scylladb/alternator/testinfra/ClusterInfrastructureTest.java) | `conformant` |
+| `CCM-REQ-006` | [`CcmRunState`](../../src/test/java/com/scylladb/alternator/testinfra/CcmRunState.java) | [`CcmRunStateTest#hardKilledJvmIsRecoveredByTheNextHarnessStartup`](../../src/test/java/com/scylladb/alternator/testinfra/CcmRunStateTest.java) | `conformant` |
 
 ## Test coverage
 
-- [`ClusterInfrastructureTest`](../../src/test/java/com/scylladb/alternator/testinfra/ClusterInfrastructureTest.java)
-  covers memory calculations, resource naming, failure retention, and cleanup path rejection.
-- [`ClusterSpecValidationTest`](../../src/test/java/com/scylladb/alternator/testinfra/ClusterSpecValidationTest.java)
-  covers the complete security compatibility matrix and canonical YAML override keys.
-- [`ClusterLifecycleTest`](../../src/test/java/com/scylladb/alternator/testinfra/ClusterLifecycleTest.java)
-  covers private-control serialization, node reconciliation, capacity accounting, pooled retirement,
-  and bounded resource cleanup.
-- [`CcmProvisionerRecoveryTest`](../../src/test/java/com/scylladb/alternator/testinfra/CcmProvisionerRecoveryTest.java)
-  covers process-tree termination and cleanup of nodes removed from CCM metadata.
-- [`CcmMakefileTest`](../../src/test/java/com/scylladb/alternator/testinfra/CcmMakefileTest.java)
-  covers Makefile environment propagation, failed-run cleanup, stale-run recovery, diagnostics,
-  and cleanup path rejection.
-- [`ClusterProvisioningIT`](../../src/integration-test/java/com/scylladb/alternator/ClusterProvisioningIT.java)
-  proves real-cluster reuse, independent scopes, enforced authorization, preserved YAML overrides,
-  custom-CA HTTPS, and private node add/start/stop/remove/replacement.
-- The existing integration-test classes all consume the CCM-backed `IntegrationTestConfig`, covering
-  discovery, CRUD, compression, TLS, connection reuse, client implementations, and routing against
-  the default three-node cluster.
-- `DemoApplicationsIT` launches both demo applications in child JVMs against that cluster, preserving
-  their runtime smoke coverage even though the applications terminate their own processes.
+- `ClusterSpecValidationTest` covers security combinations, topology limits, and canonical YAML
+  override keys.
+- `ClusterLifecycleTest` covers matching reuse, fail-fast incompatible requests, private
+  exclusivity, dirty-state handling, idempotent close, and bounded resource cleanup.
+- `ClusterInfrastructureTest` covers state-root validation, address reservations, and bind-based
+  address checks. `CcmRunStateTest` covers owner identity, reservation quarantine, and a subprocess
+  hard-kill followed by real provisioner cleanup, diagnostic preservation, and reprovisioning.
+- `CcmProvisionerRecoveryTest` covers durable command logs, cancellation, rollback, and diagnostic
+  snapshots.
+- `CcmMakefileTest` covers the two foreground test phases, environment propagation, cached CCM
+  validation, concurrent installation locking, and phase-failure propagation.
+- `ClusterProvisioningIT` proves real-cluster reuse, independent resource scopes, enforced
+  authorization, custom-CA HTTPS, YAML overrides, and private node lifecycle operations.
+
+Recovery is deliberately best effort. An uncatchable JVM kill leaves the run in place until the
+next harness startup. If CCM cannot load malformed metadata, the run and address ID stay
+quarantined rather than being guessed at or removed unsafely.
 
 ## Known conformance gaps
 
-No known conformance gaps are currently recorded.
+None currently known. Malformed CCM state that CCM itself cannot remove remains deliberately
+quarantined; this is the specified safe outcome rather than destructive best-effort deletion.

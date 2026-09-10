@@ -17,6 +17,8 @@ package com.scylladb.alternator.testinfra;
 
 import com.scylladb.alternator.AlternatorDynamoDbClientWrapper;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -87,6 +89,7 @@ public final class TestResourceScope {
   static void cleanupTables(DynamoDbClient client, String prefix, Duration timeout)
       throws InterruptedException, TimeoutException {
     long deadline = deadlineAfter(timeout);
+    List<String> ownedTables = new ArrayList<>();
     String startName = null;
     do {
       checkDeadline(deadline);
@@ -94,19 +97,22 @@ public final class TestResourceScope {
           client.listTables(ListTablesRequest.builder().exclusiveStartTableName(startName).build());
       checkDeadline(deadline);
       for (String tableName : response.tableNames()) {
-        if (!tableName.startsWith(prefix)) {
-          continue;
-        }
-        try {
-          checkDeadline(deadline);
-          client.deleteTable(request -> request.tableName(tableName));
-          waitForTableDeletion(client, tableName, deadline);
-        } catch (ResourceNotFoundException ignored) {
-          // The table is already gone.
+        if (tableName.startsWith(prefix)) {
+          ownedTables.add(tableName);
         }
       }
       startName = response.lastEvaluatedTableName();
     } while (startName != null && !startName.isEmpty());
+
+    for (String tableName : ownedTables) {
+      try {
+        checkDeadline(deadline);
+        client.deleteTable(request -> request.tableName(tableName));
+        waitForTableDeletion(client, tableName, deadline);
+      } catch (ResourceNotFoundException ignored) {
+        // The table is already gone.
+      }
+    }
   }
 
   private static void waitForTableDeletion(DynamoDbClient client, String tableName, long deadline)

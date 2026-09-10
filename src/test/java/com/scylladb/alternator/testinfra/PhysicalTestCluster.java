@@ -28,26 +28,18 @@ import java.util.Map;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 
 /** Mutable physical cluster hidden behind read-only or private lease views. */
-final class PhysicalTestCluster implements TestClusterInfo, PrivateClusterControl {
+final class PhysicalTestCluster implements TestClusterInfo {
   private enum LifecycleState {
     OPEN,
-    CLOSING,
+    REMOVING,
     REMOVAL_FAILED,
     CLOSED
   }
 
   private enum NodeState {
     RUNNING,
-    RUNNING_UNVERIFIED,
     STOPPED,
-    DECOMMISSIONED,
-    UNKNOWN
-  }
-
-  private enum AmbiguousOperation {
-    START,
-    STOP,
-    DECOMMISSION
+    DECOMMISSIONED
   }
 
   private final CcmProvisioner provisioner;
@@ -57,11 +49,11 @@ final class PhysicalTestCluster implements TestClusterInfo, PrivateClusterContro
   private final ClusterSpec spec;
   private final List<TestClusterNode> nodes;
   private final Map<TestClusterNode, NodeState> nodeStates = new IdentityHashMap<>();
-  private final Map<TestClusterNode, AmbiguousOperation> ambiguousOperations =
-      new IdentityHashMap<>();
   private final Path caCertificatePath;
   private final AwsCredentialsProvider credentials;
   private LifecycleState lifecycleState = LifecycleState.OPEN;
+  private boolean dirty;
+  private boolean recoveryRequired;
 
   PhysicalTestCluster(
       CcmProvisioner provisioner,
@@ -151,185 +143,188 @@ final class PhysicalTestCluster implements TestClusterInfo, PrivateClusterContro
     return builder;
   }
 
-  @Override
-  public synchronized void start() throws Exception {
-    ensureOpen();
-    boolean requiresStart = false;
-    boolean hasRetainedDecommissionedNode = false;
+  synchronized void start() throws Exception {
+    ensureMutable();
+    List<TestClusterNode> stopped = new ArrayList<>();
     for (TestClusterNode node : nodes) {
-      resolveAmbiguousState(node);
-      if (nodeStates.get(node) == NodeState.DECOMMISSIONED) {
-        hasRetainedDecommissionedNode = true;
-        continue;
-      }
-      if (provisioner.isNodeRunning(this, node)) {
-        try {
-          provisioner.waitForNodeReady(this, node);
-          setNodeState(node, NodeState.RUNNING);
-        } catch (Exception exception) {
-          setNodeState(node, NodeState.RUNNING_UNVERIFIED);
-          throw exception;
-        }
-      } else {
-        setNodeState(node, NodeState.STOPPED);
-        requiresStart = true;
+      if (nodeStates.get(node) == NodeState.STOPPED) {
+        stopped.add(node);
       }
     }
-    if (!requiresStart) {
+    if (stopped.isEmpty()) {
       return;
-    }
-    if (hasRetainedDecommissionedNode) {
-      // A decommissioned node can remain in CCM metadata when deleting its state failed. Using
-      // the cluster-wide start command would resurrect it, so start active nodes individually.
-      for (TestClusterNode node : nodes) {
-        if (nodeStates.get(node) != NodeState.DECOMMISSIONED) {
-          ensureNodeRunning(node);
-        }
-      }
-      return;
-    }
-    for (TestClusterNode node : nodes) {
-      markUnknown(node, AmbiguousOperation.START);
     }
     try {
-      provisioner.start(this);
-      setNonDecommissionedNodes(NodeState.RUNNING);
+      provisioner.start(this, stopped);
+      for (TestClusterNode node : stopped) {
+        nodeStates.put(node, NodeState.RUNNING);
+      }
     } catch (Exception exception) {
-      reconcileAllRunningStates(exception, NodeState.RUNNING_UNVERIFIED);
+      recordAmbiguousFailure(exception);
       throw exception;
     }
   }
 
-  @Override
-  public synchronized void stop() throws Exception {
-    ensureOpen();
-    boolean requiresStop = false;
-    for (TestClusterNode node : nodes) {
-      resolveAmbiguousState(node);
-      if (nodeStates.get(node) == NodeState.DECOMMISSIONED) {
-        continue;
-      }
-      if (provisioner.isNodeRunning(this, node)) {
-        setNodeState(node, NodeState.RUNNING);
-        requiresStop = true;
-      } else {
-        setNodeState(node, NodeState.STOPPED);
-      }
+  synchronized void stop() throws Exception {
+    ensureMutable();
+    boolean running = false;
+    for (NodeState state : nodeStates.values()) {
+      running |= state == NodeState.RUNNING;
     }
-    if (!requiresStop) {
+    if (!running) {
       return;
-    }
-    for (TestClusterNode node : nodes) {
-      if (nodeStates.get(node) != NodeState.DECOMMISSIONED) {
-        markUnknown(node, AmbiguousOperation.STOP);
-      }
     }
     try {
       provisioner.stop(this);
-      setNonDecommissionedNodes(NodeState.STOPPED);
+      for (TestClusterNode node : nodes) {
+        if (nodeStates.get(node) != NodeState.DECOMMISSIONED) {
+          nodeStates.put(node, NodeState.STOPPED);
+        }
+      }
     } catch (Exception exception) {
-      reconcileAllRunningStates(exception, NodeState.RUNNING);
+      recordAmbiguousFailure(exception);
       throw exception;
     }
   }
 
-  @Override
-  public synchronized void startNode(TestClusterNode node) throws Exception {
-    ensureOpen();
-    ensureNodeRunning(getNode(node));
-  }
-
-  @Override
-  public synchronized void stopNode(TestClusterNode node) throws Exception {
-    ensureOpen();
-    TestClusterNode existing = getNode(node);
-    resolveAmbiguousState(existing);
-    NodeState state = nodeStates.get(existing);
+  synchronized void startNode(TestClusterNode requested) throws Exception {
+    ensureMutable();
+    TestClusterNode node = getNode(requested);
+    NodeState state = nodeStates.get(node);
     if (state == NodeState.DECOMMISSIONED) {
-      throw new IllegalStateException("Cannot stop decommissioned node " + existing.name());
+      throw new IllegalStateException("Cannot start decommissioned node " + node.name());
     }
-    if (!provisioner.isNodeRunning(this, existing)) {
-      setNodeState(existing, NodeState.STOPPED);
+    if (state == NodeState.RUNNING) {
       return;
     }
-    setNodeState(existing, NodeState.RUNNING);
-    markUnknown(existing, AmbiguousOperation.STOP);
     try {
-      provisioner.stopNode(this, existing);
-      setNodeState(existing, NodeState.STOPPED);
+      provisioner.startNode(this, node);
+      nodeStates.put(node, NodeState.RUNNING);
     } catch (Exception exception) {
-      reconcileRunningState(existing, exception, NodeState.RUNNING);
+      recordAmbiguousFailure(exception);
       throw exception;
     }
   }
 
-  @Override
-  public synchronized TestClusterNode addNode(String datacenter, String rack) throws Exception {
-    ensureOpen();
+  synchronized void stopNode(TestClusterNode requested) throws Exception {
+    ensureMutable();
+    TestClusterNode node = getNode(requested);
+    NodeState state = nodeStates.get(node);
+    if (state == NodeState.DECOMMISSIONED) {
+      throw new IllegalStateException("Cannot stop decommissioned node " + node.name());
+    }
+    if (state == NodeState.STOPPED) {
+      return;
+    }
+    try {
+      provisioner.stopNode(this, node);
+      nodeStates.put(node, NodeState.STOPPED);
+    } catch (Exception exception) {
+      recordAmbiguousFailure(exception);
+      throw exception;
+    }
+  }
+
+  synchronized TestClusterNode addNode(String datacenter, String rack) throws Exception {
+    ensureMutable();
     try {
       TestClusterNode node = provisioner.addNode(this, datacenter, rack);
       nodes.add(node);
-      setNodeState(node, NodeState.RUNNING);
+      nodeStates.put(node, NodeState.RUNNING);
       return node;
     } catch (CcmProvisioner.CcmNodeProvisioningException exception) {
+      if (CcmProvisioner.requiresNextRunRecovery(exception)) {
+        recoveryRequired = true;
+        dirty = true;
+      }
       if (exception.nodeRemainsProvisioned()) {
         TestClusterNode node = exception.node();
         nodes.add(node);
-        markUnknown(node, AmbiguousOperation.START);
-        reconcileRunningState(node, exception, NodeState.RUNNING_UNVERIFIED);
+        nodeStates.put(node, NodeState.STOPPED);
+        dirty = true;
       }
+      throw exception;
+    } catch (Exception exception) {
+      recordAmbiguousFailure(exception);
       throw exception;
     }
   }
 
   synchronized TestClusterNode addNode(TestClusterPool pool, String datacenter, String rack)
       throws Exception {
-    ensureOpen();
+    ensureMutable();
     pool.reserveAdditionalPrivateNode(this);
-    try {
-      return addNode(datacenter, rack);
-    } catch (CcmProvisioner.CcmNodeProvisioningException exception) {
-      if (!exception.nodeRemainsProvisioned()) {
-        pool.releaseAdditionalPrivateNode(this);
-      }
-      throw exception;
-    } catch (Exception exception) {
-      pool.releaseAdditionalPrivateNode(this);
-      throw exception;
-    }
+    return addNode(datacenter, rack);
   }
 
-  @Override
-  public synchronized void removeNode(TestClusterNode node) throws Exception {
-    ensureOpen();
-    TestClusterNode existing = getNode(node);
-    for (TestClusterNode current : nodes) {
-      resolveAmbiguousState(current);
-    }
-    if (nodeStates.get(existing) != NodeState.DECOMMISSIONED && nonDecommissionedNodeCount() == 1) {
+  synchronized void removeNode(TestClusterNode requested) throws Exception {
+    ensureMutable();
+    TestClusterNode node = getNode(requested);
+    if (nodeStates.get(node) != NodeState.DECOMMISSIONED && activeNodeCount() == 1) {
       throw new IllegalStateException("Cannot remove the final node from a cluster");
     }
-    if (nodeStates.get(existing) != NodeState.DECOMMISSIONED) {
-      ensureNodeProcessRunning(existing);
-      markUnknown(existing, AmbiguousOperation.DECOMMISSION);
-      try {
-        provisioner.decommissionNode(this, existing);
-        setNodeState(existing, NodeState.DECOMMISSIONED);
-      } catch (Exception exception) {
-        if (!reconcileDecommissionState(existing, exception)) {
-          throw exception;
-        }
+    try {
+      if (nodeStates.get(node) == NodeState.STOPPED) {
+        provisioner.startNode(this, node);
+        nodeStates.put(node, NodeState.RUNNING);
       }
+      if (nodeStates.get(node) != NodeState.DECOMMISSIONED) {
+        provisioner.decommissionNode(this, node);
+        nodeStates.put(node, NodeState.DECOMMISSIONED);
+      }
+      provisioner.deleteNodeState(this, node);
+      nodes.remove(node);
+      nodeStates.remove(node);
+    } catch (Exception exception) {
+      recordAmbiguousFailure(exception);
+      throw exception;
     }
-    provisioner.deleteNodeState(this, existing);
-    nodes.remove(existing);
-    nodeStates.remove(existing);
-    ambiguousOperations.remove(existing);
   }
 
   synchronized void removeNode(TestClusterPool pool, TestClusterNode node) throws Exception {
     removeNode(node);
     pool.releaseAdditionalPrivateNode(this);
+  }
+
+  synchronized void markDirty() {
+    dirty = true;
+  }
+
+  synchronized void markRecoveryRequired() {
+    dirty = true;
+    recoveryRequired = true;
+  }
+
+  synchronized boolean isDirty() {
+    return dirty;
+  }
+
+  /** Whole-cluster removal is the sole operation allowed after an ambiguous command failure. */
+  synchronized void removePhysical() throws Exception {
+    if (lifecycleState == LifecycleState.CLOSED) {
+      return;
+    }
+    if (recoveryRequired) {
+      throw new IllegalStateException(
+          "Cluster '" + instanceId + "' must be recovered by the next test JVM");
+    }
+    if (lifecycleState == LifecycleState.REMOVING) {
+      throw new IllegalStateException("Cluster removal is already in progress");
+    }
+    lifecycleState = LifecycleState.REMOVING;
+    try {
+      provisioner.remove(this);
+      lifecycleState = LifecycleState.CLOSED;
+    } catch (Exception exception) {
+      lifecycleState = LifecycleState.REMOVAL_FAILED;
+      recordAmbiguousFailure(exception);
+      throw exception;
+    }
+  }
+
+  private void recordAmbiguousFailure(Throwable failure) {
+    dirty = true;
+    recoveryRequired |= CcmProvisioner.requiresNextRunRecovery(failure);
   }
 
   private TestClusterNode getNode(TestClusterNode requested) {
@@ -341,159 +336,24 @@ final class PhysicalTestCluster implements TestClusterInfo, PrivateClusterContro
     throw new IllegalArgumentException("Node is not part of cluster: " + requested.name());
   }
 
-  /** Serializes whole-cluster removal with every private control operation. */
-  synchronized void removePhysical() throws Exception {
-    if (lifecycleState == LifecycleState.CLOSED) {
-      return;
-    }
-    if (lifecycleState == LifecycleState.CLOSING) {
-      throw new IllegalStateException("Cluster removal is already in progress");
-    }
-    lifecycleState = LifecycleState.CLOSING;
-    try {
-      provisioner.remove(this);
-      lifecycleState = LifecycleState.CLOSED;
-    } catch (Exception exception) {
-      lifecycleState = LifecycleState.REMOVAL_FAILED;
-      throw exception;
-    }
-  }
-
-  private void ensureOpen() {
-    if (lifecycleState != LifecycleState.OPEN) {
-      throw new IllegalStateException(
-          "Cluster '" + instanceId + "' is closing or has already been removed");
-    }
-  }
-
-  private void markUnknown(TestClusterNode node, AmbiguousOperation operation) {
-    nodeStates.put(node, NodeState.UNKNOWN);
-    ambiguousOperations.put(node, operation);
-  }
-
-  private void setNodeState(TestClusterNode node, NodeState state) {
-    nodeStates.put(node, state);
-    ambiguousOperations.remove(node);
-  }
-
-  private void setNonDecommissionedNodes(NodeState state) {
-    for (TestClusterNode node : nodes) {
-      if (nodeStates.get(node) != NodeState.DECOMMISSIONED) {
-        setNodeState(node, state);
-      }
-    }
-  }
-
-  private int nonDecommissionedNodeCount() {
+  private int activeNodeCount() {
     int count = 0;
-    for (TestClusterNode node : nodes) {
-      if (nodeStates.get(node) != NodeState.DECOMMISSIONED) {
+    for (NodeState state : nodeStates.values()) {
+      if (state != NodeState.DECOMMISSIONED) {
         count++;
       }
     }
     return count;
   }
 
-  private void reconcileAllRunningStates(Exception failure, NodeState runningState) {
-    for (TestClusterNode node : nodes) {
-      if (nodeStates.get(node) == NodeState.UNKNOWN) {
-        reconcileRunningState(node, failure, runningState);
-      }
+  private void ensureMutable() {
+    if (lifecycleState != LifecycleState.OPEN) {
+      throw new IllegalStateException(
+          "Cluster '" + instanceId + "' is closing or has already been removed");
     }
-  }
-
-  private void reconcileRunningState(
-      TestClusterNode node, Exception failure, NodeState runningState) {
-    try {
-      setNodeState(node, provisioner.isNodeRunning(this, node) ? runningState : NodeState.STOPPED);
-    } catch (Exception probeFailure) {
-      failure.addSuppressed(probeFailure);
-    }
-  }
-
-  private boolean reconcileDecommissionState(TestClusterNode node, Exception failure) {
-    try {
-      if (provisioner.isNodeDecommissioned(this, node)) {
-        setNodeState(node, NodeState.DECOMMISSIONED);
-        return true;
-      }
-      reconcileRunningState(node, failure, NodeState.RUNNING);
-      return false;
-    } catch (Exception probeFailure) {
-      failure.addSuppressed(probeFailure);
-      return false;
-    }
-  }
-
-  private void resolveAmbiguousState(TestClusterNode node) throws Exception {
-    if (nodeStates.get(node) != NodeState.UNKNOWN) {
-      return;
-    }
-    AmbiguousOperation operation = ambiguousOperations.get(node);
-    if (operation == AmbiguousOperation.DECOMMISSION) {
-      if (provisioner.isNodeDecommissioned(this, node)) {
-        setNodeState(node, NodeState.DECOMMISSIONED);
-      } else {
-        setNodeState(
-            node, provisioner.isNodeRunning(this, node) ? NodeState.RUNNING : NodeState.STOPPED);
-      }
-    } else {
-      setNodeState(
-          node,
-          provisioner.isNodeRunning(this, node)
-              ? operation == AmbiguousOperation.START
-                  ? NodeState.RUNNING_UNVERIFIED
-                  : NodeState.RUNNING
-              : NodeState.STOPPED);
-    }
-  }
-
-  private void ensureNodeRunning(TestClusterNode node) throws Exception {
-    resolveAmbiguousState(node);
-    NodeState state = nodeStates.get(node);
-    if (state == NodeState.DECOMMISSIONED) {
-      throw new IllegalStateException("Cannot start decommissioned node " + node.name());
-    }
-    if (provisioner.isNodeRunning(this, node)) {
-      try {
-        provisioner.waitForNodeReady(this, node);
-        setNodeState(node, NodeState.RUNNING);
-        return;
-      } catch (Exception exception) {
-        setNodeState(node, NodeState.RUNNING_UNVERIFIED);
-        throw exception;
-      }
-    }
-    setNodeState(node, NodeState.STOPPED);
-    markUnknown(node, AmbiguousOperation.START);
-    try {
-      provisioner.startNode(this, node);
-      setNodeState(node, NodeState.RUNNING);
-    } catch (Exception exception) {
-      reconcileRunningState(node, exception, NodeState.RUNNING_UNVERIFIED);
-      throw exception;
-    }
-  }
-
-  private void ensureNodeProcessRunning(TestClusterNode node) throws Exception {
-    resolveAmbiguousState(node);
-    if (nodeStates.get(node) == NodeState.DECOMMISSIONED) {
-      throw new IllegalStateException("Cannot start decommissioned node " + node.name());
-    }
-    if (provisioner.isNodeRunning(this, node)) {
-      setNodeState(node, NodeState.RUNNING);
-      return;
-    }
-    setNodeState(node, NodeState.STOPPED);
-    markUnknown(node, AmbiguousOperation.START);
-    try {
-      provisioner.startNode(this, node);
-      setNodeState(node, NodeState.RUNNING);
-    } catch (Exception exception) {
-      reconcileRunningState(node, exception, NodeState.RUNNING);
-      if (nodeStates.get(node) != NodeState.RUNNING) {
-        throw exception;
-      }
+    if (dirty) {
+      throw new IllegalStateException(
+          "Cluster '" + instanceId + "' has ambiguous state and must be removed");
     }
   }
 }

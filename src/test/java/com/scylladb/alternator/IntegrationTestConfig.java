@@ -35,11 +35,11 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
  *
  * <ul>
  *   <li>{@code INTEGRATION_TESTS} - Set to "true" to enable integration tests
- *   <li>{@code SCYLLA_VERSION} - CCM Scylla package selector (default: release:2025.2)
+ *   <li>{@code SCYLLA_VERSION} - CCM Scylla package selector (default: release:2025.2.5)
  *   <li>{@code SCYLLA_CCM_PATH} - CCM executable selected by the Makefile
- *   <li>{@code SCYLLA_CCM_RUN_DIR} - Durable per-run operational cluster directory
- *   <li>{@code SCYLLA_CCM_DIAGNOSTICS_DIR} - Diagnostic artifact directory
- *   <li>{@code SCYLLA_CCM_ID_LOCK_ROOT} - Host-wide loopback-range lock directory
+ *   <li>{@code SCYLLA_CCM_ROOT} - Optional private root for runs and address reservations
+ *   <li>{@code SCYLLA_CCM_DIAGNOSTICS_DIR} - External diagnostic artifact directory
+ *   <li>{@code SCYLLA_CCM_MAX_NODES} - Optional lower override for the nine-node ceiling
  * </ul>
  */
 public final class IntegrationTestConfig {

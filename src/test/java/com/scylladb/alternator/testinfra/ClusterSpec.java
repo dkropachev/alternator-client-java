@@ -28,8 +28,13 @@ import org.snakeyaml.engine.v2.schema.CoreSchema;
 
 /** Immutable, typed description of a CCM-provisioned Scylla cluster. */
 public final class ClusterSpec {
+  public static final int MAXIMUM_NODE_COUNT = 9;
+  public static final String DEFAULT_SCYLLA_VERSION = "release:2025.2.5";
+
   private static final Pattern YAML_KEY_PATTERN =
       Pattern.compile("[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)?");
+  private static final Map<String, String> SCYLLA_YAML_KEY_ALIASES =
+      Map.of("cql_port", "native_transport_port", "datadir", "data_file_directories");
   private static final Set<String> RESERVED_YAML_KEYS =
       Set.of(
           "alternator_address",
@@ -53,11 +58,17 @@ public final class ClusterSpec {
           "developer_mode",
           "endpoint_snitch",
           "hints_directory",
+          "ignore_dead_nodes_for_replace",
           "initial_token",
+          "join_ring",
           "listen_address",
           "listen_interface",
           "listen_interface_prefer_ipv6",
           "listen_on_broadcast_address",
+          "load_ring_state",
+          "maintenance_mode",
+          "maintenance_socket",
+          "maintenance_socket_group",
           "memory",
           "native_shard_aware_transport_port",
           "native_shard_aware_transport_port_proxy_protocol",
@@ -69,6 +80,12 @@ public final class ClusterSpec {
           "partitioner",
           "prometheus_address",
           "prometheus_port",
+          "redis_port",
+          "redis_ssl_port",
+          "replace_address",
+          "replace_address_first_boot",
+          "replace_node_first_boot",
+          "role_manager",
           "rpc_address",
           "rpc_interface",
           "rpc_interface_prefer_ipv6",
@@ -77,6 +94,7 @@ public final class ClusterSpec {
           "schema_commitlog_directory",
           "seeds",
           "seed_provider",
+          "server_encryption_options",
           "smp",
           "ssl_storage_port",
           "start_native_transport",
@@ -95,7 +113,7 @@ public final class ClusterSpec {
 
   public ClusterSpec() {
     this(
-        "release:2025.2",
+        DEFAULT_SCYLLA_VERSION,
         ClusterTopology.singleDatacenter(3),
         EnumSet.allOf(AlternatorTransport.class),
         ClusterSecuritySpec.DISABLED,
@@ -218,21 +236,33 @@ public final class ClusterSpec {
     if (transports.isEmpty()) {
       throw new IllegalArgumentException("At least one Alternator transport is required");
     }
-    if (topology.nodeCount() > ClusterCapacity.MAXIMUM_NODE_COUNT) {
+    if (topology.nodeCount() > MAXIMUM_NODE_COUNT) {
       throw new IllegalArgumentException(
-          "A cluster cannot exceed " + ClusterCapacity.MAXIMUM_NODE_COUNT + " nodes");
+          "A cluster cannot exceed " + MAXIMUM_NODE_COUNT + " nodes");
     }
     security.validate();
+    Map<String, Object> parsedOverrides = new TreeMap<>();
     for (Map.Entry<String, String> option : scyllaYamlOverrides.entrySet()) {
       String value = option.getValue();
       if (value == null || stripUnicodeWhitespace(value).isEmpty()) {
         throw new IllegalArgumentException("Scylla YAML override keys and values cannot be empty");
       }
       try {
-        parseYamlValue(value);
+        parsedOverrides.put(option.getKey(), parseYamlValue(value));
       } catch (RuntimeException exception) {
         throw new IllegalArgumentException(
             "Scylla YAML override '" + option.getKey() + "' has an invalid YAML value", exception);
+      }
+    }
+    for (String key : parsedOverrides.keySet()) {
+      int separator = key.indexOf('.');
+      if (separator < 0) {
+        continue;
+      }
+      String root = key.substring(0, separator);
+      if (parsedOverrides.containsKey(root) && !(parsedOverrides.get(root) instanceof Map)) {
+        throw new IllegalArgumentException(
+            "Scylla YAML override '" + root + "' must be a mapping when overriding '" + key + "'");
       }
     }
   }
@@ -266,11 +296,12 @@ public final class ClusterSpec {
 
     int separator = canonical.indexOf('.');
     String rootKey = separator < 0 ? canonical : canonical.substring(0, separator);
+    rootKey = SCYLLA_YAML_KEY_ALIASES.getOrDefault(rootKey, rootKey);
     if (RESERVED_YAML_KEYS.contains(rootKey)) {
       throw new IllegalArgumentException(
           "Scylla YAML key '" + rootKey + "' is owned by a typed cluster option");
     }
-    return canonical;
+    return separator < 0 ? rootKey : rootKey + canonical.substring(separator);
   }
 
   private static String stripUnicodeWhitespace(String value) {

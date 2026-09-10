@@ -16,29 +16,34 @@
 package com.scylladb.alternator.testinfra;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
+import java.nio.channels.Channels;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.HostnameVerifier;
@@ -56,10 +61,12 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 
 /** Executes CCM commands and turns typed specifications into physical Scylla clusters. */
 class CcmProvisioner {
+  static final String PINNED_CCM_COMMIT = "d15a2fab9d22fffad8a30c806a7c8e1632e58aae";
   static final int HTTP_PORT = 8080;
   static final int HTTPS_PORT = 8043;
   static final int STORAGE_PORT = 7000;
   static final int API_PORT = 10000;
+  static final int JMX_PORT = 7199;
 
   private static final String GOSSIPING_PROPERTY_FILE_SNITCH =
       "org.apache.cassandra.locator.GossipingPropertyFileSnitch";
@@ -70,7 +77,6 @@ class CcmProvisioner {
   private static final Duration COMMAND_TIMEOUT = Duration.ofMinutes(10);
   private static final Duration PROCESS_TERMINATION_GRACE = Duration.ofSeconds(2);
   private static final Duration PROCESS_KILL_TIMEOUT = Duration.ofSeconds(5);
-  private static final int REFERENCE_SANITIZE_ATTEMPTS = 5;
   private static final Set<String> CCM_IMPLICIT_NODE_KEYS =
       Set.of(
           "hinted_handoff_enabled",
@@ -83,15 +89,14 @@ class CcmProvisioner {
   private final Path clustersDirectory;
   private final Path diagnosticsDirectory;
   private final Duration commandTimeout;
-  private final Map<Path, List<RetainedCommandGroup>> retainedCommandGroups = new HashMap<>();
-  private final Map<Path, List<OwnedNodeState>> retainedNodeStates = new HashMap<>();
 
   CcmProvisioner(Path runDirectory) throws IOException {
     this(
         runDirectory,
-        configuredDiagnosticsDirectory(runDirectory),
+        configuredDiagnosticsDirectory(),
         System.getenv().getOrDefault("SCYLLA_CCM_PATH", "ccm"),
-        COMMAND_TIMEOUT);
+        COMMAND_TIMEOUT,
+        true);
   }
 
   CcmProvisioner(Path runDirectory, String ccmExecutable) throws IOException {
@@ -104,7 +109,29 @@ class CcmProvisioner {
   }
 
   CcmProvisioner(
+      Path runDirectory,
+      String ccmExecutable,
+      Duration commandTimeout,
+      Duration normalNodeTerminationGrace)
+      throws IOException {
+    this(runDirectory, runDirectory.resolve("diagnostics"), ccmExecutable, commandTimeout);
+    if (normalNodeTerminationGrace.isNegative() || normalNodeTerminationGrace.isZero()) {
+      throw new IllegalArgumentException("normalNodeTerminationGrace must be positive");
+    }
+  }
+
+  CcmProvisioner(
       Path runDirectory, Path diagnosticsDirectory, String ccmExecutable, Duration commandTimeout)
+      throws IOException {
+    this(runDirectory, diagnosticsDirectory, ccmExecutable, commandTimeout, false);
+  }
+
+  private CcmProvisioner(
+      Path runDirectory,
+      Path diagnosticsDirectory,
+      String ccmExecutable,
+      Duration commandTimeout,
+      boolean operational)
       throws IOException {
     Path requestedRunDirectory = runDirectory.toAbsolutePath().normalize();
     Files.createDirectories(requestedRunDirectory);
@@ -121,20 +148,102 @@ class CcmProvisioner {
     }
     validateOwnedDirectory(this.runDirectory, clustersDirectory, "clusters");
     this.ccmExecutable = ccmExecutable;
+    if (commandTimeout.isNegative() || commandTimeout.isZero()) {
+      throw new IllegalArgumentException("commandTimeout must be positive");
+    }
     this.commandTimeout = commandTimeout;
-    this.diagnosticsDirectory = diagnosticsDirectory;
-    Files.createDirectories(diagnosticsDirectory);
+    this.diagnosticsDirectory = diagnosticsDirectory.toAbsolutePath().normalize();
+    if (operational) {
+      validateOperationalDirectories(this.runDirectory, this.diagnosticsDirectory);
+    }
+    Files.createDirectories(this.diagnosticsDirectory);
+    if (Files.isSymbolicLink(this.diagnosticsDirectory)
+        || !Files.isDirectory(this.diagnosticsDirectory, LinkOption.NOFOLLOW_LINKS)
+        || !this.diagnosticsDirectory.equals(this.diagnosticsDirectory.toRealPath())) {
+      throw new IOException("Refusing unsafe CCM diagnostics directory " + diagnosticsDirectory);
+    }
   }
 
-  private static Path configuredDiagnosticsDirectory(Path runDirectory) {
+  private static Path configuredDiagnosticsDirectory() {
     String configured = System.getenv("SCYLLA_CCM_DIAGNOSTICS_DIR");
     return configured == null || configured.trim().isEmpty()
-        ? runDirectory.resolve("diagnostics")
+        ? Path.of("target", "ccm").toAbsolutePath()
         : Path.of(configured);
+  }
+
+  static void validateOperationalDirectories(Path runDirectory, Path diagnosticsDirectory)
+      throws IOException {
+    Path normalizedRun = runDirectory.toAbsolutePath().normalize();
+    Path runsDirectory = normalizedRun.getParent();
+    Path stateRoot = runsDirectory == null ? null : runsDirectory.getParent();
+    if (runsDirectory == null
+        || stateRoot == null
+        || runsDirectory.getFileName() == null
+        || !"runs".equals(runsDirectory.getFileName().toString())) {
+      throw new IOException(
+          "Operational CCM run directory is not beneath a state-root runs directory");
+    }
+    Path normalizedDiagnostics = diagnosticsDirectory.toAbsolutePath().normalize();
+    if (normalizedDiagnostics.startsWith(stateRoot)
+        || stateRoot.startsWith(normalizedDiagnostics)) {
+      throw new IOException(
+          "CCM diagnostics directory must not overlap the harness state root " + stateRoot);
+    }
   }
 
   Path runDirectory() {
     return runDirectory;
+  }
+
+  boolean requiresJmxPortReservation(ClusterSpec spec) {
+    return !ClusterSpec.DEFAULT_SCYLLA_VERSION.equals(spec.scyllaVersion())
+        || !isRepositoryPinnedCcm(ccmExecutable, projectDirectory());
+  }
+
+  static boolean isRepositoryPinnedCcm(String executable, Path projectDirectory) {
+    try {
+      Path expectedEnvironment =
+          projectDirectory
+              .toAbsolutePath()
+              .normalize()
+              .resolve("bin/scylla-ccm-" + PINNED_CCM_COMMIT);
+      Path expectedExecutable = expectedEnvironment.resolve("bin/ccm");
+      Path marker = expectedEnvironment.resolve(".install-complete");
+      Path candidate = Path.of(executable).toAbsolutePath().normalize();
+      return Files.isRegularFile(candidate, LinkOption.NOFOLLOW_LINKS)
+          && Files.isExecutable(candidate)
+          && Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS)
+          && !Files.isSymbolicLink(marker)
+          && expectedExecutable.toRealPath().equals(candidate.toRealPath())
+          && PINNED_CCM_COMMIT.equals(Files.readString(marker, StandardCharsets.US_ASCII).trim());
+    } catch (IOException | RuntimeException unavailable) {
+      return false;
+    }
+  }
+
+  private static Path projectDirectory() {
+    return Path.of(System.getProperty("basedir", System.getProperty("user.dir")));
+  }
+
+  static boolean requiresNextRunRecovery(Throwable failure) {
+    Set<Throwable> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+    return requiresNextRunRecovery(failure, visited);
+  }
+
+  private static boolean requiresNextRunRecovery(Throwable failure, Set<Throwable> visited) {
+    if (failure == null || !visited.add(failure)) {
+      return false;
+    }
+    if (failure instanceof CcmProcessCleanupException
+        || requiresNextRunRecovery(failure.getCause(), visited)) {
+      return true;
+    }
+    for (Throwable suppressed : failure.getSuppressed()) {
+      if (requiresNextRunRecovery(suppressed, visited)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   PhysicalTestCluster provision(ClusterSpec spec, String instanceId, int ccmId) throws Exception {
@@ -195,23 +304,18 @@ class CcmProvisioner {
     } catch (Exception provisioningException) {
       boolean restoreInterrupt = clearInterrupt(provisioningException);
       try {
-        collectDiagnosticsBestEffort(instanceId, ccmDirectory);
-        if (provisioningException instanceof CcmProcessCleanupException) {
-          throw clusterProvisioningException(
-              spec,
-              instanceId,
-              ccmId,
-              ccmDirectory,
-              nodes,
-              caCertificatePath,
-              credentials,
-              provisioningException,
-              new IOException("CCM child processes remain owned by the failed cluster"));
-        }
-        boolean clusterStateExists;
+        Exception diagnosticFailure = null;
         try {
-          clusterStateExists = clusterStateExists(instanceId, ccmDirectory);
-        } catch (Exception stateException) {
+          collectDiagnostics(instanceId, ccmDirectory);
+        } catch (Exception exception) {
+          diagnosticFailure = exception;
+        }
+        if (provisioningException instanceof CcmProcessCleanupException) {
+          IOException retainedState =
+              new IOException("CCM command processes remain owned by the failed cluster");
+          if (diagnosticFailure != null) {
+            retainedState.addSuppressed(diagnosticFailure);
+          }
           throw clusterProvisioningException(
               spec,
               instanceId,
@@ -221,24 +325,19 @@ class CcmProvisioner {
               caCertificatePath,
               credentials,
               provisioningException,
-              stateException);
+              retainedState);
         }
-        if (!clusterStateExists) {
-          try {
-            reapAndCleanupAbsentClusterState(instanceId, ccmDirectory);
-          } catch (Exception cleanupException) {
-            throw clusterProvisioningException(
-                spec,
-                instanceId,
-                ccmId,
-                ccmDirectory,
-                nodes,
-                caCertificatePath,
-                credentials,
-                provisioningException,
-                cleanupException);
-          }
-          throw provisioningException;
+        if (diagnosticFailure != null) {
+          throw clusterProvisioningException(
+              spec,
+              instanceId,
+              ccmId,
+              ccmDirectory,
+              nodes,
+              caCertificatePath,
+              credentials,
+              provisioningException,
+              diagnosticFailure);
         }
         try {
           removeByName(instanceId, ccmDirectory);
@@ -264,61 +363,51 @@ class CcmProvisioner {
   }
 
   void start(PhysicalTestCluster cluster) throws Exception {
-    for (TestClusterNode node : cluster.nodes()) {
-      if (prepareNodeForStart(cluster, node)) {
+    start(cluster, cluster.nodes());
+  }
+
+  void start(PhysicalTestCluster cluster, List<TestClusterNode> nodes) throws Exception {
+    for (TestClusterNode node : nodes) {
+      if (!isNodeRunning(cluster, node)) {
         runCcm(cluster.ccmDirectory(), startArguments(cluster, node.name()));
       }
     }
-    waitForAlternator(cluster, cluster.nodes(), READINESS_TIMEOUT);
+    waitForAlternator(cluster, nodes, READINESS_TIMEOUT);
   }
 
   void stop(PhysicalTestCluster cluster) throws Exception {
-    reapRetainedCommandGroups(cluster.ccmDirectory());
-    Path clusterDirectory = requireCurrentClusterDirectory(cluster.ccmDirectory());
-    for (TestClusterNode node : cluster.nodes()) {
-      sanitizeAndReapNode(ownedChild(clusterDirectory, node.name()));
+    Path clusterDirectory = currentClusterDirectory(cluster.ccmDirectory());
+    if (clusterDirectory == null) {
+      throw new IOException("CCM has no current cluster under " + cluster.ccmDirectory());
     }
+    prepareClusterProcessReferencesForCcm(clusterDirectory);
     runCcm(
         cluster.ccmDirectory(), List.of("stop", "--config-dir", cluster.ccmDirectory().toString()));
   }
 
   void startNode(PhysicalTestCluster cluster, TestClusterNode node) throws Exception {
-    if (prepareNodeForStart(cluster, node)) {
+    if (!isNodeRunning(cluster, node)) {
       runCcm(cluster.ccmDirectory(), startArguments(cluster, node.name()));
     }
     waitForNodeReady(cluster, node);
   }
 
   void stopNode(PhysicalTestCluster cluster, TestClusterNode node) throws Exception {
-    reapRetainedCommandGroups(cluster.ccmDirectory());
-    Path clusterDirectory = requireCurrentClusterDirectory(cluster.ccmDirectory());
-    sanitizeAndReapNode(ownedChild(clusterDirectory, node.name()));
-  }
-
-  private boolean prepareNodeForStart(PhysicalTestCluster cluster, TestClusterNode node)
-      throws Exception {
-    reapRetainedCommandGroups(cluster.ccmDirectory());
-    if (isNodeRunning(cluster, node)) {
-      return false;
-    }
-    Path clusterDirectory = requireCurrentClusterDirectory(cluster.ccmDirectory());
-    sanitizeAndReapNode(ownedChild(clusterDirectory, node.name()));
-    return true;
-  }
-
-  private Path requireCurrentClusterDirectory(Path ccmDirectory) throws IOException {
-    Path clusterDirectory = currentClusterDirectory(ccmDirectory);
+    Path clusterDirectory = currentClusterDirectory(cluster.ccmDirectory());
     if (clusterDirectory == null) {
-      throw new IOException("CCM has no current cluster under " + ccmDirectory);
+      throw new IOException("CCM has no current cluster under " + cluster.ccmDirectory());
     }
-    return clusterDirectory;
+    prepareNodeProcessReferencesForCcm(clusterDirectory, node.name());
+    runCcm(
+        cluster.ccmDirectory(),
+        List.of(node.name(), "stop", "--config-dir", cluster.ccmDirectory().toString()));
   }
 
   TestClusterNode addNode(PhysicalTestCluster cluster, String datacenter, String rack)
       throws Exception {
-    if (cluster.nodes().size() >= ClusterCapacity.MAXIMUM_NODE_COUNT) {
+    if (cluster.nodes().size() >= ClusterSpec.MAXIMUM_NODE_COUNT) {
       throw new IllegalStateException(
-          "A cluster cannot exceed " + ClusterCapacity.MAXIMUM_NODE_COUNT + " nodes");
+          "A cluster cannot exceed " + ClusterSpec.MAXIMUM_NODE_COUNT + " nodes");
     }
     int index = 1;
     while (containsNode(cluster.nodes(), "node" + index)) {
@@ -336,6 +425,7 @@ class CcmProvisioner {
               cluster.ccmDirectory().toString(),
               node.name(),
               "--scylla",
+              "--seeds",
               "--auto-bootstrap",
               "--itf",
               node.address(),
@@ -353,12 +443,23 @@ class CcmProvisioner {
     } catch (Exception provisioningException) {
       boolean restoreInterrupt = clearInterrupt(provisioningException);
       try {
+        Exception diagnosticFailure = null;
+        try {
+          collectDiagnostics(cluster.instanceId(), cluster.ccmDirectory());
+        } catch (Exception exception) {
+          diagnosticFailure = exception;
+        }
         if (provisioningException instanceof CcmProcessCleanupException) {
+          IOException retainedState =
+              new IOException("CCM command processes remain owned by the failed node");
+          if (diagnosticFailure != null) {
+            retainedState.addSuppressed(diagnosticFailure);
+          }
+          throw new CcmNodeProvisioningException(node, true, provisioningException, retainedState);
+        }
+        if (diagnosticFailure != null) {
           throw new CcmNodeProvisioningException(
-              node,
-              true,
-              provisioningException,
-              new IOException("CCM child processes remain owned by the failed node"));
+              node, true, provisioningException, diagnosticFailure);
         }
         try {
           removeNodeByName(cluster.ccmDirectory(), node.name());
@@ -382,6 +483,7 @@ class CcmProvisioner {
   }
 
   void deleteNodeState(PhysicalTestCluster cluster, TestClusterNode node) throws Exception {
+    collectDiagnostics(cluster.instanceId(), cluster.ccmDirectory());
     removeNodeByName(cluster.ccmDirectory(), node.name());
   }
 
@@ -403,12 +505,18 @@ class CcmProvisioner {
       return false;
     }
     Path nodeDirectory = ownedChild(currentCluster, node.name());
-    for (long pid : readScyllaPidsForProbe(nodeDirectory)) {
-      Optional<ProcessHandle> process = ProcessHandle.of(pid);
+    if (!Files.exists(nodeDirectory, LinkOption.NOFOLLOW_LINKS)) {
+      return false;
+    }
+    validateOwnedDirectory(currentCluster, nodeDirectory, "node");
+    for (long pid : readScyllaPids(nodeDirectory)) {
+      java.util.Optional<ProcessHandle> process = ProcessHandle.of(pid);
       if (process.isPresent() && isProcessAlive(process.get())) {
-        if (nodeProcessBelongsTo(process.get(), nodeDirectory)) {
-          return true;
+        if (!nodeProcessBelongsTo(process.get(), nodeDirectory)) {
+          throw new IOException(
+              "CCM node '" + node.name() + "' references an unrelated live PID " + pid);
         }
+        return true;
       }
     }
     return false;
@@ -533,9 +641,8 @@ class CcmProvisioner {
   }
 
   void remove(PhysicalTestCluster cluster) throws Exception {
-    collectDiagnosticsBestEffort(cluster.instanceId(), cluster.ccmDirectory());
+    collectDiagnostics(cluster.instanceId(), cluster.ccmDirectory());
     removeByName(cluster.instanceId(), cluster.ccmDirectory());
-    collectDiagnosticsBestEffort(cluster.instanceId(), cluster.ccmDirectory());
   }
 
   private static List<String> startArguments(PhysicalTestCluster cluster, String nodeName) {
@@ -613,6 +720,7 @@ class CcmProvisioner {
               ccmDirectory.toString(),
               node.name(),
               "--scylla",
+              "--seeds",
               "--itf",
               node.address(),
               "--data-center",
@@ -877,57 +985,326 @@ class CcmProvisioner {
     }
   }
 
-  private static Set<Long> readNodePids(Path nodeDirectory) throws IOException {
-    Set<Long> pids = readScyllaPids(nodeDirectory);
-    readPidFile(nodeDirectory.resolve("scylla-jmx.pid"), pids);
-    readPidFile(nodeDirectory.resolve("scylla-agent.pid"), pids);
-    return pids;
+  private void prepareClusterProcessReferencesForCcm(Path clusterDirectory) throws IOException {
+    Map<String, Object> cluster = readYamlMap(clusterDirectory.resolve("cluster.conf"));
+    Object configuredNodes = cluster.get("nodes");
+    if (!(configuredNodes instanceof Iterable)) {
+      throw new IOException("Invalid nodes list in " + clusterDirectory.resolve("cluster.conf"));
+    }
+    for (Object configuredNode : (Iterable<?>) configuredNodes) {
+      if (!(configuredNode instanceof String) || !isCcmNodeName((String) configuredNode)) {
+        throw new IOException(
+            "Unsafe node name in "
+                + clusterDirectory.resolve("cluster.conf")
+                + ": "
+                + configuredNode);
+      }
+      prepareNodeProcessReferencesForCcm(clusterDirectory, (String) configuredNode);
+    }
+  }
+
+  private void prepareNodeProcessReferencesForCcm(Path clusterDirectory, String nodeName)
+      throws IOException {
+    Path nodeDirectory = ownedChild(clusterDirectory, nodeName);
+    if (!Files.exists(nodeDirectory, LinkOption.NOFOLLOW_LINKS)) {
+      return;
+    }
+    validateOwnedDirectory(clusterDirectory, nodeDirectory, "node");
+
+    Path nodeConfig = nodeDirectory.resolve("node.conf");
+    Long configuredPid = null;
+    ProcessReferenceState configuredState = ProcessReferenceState.ABSENT;
+    if (Files.exists(nodeConfig, LinkOption.NOFOLLOW_LINKS)) {
+      Map<String, Object> config = readYamlMap(nodeConfig);
+      validateNativeNodeMetadata(config, nodeDirectory);
+      Object value = config.get("pid");
+      if (value != null) {
+        configuredPid = parsePidReference(value.toString(), nodeConfig);
+        configuredState =
+            inspectProcessReference(
+                configuredPid, nodeConfig, nodeDirectory, ProcessReferenceKind.SCYLLA);
+      }
+    }
+
+    Path scyllaPidFile = nodeDirectory.resolve("cassandra.pid");
+    Long scyllaPid = readPidReference(scyllaPidFile);
+    ProcessReferenceState scyllaState =
+        inspectProcessReference(
+            scyllaPid, scyllaPidFile, nodeDirectory, ProcessReferenceKind.SCYLLA);
+    if (scyllaState == ProcessReferenceState.OWNED
+        && (configuredState != ProcessReferenceState.OWNED || !scyllaPid.equals(configuredPid))) {
+      throw new CcmProcessCleanupException(
+          "CCM cannot safely stop Scylla PID "
+              + scyllaPid
+              + " because node.conf does not reference the same owned process");
+    }
+
+    Path jmxPidFile = nodeDirectory.resolve("scylla-jmx.pid");
+    Long jmxPid = readPidReference(jmxPidFile);
+    ProcessReferenceState jmxState =
+        inspectProcessReference(jmxPid, jmxPidFile, nodeDirectory, ProcessReferenceKind.JMX);
+    Path agentPidFile = nodeDirectory.resolve("scylla-agent.pid");
+    Long agentPid = readPidReference(agentPidFile);
+    ProcessReferenceState agentState =
+        inspectProcessReference(agentPid, agentPidFile, nodeDirectory, ProcessReferenceKind.AGENT);
+
+    if (configuredState == ProcessReferenceState.DEAD) {
+      sanitizeStaleNodeConfig(nodeConfig, nodeDirectory);
+    }
+    deleteDeadPidReference(scyllaPidFile, scyllaState);
+    deleteDeadPidReference(jmxPidFile, jmxState);
+    deleteDeadPidReference(agentPidFile, agentState);
+  }
+
+  private ProcessReferenceState inspectProcessReference(
+      Long pid, Path source, Path nodeDirectory, ProcessReferenceKind kind) throws IOException {
+    if (pid == null) {
+      return ProcessReferenceState.ABSENT;
+    }
+    java.util.Optional<ProcessHandle> process = ProcessHandle.of(pid);
+    if (process.isEmpty() || !isProcessAlive(process.get())) {
+      return ProcessReferenceState.DEAD;
+    }
+
+    Path processDirectory = Path.of("/proc", Long.toString(pid));
+    long startTicks = -1;
+    try {
+      startTicks = readProcessStartTicks(pid);
+      if (!Files.getOwner(Path.of("/proc/self/status"), LinkOption.NOFOLLOW_LINKS)
+          .equals(Files.getOwner(processDirectory, LinkOption.NOFOLLOW_LINKS))) {
+        throw new CcmProcessCleanupException(
+            "CCM process reference " + source + " points to foreign live PID " + pid);
+      }
+      byte[] environment = Files.readAllBytes(processDirectory.resolve("environ"));
+      if (!containsEnvironmentEntry(environment, "SCYLLA_CCM_RUN_DIR=" + runDirectory.toString())) {
+        if (!isSameLiveProcess(pid, startTicks)) {
+          return ProcessReferenceState.DEAD;
+        }
+        throw new CcmProcessCleanupException(
+            "CCM process reference " + source + " points to unrelated live PID " + pid);
+      }
+      List<String> arguments = readProcessArguments(processDirectory.resolve("cmdline"));
+      if (!matchesExpectedProcess(arguments, nodeDirectory, kind)
+          || !matchesExpectedExecutable(processDirectory, arguments, kind)) {
+        if (!isSameLiveProcess(pid, startTicks)) {
+          return ProcessReferenceState.DEAD;
+        }
+        throw new CcmProcessCleanupException(
+            "CCM process reference "
+                + source
+                + " points to the wrong "
+                + kind.description
+                + " process "
+                + pid);
+      }
+      if (!isSameLiveProcess(pid, startTicks)) {
+        return ProcessReferenceState.DEAD;
+      }
+      return ProcessReferenceState.OWNED;
+    } catch (CcmProcessCleanupException exception) {
+      throw exception;
+    } catch (IOException exception) {
+      if (startTicks >= 0 && !isSameLiveProcess(pid, startTicks)) {
+        return ProcessReferenceState.DEAD;
+      }
+      process = ProcessHandle.of(pid);
+      if (process.isEmpty() || !isProcessAlive(process.get())) {
+        return ProcessReferenceState.DEAD;
+      }
+      throw new CcmProcessCleanupException(
+          "Cannot prove ownership of live PID " + pid + " referenced by " + source, exception);
+    }
+  }
+
+  private static boolean matchesExpectedProcess(
+      List<String> arguments, Path nodeDirectory, ProcessReferenceKind kind) {
+    if (arguments.isEmpty()) {
+      return false;
+    }
+    Path normalizedNode = nodeDirectory.toAbsolutePath().normalize();
+    switch (kind) {
+      case SCYLLA:
+        return arguments.get(0).equals(normalizedNode.resolve("bin/scylla").toString());
+      case JMX:
+        return matchesExpectedJmxArguments(arguments, normalizedNode);
+      case AGENT:
+        Path executable;
+        try {
+          executable = Path.of(arguments.get(0));
+        } catch (RuntimeException invalid) {
+          return false;
+        }
+        return executable.isAbsolute()
+            && executable.getFileName() != null
+            && executable.getFileName().toString().equals("scylla-manager-agent")
+            && containsArgumentPair(
+                arguments,
+                "--config-file",
+                normalizedNode.resolve("conf/scylla-manager-agent.yaml").toString());
+      default:
+        throw new IllegalStateException("Unknown CCM process reference kind " + kind);
+    }
+  }
+
+  static boolean matchesExpectedJmxArguments(List<String> arguments, Path nodeDirectory) {
+    if (arguments.isEmpty()) {
+      return false;
+    }
+    Path normalizedNode = nodeDirectory.toAbsolutePath().normalize();
+    boolean expectedLauncher =
+        arguments.get(0).equals(normalizedNode.resolve("bin/symlinks/scylla-jmx").toString());
+    boolean expectedJava = executableBaseName(arguments.get(0), "java");
+    return (expectedLauncher || expectedJava)
+        && containsArgumentPair(
+            arguments, "-jar", normalizedNode.resolve("bin/scylla-jmx-1.0.jar").toString());
+  }
+
+  private static boolean matchesExpectedExecutable(
+      Path processDirectory, List<String> arguments, ProcessReferenceKind kind) throws IOException {
+    if (kind != ProcessReferenceKind.JMX
+        || arguments.isEmpty()
+        || !executableBaseName(arguments.get(0), "java")) {
+      return true;
+    }
+    Path executable = Files.readSymbolicLink(processDirectory.resolve("exe"));
+    Path fileName = executable.getFileName();
+    return fileName != null
+        && (fileName.toString().equals("java") || fileName.toString().equals("java (deleted)"));
+  }
+
+  private static boolean executableBaseName(String executable, String expected) {
+    try {
+      Path fileName = Path.of(executable).getFileName();
+      return fileName != null && fileName.toString().equals(expected);
+    } catch (RuntimeException invalid) {
+      return false;
+    }
+  }
+
+  private static boolean containsArgumentPair(
+      List<String> arguments, String option, String expectedValue) {
+    for (int index = 0; index + 1 < arguments.size(); index++) {
+      if (arguments.get(index).equals(option) && arguments.get(index + 1).equals(expectedValue)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static List<String> readProcessArguments(Path commandLine) throws IOException {
+    byte[] bytes = Files.readAllBytes(commandLine);
+    List<String> arguments = new ArrayList<>();
+    int start = 0;
+    for (int index = 0; index <= bytes.length; index++) {
+      if (index == bytes.length || bytes[index] == 0) {
+        if (index > start) {
+          arguments.add(new String(bytes, start, index - start, StandardCharsets.UTF_8));
+        }
+        start = index + 1;
+      }
+    }
+    return arguments;
+  }
+
+  private static boolean isSameLiveProcess(long pid, long expectedStartTicks) throws IOException {
+    java.util.Optional<ProcessHandle> process = ProcessHandle.of(pid);
+    return process.isPresent()
+        && isProcessAlive(process.get())
+        && readProcessStartTicks(pid) == expectedStartTicks;
+  }
+
+  private static long readProcessStartTicks(long pid) throws IOException {
+    String stat =
+        Files.readString(Path.of("/proc", Long.toString(pid), "stat"), StandardCharsets.US_ASCII);
+    int commandEnd = stat.lastIndexOf(')');
+    if (commandEnd < 0 || commandEnd + 2 >= stat.length()) {
+      throw new IOException("Unable to parse process identity for PID " + pid);
+    }
+    String[] fields = stat.substring(commandEnd + 2).split("\\s+");
+    if (fields.length <= 19) {
+      throw new IOException("Unable to parse process identity for PID " + pid);
+    }
+    try {
+      return Long.parseLong(fields[19]);
+    } catch (NumberFormatException exception) {
+      throw new IOException("Unable to parse process identity for PID " + pid, exception);
+    }
+  }
+
+  private static Long readPidReference(Path path) throws IOException {
+    if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+      return null;
+    }
+    rejectSymlink(path);
+    return parsePidReference(Files.readString(path, StandardCharsets.US_ASCII).trim(), path);
+  }
+
+  private static long parsePidReference(String value, Path source) throws IOException {
+    Set<Long> parsed = new HashSet<>();
+    addPid(value, source, parsed);
+    return parsed.iterator().next();
+  }
+
+  private static void deleteDeadPidReference(Path path, ProcessReferenceState state)
+      throws IOException {
+    if (state == ProcessReferenceState.DEAD) {
+      rejectSymlink(path);
+      Files.delete(path);
+    }
+  }
+
+  private static boolean containsEnvironmentEntry(byte[] environment, String expected) {
+    byte[] expectedBytes = expected.getBytes(StandardCharsets.UTF_8);
+    int start = 0;
+    for (int index = 0; index <= environment.length; index++) {
+      if (index == environment.length || environment[index] == 0) {
+        if (index - start == expectedBytes.length) {
+          boolean equal = true;
+          for (int offset = 0; offset < expectedBytes.length; offset++) {
+            if (environment[start + offset] != expectedBytes[offset]) {
+              equal = false;
+              break;
+            }
+          }
+          if (equal) {
+            return true;
+          }
+        }
+        start = index + 1;
+      }
+    }
+    return false;
+  }
+
+  private enum ProcessReferenceState {
+    ABSENT,
+    DEAD,
+    OWNED
+  }
+
+  private enum ProcessReferenceKind {
+    SCYLLA("Scylla"),
+    JMX("JMX"),
+    AGENT("manager agent");
+
+    final String description;
+
+    ProcessReferenceKind(String description) {
+      this.description = description;
+    }
   }
 
   private static Set<Long> readScyllaPids(Path nodeDirectory) throws IOException {
     Set<Long> pids = new HashSet<>();
     readPidFile(nodeDirectory.resolve("cassandra.pid"), pids);
     Path nodeConfig = nodeDirectory.resolve("node.conf");
-    if (Files.isRegularFile(nodeConfig, LinkOption.NOFOLLOW_LINKS)) {
+    if (Files.exists(nodeConfig, LinkOption.NOFOLLOW_LINKS)) {
       Object configuredPid = readYamlMap(nodeConfig).get("pid");
-      if (configuredPid instanceof Number) {
-        pids.add(((Number) configuredPid).longValue());
-      } else if (configuredPid != null) {
+      if (configuredPid != null) {
         addPid(configuredPid.toString(), nodeConfig, pids);
       }
     }
     return pids;
-  }
-
-  private static Set<Long> readScyllaPidsForProbe(Path nodeDirectory) throws IOException {
-    Set<Long> pids = new HashSet<>();
-    readPidFileForProbe(nodeDirectory.resolve("cassandra.pid"), pids);
-    Path nodeConfig = nodeDirectory.resolve("node.conf");
-    if (Files.exists(nodeConfig, LinkOption.NOFOLLOW_LINKS)) {
-      Object configuredPid = readYamlMap(nodeConfig).get("pid");
-      if (configuredPid != null) {
-        try {
-          addPid(configuredPid.toString(), nodeConfig, pids);
-        } catch (IOException ignored) {
-          // A truncated PID scalar means the node cannot be proven live. Mutating control paths
-          // atomically quarantine and repair it before invoking CCM.
-        }
-      }
-    }
-    return pids;
-  }
-
-  private static void readPidFileForProbe(Path path, Set<Long> pids) throws IOException {
-    if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
-      return;
-    }
-    rejectSymlink(path);
-    String contents = Files.readString(path, StandardCharsets.US_ASCII).trim();
-    try {
-      addPid(contents, path, pids);
-    } catch (IOException ignored) {
-      // See readScyllaPidsForProbe: invalid contents are not evidence of a live node.
-    }
   }
 
   private static void readPidFile(Path path, Set<Long> pids) throws IOException {
@@ -938,500 +1315,16 @@ class CcmProvisioner {
     addPid(Files.readString(path, StandardCharsets.US_ASCII).trim(), path, pids);
   }
 
-  private static void sanitizeStaleNodeProcessReferences(Path nodeDirectory) throws IOException {
-    if (Files.isSymbolicLink(nodeDirectory)
-        || !Files.isDirectory(nodeDirectory, LinkOption.NOFOLLOW_LINKS)) {
-      throw new IOException("Refusing unsafe CCM node directory " + nodeDirectory);
-    }
-    for (String name : List.of("cassandra.pid", "scylla-jmx.pid", "scylla-agent.pid")) {
-      sanitizePidFile(nodeDirectory.resolve(name), nodeDirectory);
-    }
-    sanitizeNodeConfig(nodeDirectory.resolve("node.conf"), nodeDirectory);
-  }
-
-  private static void sanitizePidFile(Path pidFile, Path nodeDirectory) throws IOException {
-    for (int attempt = 0; attempt < REFERENCE_SANITIZE_ATTEMPTS; attempt++) {
-      QuarantinedReference reference = claimProcessReference(pidFile, nodeDirectory);
-      if (reference == null) {
-        return;
-      }
-      try {
-        String contents = Files.readString(reference.claimed, StandardCharsets.US_ASCII).trim();
-        long pid;
-        try {
-          pid = parsePid(contents, pidFile);
-        } catch (IOException malformedPid) {
-          // An interrupted CCM start can leave an empty/truncated PID file. The reference is
-          // quarantined, so a complete process scan can safely reap anything started before
-          // PID publication and make the malformed file disposable.
-          reapRecognizedNodeProcesses(nodeDirectory);
-          discardClaimedReference(reference);
-          continue;
-        }
-        makeProcessReferenceSafe(pid, nodeDirectory);
-        discardClaimedReference(reference);
-      } catch (IOException exception) {
-        restoreClaimAfterFailure(reference, exception);
-        throw exception;
-      }
-      if (!Files.exists(pidFile, LinkOption.NOFOLLOW_LINKS)) {
-        if (Files.notExists(pidFile, LinkOption.NOFOLLOW_LINKS)) {
-          return;
-        }
-        throw new IOException("Cannot determine whether CCM PID file exists: " + pidFile);
-      }
-      // A cooperating writer published a new reference without being overwritten. Claim and
-      // validate that new entry before allowing CCM to observe it.
-    }
-    throw new IOException("CCM PID file changed repeatedly while sanitizing " + pidFile);
-  }
-
-  private static void sanitizeNodeConfig(Path nodeConfig, Path nodeDirectory) throws IOException {
-    QuarantinedReference reference = claimProcessReference(nodeConfig, nodeDirectory);
-    if (reference == null) {
-      return;
-    }
-    try {
-      Map<String, Object> yaml = readYamlMap(reference.claimed);
-      Object configuredPid = yaml.get("pid");
-      if (configuredPid == null) {
-        restoreClaimedReference(reference);
-        return;
-      }
-      long pid;
-      try {
-        pid = parsePid(configuredPid.toString(), nodeConfig);
-      } catch (IOException malformedPid) {
-        reapRecognizedNodeProcesses(nodeDirectory);
-        pid = -1;
-      }
-      if (pid >= 2) {
-        makeProcessReferenceSafe(pid, nodeDirectory);
-      }
-      yaml.remove("pid");
-      Files.writeString(
-          reference.prepared,
-          dumpYamlMap(yaml),
-          StandardCharsets.UTF_8,
-          java.nio.file.StandardOpenOption.CREATE_NEW,
-          java.nio.file.StandardOpenOption.WRITE);
-      copyPosixPermissions(reference.claimed, reference.prepared);
-      publishWithoutReplacement(reference.prepared, nodeConfig);
-      if (!Files.isSameFile(reference.prepared, nodeConfig)
-          || !yaml.equals(readYamlMap(nodeConfig))) {
-        throw new IOException("CCM node configuration changed while sanitizing " + nodeConfig);
-      }
-      Files.delete(reference.prepared);
-      discardClaimedReference(reference);
-    } catch (IOException exception) {
-      restoreClaimAfterFailure(reference, exception);
-      throw exception;
-    }
-  }
-
-  private static QuarantinedReference claimProcessReference(Path reference, Path nodeDirectory)
-      throws IOException {
-    recoverQuarantinedReference(reference, nodeDirectory);
-    if (!Files.exists(reference, LinkOption.NOFOLLOW_LINKS)) {
-      if (Files.notExists(reference, LinkOption.NOFOLLOW_LINKS)) {
-        return null;
-      }
-      throw new IOException("Cannot determine whether CCM process reference exists: " + reference);
-    }
-    rejectSymlink(reference);
-
-    String prefix = ".ccm-sanitize-" + reference.getFileName() + "-";
-    Path quarantine = Files.createTempDirectory(nodeDirectory, prefix);
-    try {
-      try {
-        Files.setPosixFilePermissions(
-            quarantine, java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"));
-      } catch (UnsupportedOperationException ignored) {
-        // The no-clobber hard-link publication below is the required safety property.
-      }
-      Path claimed = quarantine.resolve("claimed");
-      try {
-        // There is deliberately no non-atomic fallback. The private, newly-created directory
-        // guarantees that the target name was absent when this same-filesystem rename began.
-        Files.move(reference, claimed, StandardCopyOption.ATOMIC_MOVE);
-      } catch (AtomicMoveNotSupportedException exception) {
-        throw new IOException("Atomic CCM process-reference quarantine is unsupported", exception);
-      }
-      if (Files.exists(reference, LinkOption.NOFOLLOW_LINKS)) {
-        throw new IOException("CCM process reference was concurrently replaced: " + reference);
-      }
-      rejectSymlink(claimed);
-      return new QuarantinedReference(
-          reference, quarantine, claimed, quarantine.resolve("prepared"));
-    } catch (IOException exception) {
-      if (isEmptyDirectory(quarantine)) {
-        try {
-          Files.delete(quarantine);
-        } catch (IOException cleanupException) {
-          exception.addSuppressed(cleanupException);
-        }
-      }
-      throw exception;
-    }
-  }
-
-  private static void recoverQuarantinedReference(Path reference, Path nodeDirectory)
-      throws IOException {
-    String prefix = ".ccm-sanitize-" + reference.getFileName() + "-";
-    List<Path> quarantines = new ArrayList<>();
-    try (java.nio.file.DirectoryStream<Path> entries =
-        Files.newDirectoryStream(
-            nodeDirectory, path -> path.getFileName().toString().startsWith(prefix))) {
-      entries.forEach(quarantines::add);
-    }
-    if (quarantines.size() > 1) {
-      throw new IOException(
-          "Multiple interrupted CCM process-reference transactions exist for " + reference);
-    }
-    if (quarantines.isEmpty()) {
-      return;
-    }
-
-    Path quarantine = quarantines.get(0);
-    if (Files.isSymbolicLink(quarantine)
-        || !Files.isDirectory(quarantine, LinkOption.NOFOLLOW_LINKS)) {
-      throw new IOException("Refusing unsafe CCM quarantine directory " + quarantine);
-    }
-    QuarantinedReference transaction =
-        new QuarantinedReference(
-            reference, quarantine, quarantine.resolve("claimed"), quarantine.resolve("prepared"));
-    validateQuarantineEntries(transaction);
-    boolean claimedExists = Files.exists(transaction.claimed, LinkOption.NOFOLLOW_LINKS);
-    boolean preparedExists = Files.exists(transaction.prepared, LinkOption.NOFOLLOW_LINKS);
-    boolean referenceExists = Files.exists(reference, LinkOption.NOFOLLOW_LINKS);
-
-    if (!claimedExists) {
-      if (!preparedExists) {
-        Files.delete(quarantine);
-        return;
-      }
-      if (referenceExists) {
-        rejectSymlink(reference);
-        rejectSymlink(transaction.prepared);
-        if (Files.isSameFile(reference, transaction.prepared)) {
-          Files.delete(transaction.prepared);
-          Files.delete(quarantine);
-          return;
-        }
-      }
-      throw new IOException("Cannot recover interrupted CCM sanitization at " + quarantine);
-    }
-
-    rejectSymlink(transaction.claimed);
-    if (!referenceExists) {
-      restoreClaimedReference(transaction);
-      return;
-    }
-    rejectSymlink(reference);
-    if (Files.isSameFile(reference, transaction.claimed)) {
-      discardClaimedReference(transaction);
-      return;
-    }
-    if ("node.conf".equals(reference.getFileName().toString())
-        && completedSanitizedNodeConfig(transaction, nodeDirectory)) {
-      discardClaimedReference(transaction);
-      return;
-    }
-    throw new IOException("A concurrent CCM process reference prevents recovery of " + quarantine);
-  }
-
-  private static boolean completedSanitizedNodeConfig(
-      QuarantinedReference transaction, Path nodeDirectory) throws IOException {
-    if (Files.exists(transaction.prepared, LinkOption.NOFOLLOW_LINKS)) {
-      rejectSymlink(transaction.prepared);
-      if (!Files.isSameFile(transaction.original, transaction.prepared)) {
-        return false;
-      }
-    }
-    Map<String, Object> claimed = readYamlMap(transaction.claimed);
-    Object configuredPid = claimed.get("pid");
-    if (configuredPid == null) {
-      return false;
-    }
-    long pid = parsePid(configuredPid.toString(), transaction.original);
-    claimed.remove("pid");
-    return claimed.equals(readYamlMap(transaction.original))
-        && processReferenceIsStale(pid, nodeDirectory);
-  }
-
-  private static void validateQuarantineEntries(QuarantinedReference transaction)
-      throws IOException {
-    try (java.nio.file.DirectoryStream<Path> entries =
-        Files.newDirectoryStream(transaction.quarantine)) {
-      for (Path entry : entries) {
-        if (!entry.equals(transaction.claimed) && !entry.equals(transaction.prepared)) {
-          throw new IOException("Unexpected file in CCM quarantine transaction: " + entry);
-        }
-        rejectSymlink(entry);
-      }
-    }
-  }
-
-  private static void publishWithoutReplacement(Path source, Path target) throws IOException {
-    try {
-      Files.createLink(target, source);
-    } catch (UnsupportedOperationException exception) {
-      throw new IOException("Safe CCM process-reference publication is unsupported", exception);
-    }
-  }
-
-  private static void restoreClaimedReference(QuarantinedReference transaction) throws IOException {
-    if (Files.exists(transaction.original, LinkOption.NOFOLLOW_LINKS)) {
-      rejectSymlink(transaction.original);
-      if (!Files.isSameFile(transaction.original, transaction.claimed)) {
-        throw new IOException(
-            "Refusing to overwrite a concurrent CCM process reference " + transaction.original);
-      }
-    } else if (Files.notExists(transaction.original, LinkOption.NOFOLLOW_LINKS)) {
-      publishWithoutReplacement(transaction.claimed, transaction.original);
-      if (!Files.isSameFile(transaction.claimed, transaction.original)) {
-        throw new IOException("Unable to restore CCM process reference " + transaction.original);
-      }
-    } else {
-      throw new IOException(
-          "Cannot determine whether CCM process reference exists: " + transaction.original);
-    }
-    discardClaimedReference(transaction);
-  }
-
-  private static void restoreClaimAfterFailure(
-      QuarantinedReference transaction, IOException originalFailure) {
-    try {
-      if (!Files.exists(transaction.claimed, LinkOption.NOFOLLOW_LINKS)) {
-        return;
-      }
-      if (!Files.exists(transaction.original, LinkOption.NOFOLLOW_LINKS)) {
-        if (!Files.notExists(transaction.original, LinkOption.NOFOLLOW_LINKS)) {
-          throw new IOException(
-              "Cannot determine whether CCM process reference exists: " + transaction.original);
-        }
-        restoreClaimedReference(transaction);
-      } else if (Files.isSameFile(transaction.original, transaction.claimed)) {
-        discardClaimedReference(transaction);
-      }
-    } catch (IOException recoveryFailure) {
-      originalFailure.addSuppressed(recoveryFailure);
-    }
-  }
-
-  private static void discardClaimedReference(QuarantinedReference transaction) throws IOException {
-    Files.deleteIfExists(transaction.prepared);
-    Files.deleteIfExists(transaction.claimed);
-    Files.delete(transaction.quarantine);
-  }
-
-  private static void copyPosixPermissions(Path source, Path target) throws IOException {
-    try {
-      Files.setPosixFilePermissions(
-          target, Files.getPosixFilePermissions(source, LinkOption.NOFOLLOW_LINKS));
-    } catch (UnsupportedOperationException ignored) {
-      // Non-POSIX file systems still get a complete, no-clobber replacement.
-    }
-  }
-
-  private static boolean isEmptyDirectory(Path directory) throws IOException {
-    try (java.nio.file.DirectoryStream<Path> entries = Files.newDirectoryStream(directory)) {
-      return !entries.iterator().hasNext();
-    }
-  }
-
-  private static boolean processReferenceIsStale(long pid, Path nodeDirectory) throws IOException {
-    Optional<ProcessHandle> initial = ProcessHandle.of(pid);
-    if (initial.isEmpty() || !isProcessAlive(initial.get())) {
-      return true;
-    }
-    if (nodeProcessBelongsTo(initial.get(), nodeDirectory)) {
-      return false;
-    }
-    OwnedProcess foreign = new OwnedProcess(initial.get());
-    if (foreign.startTicks.isEmpty()) {
-      throw new IOException("Cannot prove that foreign PID " + pid + " retained its identity");
-    }
-    Optional<ProcessHandle> current = ProcessHandle.of(pid);
-    if (current.isEmpty() || !isProcessAlive(current.get())) {
-      return true;
-    }
-    if (!sameProcess(foreign, current.get())) {
-      throw new IOException("PID " + pid + " changed identity while sanitizing CCM state");
-    }
-    if (nodeProcessBelongsTo(current.get(), nodeDirectory)) {
-      // The process may have completed exec between the two command-line snapshots.
-      return false;
-    }
-    return true;
-  }
-
-  private static void makeProcessReferenceSafe(long pid, Path nodeDirectory) throws IOException {
-    Optional<ProcessHandle> initial = ProcessHandle.of(pid);
-    if (initial.isEmpty() || !isProcessAlive(initial.get())) {
-      return;
-    }
-    if (!nodeProcessBelongsTo(initial.get(), nodeDirectory)) {
-      if (!processReferenceIsStale(pid, nodeDirectory)) {
-        throw new IOException("Foreign PID " + pid + " became a CCM node process unexpectedly");
-      }
-      return;
-    }
-
-    OwnedProcess owned = new OwnedProcess(initial.get());
-    if (owned.startTicks.isEmpty()) {
-      throw new IOException("Cannot capture stable identity for owned PID " + pid);
-    }
-    reapOwnedNode(new OwnedNodeState(nodeDirectory.toAbsolutePath().normalize(), List.of(owned)));
-  }
-
-  private static void sanitizeAndReapNode(Path nodeDirectory) throws IOException {
-    sanitizeStaleNodeProcessReferences(nodeDirectory);
-    reapRecognizedNodeProcesses(nodeDirectory);
-    Set<Long> remainingReferences = readNodePids(nodeDirectory);
-    if (!remainingReferences.isEmpty()) {
-      throw new IOException(
-          "CCM process references remain after safe sanitization in "
-              + nodeDirectory
-              + ": "
-              + remainingReferences);
-    }
-  }
-
-  private static void reapRecognizedNodeProcesses(Path nodeDirectory) throws IOException {
-    java.nio.file.attribute.UserPrincipal currentOwner =
-        Files.getOwner(
-            Path.of("/proc", Long.toString(ProcessHandle.current().pid())),
-            LinkOption.NOFOLLOW_LINKS);
-    for (int attempt = 0; attempt < REFERENCE_SANITIZE_ATTEMPTS; attempt++) {
-      Map<Long, OwnedProcess> owned = new LinkedHashMap<>();
-      try (java.util.stream.Stream<ProcessHandle> processes = ProcessHandle.allProcesses()) {
-        java.util.Iterator<ProcessHandle> iterator = processes.iterator();
-        while (iterator.hasNext()) {
-          ProcessHandle process = iterator.next();
-          Path processDirectory = Path.of("/proc", Long.toString(process.pid()));
-          try {
-            if (!currentOwner.equals(Files.getOwner(processDirectory, LinkOption.NOFOLLOW_LINKS))) {
-              continue;
-            }
-          } catch (java.nio.file.NoSuchFileException ignored) {
-            continue;
-          }
-          if (!isProcessAlive(process) || !nodeProcessBelongsTo(process, nodeDirectory)) {
-            continue;
-          }
-          OwnedProcess identity = new OwnedProcess(process);
-          if (identity.startTicks.isEmpty()) {
-            throw new IOException(
-                "Cannot capture stable identity for CCM node process " + process.pid());
-          }
-          owned.put(process.pid(), identity);
-        }
-      }
-      if (owned.isEmpty()) {
-        return;
-      }
-      reapOwnedNode(
-          new OwnedNodeState(
-              nodeDirectory.toAbsolutePath().normalize(), new ArrayList<>(owned.values())));
-    }
-    throw new IOException("CCM node processes changed repeatedly during cleanup: " + nodeDirectory);
-  }
-
   private static void addPid(String value, Path source, Set<Long> pids) throws IOException {
-    pids.add(parsePid(value, source));
-  }
-
-  private static long parsePid(String value, Path source) throws IOException {
     try {
       long pid = Long.parseLong(value);
       if (pid < 2) {
         throw new NumberFormatException();
       }
-      return pid;
+      pids.add(pid);
     } catch (NumberFormatException exception) {
       throw new IOException("Invalid process ID in " + source, exception);
     }
-  }
-
-  private static boolean nodeProcessBelongsTo(ProcessHandle process, Path nodeDirectory)
-      throws IOException {
-    Path expectedDirectory = nodeDirectory.toAbsolutePath().normalize();
-    List<String> arguments = readProcessArguments(process);
-    if (arguments.isEmpty()) {
-      return false;
-    }
-    String executable = arguments.get(0);
-    if (executable.equals(expectedDirectory.resolve("bin/scylla").toString())) {
-      return true;
-    }
-
-    String jmxLauncher = expectedDirectory.resolve("bin/symlinks/scylla-jmx").toString();
-    if (executable.equals(jmxLauncher)) {
-      return hasJmxJarOperand(arguments, expectedDirectory);
-    }
-    Path executableName;
-    try {
-      executableName = Path.of(executable).getFileName();
-    } catch (RuntimeException ignored) {
-      return false;
-    }
-    if (executableName == null) {
-      return false;
-    }
-    if ("java".equals(executableName.toString())
-        && hasJmxJarOperand(arguments, expectedDirectory)) {
-      return true;
-    }
-    if (!"scylla-manager-agent".equals(executableName.toString())) {
-      return false;
-    }
-    String expectedAgentConfig =
-        expectedDirectory.resolve("conf/scylla-manager-agent.yaml").toString();
-    for (int index = 1; index + 1 < arguments.size(); index++) {
-      if ("--config-file".equals(arguments.get(index))
-          && expectedAgentConfig.equals(arguments.get(index + 1))) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static boolean hasJmxJarOperand(List<String> arguments, Path nodeDirectory) {
-    String jarPrefix = nodeDirectory.resolve("bin/scylla-jmx-").toString();
-    for (int index = 1; index + 1 < arguments.size(); index++) {
-      String jar = arguments.get(index + 1);
-      if ("-jar".equals(arguments.get(index))
-          && jar.startsWith(jarPrefix)
-          && jar.endsWith(".jar")) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static List<String> readProcessArguments(ProcessHandle process) throws IOException {
-    byte[] commandLine;
-    try {
-      commandLine = Files.readAllBytes(Path.of("/proc", Long.toString(process.pid()), "cmdline"));
-    } catch (IOException exception) {
-      if (!isProcessAlive(process)) {
-        return List.of();
-      }
-      throw new IOException("Unable to verify ownership of PID " + process.pid(), exception);
-    }
-    List<String> arguments = new ArrayList<>();
-    int start = 0;
-    for (int index = 0; index <= commandLine.length; index++) {
-      if (index == commandLine.length || commandLine[index] == 0) {
-        String argument = new String(commandLine, start, index - start, StandardCharsets.UTF_8);
-        if (!argument.isEmpty()) {
-          arguments.add(argument);
-        }
-        start = index + 1;
-      }
-    }
-    return arguments;
   }
 
   private static boolean isProcessAlive(ProcessHandle process) {
@@ -1443,32 +1336,32 @@ class CcmProvisioner {
           Files.readString(
               Path.of("/proc", Long.toString(process.pid()), "stat"), StandardCharsets.US_ASCII);
       int commandEnd = stat.lastIndexOf(')');
-      if (commandEnd >= 0 && commandEnd + 2 < stat.length()) {
-        return stat.charAt(commandEnd + 2) != 'Z';
-      }
+      return commandEnd < 0
+          || commandEnd + 2 >= stat.length()
+          || stat.charAt(commandEnd + 2) != 'Z';
     } catch (IOException ignored) {
-      // A process that disappeared while being inspected is not alive.
       return process.isAlive();
     }
-    return process.isAlive();
   }
 
-  private static Optional<Long> readProcessStartTicks(long pid) {
+  private static boolean nodeProcessBelongsTo(ProcessHandle process, Path nodeDirectory)
+      throws IOException {
+    Path commandLine = Path.of("/proc", Long.toString(process.pid()), "cmdline");
+    byte[] bytes;
     try {
-      String stat =
-          Files.readString(Path.of("/proc", Long.toString(pid), "stat"), StandardCharsets.US_ASCII);
-      int commandEnd = stat.lastIndexOf(')');
-      if (commandEnd < 0 || commandEnd + 2 >= stat.length()) {
-        return Optional.empty();
+      bytes = Files.readAllBytes(commandLine);
+    } catch (IOException exception) {
+      if (!isProcessAlive(process)) {
+        return false;
       }
-      String[] fields = stat.substring(commandEnd + 2).split("\\s+");
-      if (fields.length <= 19) {
-        return Optional.empty();
-      }
-      return Optional.of(Long.parseLong(fields[19]));
-    } catch (IOException | NumberFormatException ignored) {
-      return Optional.empty();
+      throw new IOException("Unable to inspect CCM node PID " + process.pid(), exception);
     }
+    int end = 0;
+    while (end < bytes.length && bytes[end] != 0) {
+      end++;
+    }
+    String executable = new String(bytes, 0, end, StandardCharsets.UTF_8);
+    return executable.equals(nodeDirectory.resolve("bin/scylla").toString());
   }
 
   private static String authenticator(AuthenticationMode mode) {
@@ -1671,137 +1564,330 @@ class CcmProvisioner {
     }
   }
 
-  private void collectDiagnosticsBestEffort(String instanceId, Path ccmDirectory) {
-    try {
-      if (!Files.isDirectory(ccmDirectory)) {
-        return;
+  private void collectDiagnostics(String instanceId, Path ccmDirectory) throws IOException {
+    Path normalized = validateCcmDirectoryLocation(ccmDirectory, false);
+    if (!Files.exists(normalized, LinkOption.NOFOLLOW_LINKS)) {
+      return;
+    }
+    validateOwnedDirectory(clustersDirectory, normalized, "CCM config");
+    Path destination = ownedChild(diagnosticsDirectory, instanceId);
+    prepareDiagnosticDirectory(diagnosticsDirectory, destination);
+
+    try (DirectoryStream<Path> entries = Files.newDirectoryStream(normalized)) {
+      for (Path entry : entries) {
+        String name = entry.getFileName().toString();
+        if (name.equals("ccm-commands.log")
+            || (name.startsWith("ccm-command-") && name.endsWith(".log"))) {
+          copyDiagnosticFile(entry, destination, Path.of(name), true);
+        }
       }
-      Path destination = diagnosticsDirectory.resolve(instanceId);
-      Files.walkFileTree(
-          ccmDirectory,
-          new SimpleFileVisitor<Path>() {
-            @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
-                throws IOException {
-              Path relative = ccmDirectory.relativize(file);
-              if (shouldCollect(relative)) {
-                Path target = destination.resolve(relative);
-                Files.createDirectories(target.getParent());
-                Files.copy(file, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-              }
-              return FileVisitResult.CONTINUE;
-            }
-          });
-    } catch (Exception ignored) {
-      // Diagnostics must not mask the provisioning or cleanup failure.
+    }
+
+    Path clusterDirectory = ownedChild(normalized, instanceId);
+    PathState clusterState = pathState(clusterDirectory);
+    if (clusterState == PathState.ABSENT) {
+      return;
+    }
+    if (clusterState == PathState.UNKNOWN) {
+      throw new IOException("Cannot determine CCM cluster state at " + clusterDirectory);
+    }
+    validateOwnedDirectory(normalized, clusterDirectory, "cluster");
+    copyOptionalDiagnosticFile(
+        clusterDirectory.resolve("cluster.conf"),
+        destination,
+        Path.of(instanceId, "cluster.conf"),
+        false);
+
+    try (DirectoryStream<Path> entries = Files.newDirectoryStream(clusterDirectory)) {
+      for (Path nodeDirectory : entries) {
+        String nodeName = nodeDirectory.getFileName().toString();
+        if (!isCcmNodeName(nodeName)) {
+          continue;
+        }
+        PathState nodeState = pathState(nodeDirectory);
+        if (nodeState == PathState.ABSENT) {
+          continue;
+        }
+        if (nodeState == PathState.UNKNOWN) {
+          throw new IOException("Cannot determine CCM node state at " + nodeDirectory);
+        }
+        validateOwnedDirectory(clusterDirectory, nodeDirectory, "node");
+        Path nodeRelative = Path.of(instanceId, nodeName);
+        copyOptionalDiagnosticFile(
+            nodeDirectory.resolve("node.conf"),
+            destination,
+            nodeRelative.resolve("node.conf"),
+            false);
+
+        Path configurationDirectory = nodeDirectory.resolve("conf");
+        PathState configurationState = pathState(configurationDirectory);
+        if (configurationState == PathState.PRESENT) {
+          validateOwnedDirectory(nodeDirectory, configurationDirectory, "node configuration");
+          copyOptionalDiagnosticFile(
+              configurationDirectory.resolve("scylla.yaml"),
+              destination,
+              nodeRelative.resolve("conf/scylla.yaml"),
+              false);
+        } else if (configurationState == PathState.UNKNOWN) {
+          throw new IOException(
+              "Cannot determine CCM node configuration state at " + configurationDirectory);
+        }
+
+        Path logsDirectory = nodeDirectory.resolve("logs");
+        PathState logsState = pathState(logsDirectory);
+        if (logsState == PathState.PRESENT) {
+          validateOwnedDirectory(nodeDirectory, logsDirectory, "node logs");
+          copyDiagnosticLogTree(logsDirectory, destination, nodeRelative.resolve("logs"));
+        } else if (logsState == PathState.UNKNOWN) {
+          throw new IOException("Cannot determine CCM node logs state at " + logsDirectory);
+        }
+      }
     }
   }
 
-  private static boolean shouldCollect(Path relativePath) {
-    String path = relativePath.toString().replace('\\', '/');
-    return path.equals("ccm-commands.log")
-        || path.endsWith("/cluster.conf")
-        || path.endsWith("/node.conf")
-        || path.endsWith("/conf/scylla.yaml")
-        || path.contains("/logs/");
+  private static void copyDiagnosticLogTree(
+      Path logsDirectory, Path destination, Path destinationRelative) throws IOException {
+    Files.walkFileTree(
+        logsDirectory,
+        new SimpleFileVisitor<Path>() {
+          @Override
+          public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attributes)
+              throws IOException {
+            if (Files.isSymbolicLink(directory) || !attributes.isDirectory()) {
+              throw new IOException("Refusing unsafe CCM log directory " + directory);
+            }
+            if (!directory.equals(logsDirectory)) {
+              validateOwnedDirectory(directory.getParent(), directory, "log");
+            }
+            return FileVisitResult.CONTINUE;
+          }
+
+          @Override
+          public FileVisitResult visitFile(Path file, BasicFileAttributes attributes)
+              throws IOException {
+            if (attributes.isSymbolicLink()) {
+              throw new IOException("Refusing symbolic link in CCM logs: " + file);
+            }
+            if (attributes.isRegularFile() && !isPrivateKeyFile(file)) {
+              copyDiagnosticFile(
+                  file,
+                  destination,
+                  destinationRelative.resolve(logsDirectory.relativize(file)),
+                  true);
+            }
+            return FileVisitResult.CONTINUE;
+          }
+
+          @Override
+          public FileVisitResult visitFileFailed(Path file, IOException exception)
+              throws IOException {
+            if (exception instanceof NoSuchFileException) {
+              return FileVisitResult.CONTINUE;
+            }
+            throw exception;
+          }
+
+          @Override
+          public FileVisitResult postVisitDirectory(Path directory, IOException exception)
+              throws IOException {
+            if (exception == null || exception instanceof NoSuchFileException) {
+              return FileVisitResult.CONTINUE;
+            }
+            throw exception;
+          }
+        });
+  }
+
+  private static void copyOptionalDiagnosticFile(
+      Path source, Path destination, Path relative, boolean tolerateDisappearance)
+      throws IOException {
+    PathState state = pathState(source);
+    if (state == PathState.ABSENT) {
+      return;
+    }
+    if (state == PathState.UNKNOWN) {
+      throw new IOException("Cannot determine diagnostic source state at " + source);
+    }
+    copyDiagnosticFile(source, destination, relative, tolerateDisappearance);
+  }
+
+  private static void copyDiagnosticFile(
+      Path source, Path destination, Path relative, boolean tolerateDisappearance)
+      throws IOException {
+    Path target = destination.resolve(relative).normalize();
+    if (!target.startsWith(destination) || target.equals(destination)) {
+      throw new IOException("Refusing diagnostic path outside " + destination);
+    }
+    Path targetParent = target.getParent();
+    prepareDiagnosticDirectories(destination, targetParent);
+    if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)
+        && (Files.isSymbolicLink(target)
+            || !Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS))) {
+      throw new IOException("Refusing unsafe diagnostic target " + target);
+    }
+    if (Files.isSymbolicLink(source) || !Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)) {
+      if (tolerateDisappearance && Files.notExists(source, LinkOption.NOFOLLOW_LINKS)) {
+        return;
+      }
+      throw new IOException("Refusing unsafe diagnostic source " + source);
+    }
+
+    Path temporary = Files.createTempFile(targetParent, ".ccm-diagnostic-", ".tmp");
+    try {
+      try (java.nio.channels.SeekableByteChannel channel =
+              Files.newByteChannel(source, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
+          InputStream input = Channels.newInputStream(channel);
+          OutputStream output =
+              Files.newOutputStream(temporary, StandardOpenOption.TRUNCATE_EXISTING)) {
+        input.transferTo(output);
+      } catch (NoSuchFileException disappeared) {
+        if (tolerateDisappearance) {
+          return;
+        }
+        throw disappeared;
+      }
+      try {
+        Files.move(
+            temporary, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+      } catch (AtomicMoveNotSupportedException ignored) {
+        Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+      }
+    } finally {
+      Files.deleteIfExists(temporary);
+    }
+  }
+
+  private static void prepareDiagnosticDirectories(Path root, Path directory) throws IOException {
+    if (root.equals(directory)) {
+      return;
+    }
+    Path relative = root.relativize(directory);
+    Path current = root;
+    for (Path segment : relative) {
+      Path child = current.resolve(segment);
+      prepareDiagnosticDirectory(current, child);
+      current = child;
+    }
+  }
+
+  private static void prepareDiagnosticDirectory(Path parent, Path directory) throws IOException {
+    try {
+      Files.createDirectory(directory);
+    } catch (FileAlreadyExistsException ignored) {
+      // Validate the existing entry below without following it.
+    }
+    validateOwnedDirectory(parent, directory, "diagnostic");
+  }
+
+  private static boolean isPrivateKeyFile(Path path) {
+    String fileName = path.getFileName().toString().toLowerCase(java.util.Locale.ROOT);
+    return fileName.endsWith(".key") || fileName.endsWith(".pem");
   }
 
   private void removeByName(String instanceId, Path ccmDirectory) throws Exception {
-    reapRetainedCommandGroups(ccmDirectory);
-    Path clusterDirectory =
-        ownedClusterDirectory(ccmDirectory, instanceId).toAbsolutePath().normalize();
-    List<OwnedNodeState> ownedNodes =
-        retainNodeStates(ccmDirectory, snapshotOwnedNodes(clusterDirectory));
-    Exception removalFailure = null;
-    try {
-      runCcm(ccmDirectory, List.of("remove", "--config-dir", ccmDirectory.toString(), instanceId));
-    } catch (Exception exception) {
-      removalFailure = exception;
+    Path normalized = validateCcmDirectoryLocation(ccmDirectory, false);
+    if (!Files.exists(normalized, LinkOption.NOFOLLOW_LINKS)) {
+      return;
     }
-    if (removalFailure instanceof CcmProcessCleanupException) {
-      throw removalFailure;
+    validateOwnedDirectory(clustersDirectory, normalized, "CCM config");
+    Path clusterDirectory = ownedClusterDirectory(normalized, instanceId);
+    PathState initialState = pathState(clusterDirectory.resolve("cluster.conf"));
+    if (initialState == PathState.ABSENT) {
+      cleanupAbsentClusterState(instanceId, normalized);
+      return;
+    }
+    if (initialState == PathState.UNKNOWN) {
+      throw new IOException("Cannot determine CCM cluster state for '" + instanceId + "'");
+    }
+    validateClusterMetadataIfPresent(clusterDirectory, instanceId);
+    prepareClusterProcessReferencesForCcm(clusterDirectory);
+
+    Exception commandFailure = null;
+    try {
+      runCcm(normalized, List.of("remove", "--config-dir", normalized.toString(), instanceId));
+    } catch (Exception exception) {
+      commandFailure = exception;
     }
 
+    boolean clusterRemoved;
     try {
-      if (!clusterStateExists(instanceId, ccmDirectory)) {
-        reapOwnedNodes(ownedNodes);
-        cleanupAbsentClusterState(instanceId, ccmDirectory);
-        clearRetainedNodeStates(ccmDirectory, null);
-        restoreRemovalInterrupt(removalFailure);
-        return;
+      clusterRemoved = !clusterStateExists(instanceId, normalized);
+    } catch (Exception verificationFailure) {
+      if (commandFailure != null) {
+        verificationFailure.addSuppressed(commandFailure);
       }
-    } catch (Exception stateException) {
-      if (removalFailure != null && removalFailure != stateException) {
-        stateException.addSuppressed(removalFailure);
-      }
-      throw stateException;
+      throw verificationFailure;
     }
-    if (removalFailure != null) {
-      throw removalFailure;
+    if (clusterRemoved) {
+      if (commandFailure instanceof CcmProcessCleanupException) {
+        throw commandFailure;
+      }
+      cleanupAbsentClusterState(instanceId, normalized);
+      restoreRemovalInterrupt(commandFailure);
+      return;
+    }
+    if (commandFailure != null) {
+      throw commandFailure;
     }
     throw new IOException("CCM reported success but cluster '" + instanceId + "' still exists");
   }
 
   private void removeNodeByName(Path ccmDirectory, String nodeName) throws Exception {
-    reapRetainedCommandGroups(ccmDirectory);
-    Path currentClusterBefore = currentClusterDirectory(ccmDirectory);
-    OwnedNodeState ownedNode = null;
-    if (currentClusterBefore != null) {
-      Path nodeDirectory = ownedChild(currentClusterBefore, nodeName);
-      PathState nodeState = pathState(nodeDirectory);
-      if (nodeState == PathState.PRESENT) {
-        ownedNode = snapshotOwnedNode(nodeDirectory);
-      } else if (nodeState == PathState.UNKNOWN) {
-        throw new IOException("Cannot determine CCM node state at " + nodeDirectory);
-      }
+    Path normalized = requireOwnedCcmDirectory(ccmDirectory);
+    if (!nodeStateExists(normalized, nodeName)) {
+      return;
     }
-    List<OwnedNodeState> ownedNodes =
-        retainNodeStates(ccmDirectory, ownedNode == null ? List.of() : List.of(ownedNode));
-    ownedNode =
-        ownedNodes.stream()
-            .filter(state -> state.directory.getFileName().toString().equals(nodeName))
-            .findFirst()
-            .orElse(null);
-    Exception removalFailure = null;
+    Path clusterDirectory = currentClusterDirectory(normalized);
+    if (clusterDirectory == null) {
+      return;
+    }
+    prepareNodeProcessReferencesForCcm(clusterDirectory, nodeName);
+
+    Exception commandFailure = null;
     try {
-      runCcm(ccmDirectory, List.of(nodeName, "remove", "--config-dir", ccmDirectory.toString()));
+      runCcm(normalized, List.of(nodeName, "remove", "--config-dir", normalized.toString()));
     } catch (Exception exception) {
-      removalFailure = exception;
-    }
-    if (removalFailure instanceof CcmProcessCleanupException) {
-      throw removalFailure;
+      commandFailure = exception;
     }
 
-    Path currentCluster = currentClusterDirectory(ccmDirectory);
-    Path verificationCluster = currentCluster == null ? currentClusterBefore : currentCluster;
-    if (verificationCluster != null
-        && pathState(verificationCluster.resolve(nodeName)) == PathState.ABSENT) {
-      if (ownedNode != null) {
-        reapOwnedNode(ownedNode);
+    boolean nodeRemoved;
+    try {
+      nodeRemoved = !nodeStateExists(normalized, nodeName);
+    } catch (Exception verificationFailure) {
+      if (commandFailure != null) {
+        verificationFailure.addSuppressed(commandFailure);
       }
-      clearRetainedNodeStates(ccmDirectory, nodeName);
-      restoreRemovalInterrupt(removalFailure);
+      throw verificationFailure;
+    }
+    if (nodeRemoved) {
+      if (commandFailure instanceof CcmProcessCleanupException) {
+        throw commandFailure;
+      }
+      restoreRemovalInterrupt(commandFailure);
       return;
     }
-    if (verificationCluster != null
-        && pathState(verificationCluster.resolve("cluster.conf")) == PathState.PRESENT
-        && nodeAbsentFromClusterMetadata(verificationCluster, nodeName)) {
-      if (ownedNode != null) {
-        reapOwnedNode(ownedNode);
-      }
-      Path nodeDirectory = ownedChild(verificationCluster, nodeName);
-      deleteRecursively(nodeDirectory);
-      if (pathState(nodeDirectory) != PathState.ABSENT) {
-        throw new IOException("Node directory remains after fallback cleanup: " + nodeDirectory);
-      }
-      clearRetainedNodeStates(ccmDirectory, nodeName);
-      restoreRemovalInterrupt(removalFailure);
-      return;
-    }
-    if (removalFailure != null) {
-      throw removalFailure;
+    if (commandFailure != null) {
+      throw commandFailure;
     }
     throw new IOException("CCM reported success but node '" + nodeName + "' still exists");
+  }
+
+  private boolean nodeStateExists(Path ccmDirectory, String nodeName) throws IOException {
+    Path clusterDirectory = currentClusterDirectory(ccmDirectory);
+    if (clusterDirectory == null) {
+      return false;
+    }
+    validateClusterMetadataIfPresent(clusterDirectory, clusterDirectory.getFileName().toString());
+    Path nodeDirectory = ownedChild(clusterDirectory, nodeName);
+    PathState directoryState = pathState(nodeDirectory);
+    if (directoryState == PathState.UNKNOWN) {
+      throw new IOException("Cannot determine CCM node state at " + nodeDirectory);
+    }
+    if (directoryState == PathState.PRESENT) {
+      validateOwnedDirectory(clusterDirectory, nodeDirectory, "node");
+    }
+    return directoryState == PathState.PRESENT
+        || !nodeAbsentFromClusterMetadata(clusterDirectory, nodeName);
   }
 
   private static void restoreRemovalInterrupt(Exception removalFailure) {
@@ -1810,218 +1896,62 @@ class CcmProvisioner {
     }
   }
 
-  private static final class OwnedProcess {
-    final long pid;
-    final Optional<Long> startTicks;
-
-    OwnedProcess(ProcessHandle process) {
-      this.pid = process.pid();
-      this.startTicks = readProcessStartTicks(process.pid());
+  private static void validateClusterMetadataIfPresent(Path clusterDirectory, String expectedName)
+      throws IOException {
+    Path clusterConfig = clusterDirectory.resolve("cluster.conf");
+    PathState state = pathState(clusterConfig);
+    if (state == PathState.ABSENT) {
+      return;
     }
-  }
-
-  private static final class QuarantinedReference {
-    final Path original;
-    final Path quarantine;
-    final Path claimed;
-    final Path prepared;
-
-    QuarantinedReference(Path original, Path quarantine, Path claimed, Path prepared) {
-      this.original = original;
-      this.quarantine = quarantine;
-      this.claimed = claimed;
-      this.prepared = prepared;
+    if (state == PathState.UNKNOWN) {
+      throw new IOException("Cannot determine CCM cluster configuration state at " + clusterConfig);
     }
-  }
-
-  private static final class RetainedCommandGroup {
-    final long processGroup;
-    final Path ccmDirectory;
-    final List<OwnedProcess> observedProcesses;
-    final boolean completeIdentitySnapshot;
-
-    RetainedCommandGroup(
-        long processGroup,
-        Path ccmDirectory,
-        List<OwnedProcess> observedProcesses,
-        boolean completeIdentitySnapshot) {
-      this.processGroup = processGroup;
-      this.ccmDirectory = ccmDirectory;
-      this.observedProcesses = observedProcesses;
-      this.completeIdentitySnapshot = completeIdentitySnapshot;
+    Map<String, Object> config = readYamlMap(clusterConfig);
+    if (!expectedName.equals(config.get("name"))) {
+      throw new IOException("CCM cluster configuration has an unexpected name: " + clusterConfig);
     }
-  }
-
-  private static final class OwnedNodeState {
-    final Path directory;
-    final List<OwnedProcess> processes;
-
-    OwnedNodeState(Path directory, List<OwnedProcess> processes) {
-      this.directory = directory;
-      this.processes = processes;
+    Object configuredNodes = config.get("nodes");
+    if (!(configuredNodes instanceof Iterable)) {
+      throw new IOException("Invalid nodes list in " + clusterConfig);
     }
-  }
-
-  private List<OwnedNodeState> retainNodeStates(
-      Path ccmDirectory, List<OwnedNodeState> discovered) {
-    Path key = ccmDirectory.toAbsolutePath().normalize();
-    synchronized (retainedNodeStates) {
-      Map<Path, List<OwnedProcess>> merged = new LinkedHashMap<>();
-      for (OwnedNodeState state : retainedNodeStates.getOrDefault(key, List.of())) {
-        merged.put(state.directory, new ArrayList<>(state.processes));
+    Set<String> nodeNames = new HashSet<>();
+    for (Object configuredNode : (Iterable<?>) configuredNodes) {
+      if (!(configuredNode instanceof String) || !isCcmNodeName((String) configuredNode)) {
+        throw new IOException("Unsafe node name in " + clusterConfig + ": " + configuredNode);
       }
-      for (OwnedNodeState state : discovered) {
-        List<OwnedProcess> processes =
-            merged.computeIfAbsent(state.directory, ignored -> new ArrayList<>());
-        for (OwnedProcess process : state.processes) {
-          if (processes.stream()
-              .noneMatch(
-                  existing ->
-                      existing.pid == process.pid
-                          && Objects.equals(existing.startTicks, process.startTicks))) {
-            processes.add(process);
-          }
-        }
+      String nodeName = (String) configuredNode;
+      if (!nodeNames.add(nodeName)) {
+        throw new IOException("Duplicate node name in " + clusterConfig + ": " + nodeName);
       }
-      List<OwnedNodeState> retained = new ArrayList<>();
-      merged.forEach(
-          (directory, processes) -> retained.add(new OwnedNodeState(directory, processes)));
-      if (retained.isEmpty()) {
-        retainedNodeStates.remove(key);
-      } else {
-        retainedNodeStates.put(key, retained);
-      }
-      return new ArrayList<>(retained);
-    }
-  }
-
-  private void clearRetainedNodeStates(Path ccmDirectory, String nodeName) {
-    Path key = ccmDirectory.toAbsolutePath().normalize();
-    synchronized (retainedNodeStates) {
-      if (nodeName == null) {
-        retainedNodeStates.remove(key);
-        return;
-      }
-      List<OwnedNodeState> retained = retainedNodeStates.get(key);
-      if (retained == null) {
-        return;
-      }
-      retained.removeIf(state -> state.directory.getFileName().toString().equals(nodeName));
-      if (retained.isEmpty()) {
-        retainedNodeStates.remove(key);
-      }
-    }
-  }
-
-  private static List<OwnedNodeState> snapshotOwnedNodes(Path clusterDirectory) throws IOException {
-    List<OwnedNodeState> result = new ArrayList<>();
-    if (!Files.isDirectory(clusterDirectory, LinkOption.NOFOLLOW_LINKS)) {
-      return result;
-    }
-    try (java.nio.file.DirectoryStream<Path> entries = Files.newDirectoryStream(clusterDirectory)) {
-      for (Path entry : entries) {
-        if (Files.isDirectory(entry, LinkOption.NOFOLLOW_LINKS)
-            && entry.getFileName().toString().startsWith("node")) {
-          result.add(snapshotOwnedNode(entry));
+      Path nodeDirectory = ownedChild(clusterDirectory, nodeName);
+      if (Files.exists(nodeDirectory, LinkOption.NOFOLLOW_LINKS)) {
+        validateOwnedDirectory(clusterDirectory, nodeDirectory, "node");
+        Path nodeConfig = nodeDirectory.resolve("node.conf");
+        if (Files.exists(nodeConfig, LinkOption.NOFOLLOW_LINKS)) {
+          validateNativeNodeMetadata(readYamlMap(nodeConfig), nodeDirectory);
         }
       }
     }
-    return result;
-  }
-
-  private static OwnedNodeState snapshotOwnedNode(Path nodeDirectory) throws IOException {
-    if (Files.isSymbolicLink(nodeDirectory)) {
-      throw new IOException("Refusing symlinked CCM node directory " + nodeDirectory);
-    }
-    sanitizeAndReapNode(nodeDirectory);
-    return new OwnedNodeState(nodeDirectory.toAbsolutePath().normalize(), List.of());
-  }
-
-  private static void reapOwnedNodes(List<OwnedNodeState> nodes) throws IOException {
-    IOException failure = null;
-    for (OwnedNodeState node : nodes) {
-      try {
-        reapOwnedNode(node);
-      } catch (IOException exception) {
-        if (failure == null) {
-          failure = exception;
-        } else {
-          failure.addSuppressed(exception);
+    Object configuredSeeds = config.get("seeds");
+    if (configuredSeeds instanceof Iterable) {
+      for (Object seed : (Iterable<?>) configuredSeeds) {
+        if (!(seed instanceof String) || !nodeNames.contains(seed)) {
+          throw new IOException("Unsafe seed name in " + clusterConfig + ": " + seed);
         }
       }
     }
-    if (failure != null) {
-      throw failure;
-    }
   }
 
-  private static void reapOwnedNode(OwnedNodeState node) throws IOException {
-    for (OwnedProcess owned : node.processes) {
-      Optional<ProcessHandle> current = ProcessHandle.of(owned.pid);
-      if (current.isEmpty() || !isProcessAlive(current.get())) {
-        continue;
-      }
-      if (!sameProcess(owned, current.get())) {
-        continue;
-      }
-      if (!nodeProcessBelongsTo(current.get(), node.directory)) {
-        throw new IOException("PID " + owned.pid + " changed ownership during CCM cleanup");
-      }
-      current.get().destroy();
-    }
-    waitForOwnedProcesses(node.processes, PROCESS_TERMINATION_GRACE);
-    for (OwnedProcess owned : node.processes) {
-      Optional<ProcessHandle> current = ProcessHandle.of(owned.pid);
-      if (current.isPresent()
-          && isProcessAlive(current.get())
-          && sameProcess(owned, current.get())) {
-        if (!nodeProcessBelongsTo(current.get(), node.directory)) {
-          throw new IOException("PID " + owned.pid + " changed ownership during CCM cleanup");
-        }
-        current.get().destroyForcibly();
-      }
-    }
-    waitForOwnedProcesses(node.processes, PROCESS_KILL_TIMEOUT);
-    List<Long> survivors = new ArrayList<>();
-    for (OwnedProcess owned : node.processes) {
-      if (ownedProcessStillAlive(owned)) {
-        survivors.add(owned.pid);
-      }
-    }
-    if (!survivors.isEmpty()) {
-      throw new IOException("Scylla node processes survived cleanup: " + survivors);
-    }
+  private static boolean isCcmNodeName(String name) {
+    return name.matches("node[1-9][0-9]*");
   }
 
-  private static void waitForOwnedProcesses(List<OwnedProcess> processes, Duration timeout) {
-    boolean interrupted = false;
-    long deadline = System.nanoTime() + timeout.toNanos();
-    while (System.nanoTime() < deadline) {
-      boolean anyAlive = processes.stream().anyMatch(CcmProvisioner::ownedProcessStillAlive);
-      if (!anyAlive) {
-        return;
-      }
-      try {
-        Thread.sleep(20);
-      } catch (InterruptedException ignored) {
-        interrupted = true;
-      }
+  private static void validateNativeNodeMetadata(Map<String, Object> config, Path nodeDirectory)
+      throws IOException {
+    String expectedName = nodeDirectory.getFileName().toString();
+    if (!expectedName.equals(config.get("name")) || config.containsKey("docker_id")) {
+      throw new IOException("Unsafe CCM node configuration: " + nodeDirectory.resolve("node.conf"));
     }
-    if (interrupted) {
-      Thread.currentThread().interrupt();
-    }
-  }
-
-  private static boolean ownedProcessStillAlive(OwnedProcess expected) {
-    Optional<ProcessHandle> current = ProcessHandle.of(expected.pid);
-    if (current.isEmpty() || !isProcessAlive(current.get())) {
-      return false;
-    }
-    Optional<Long> currentStart = readProcessStartTicks(expected.pid);
-    if (expected.startTicks.isEmpty() || currentStart.isEmpty()) {
-      return true;
-    }
-    return expected.startTicks.equals(currentStart);
   }
 
   @SuppressWarnings("unchecked")
@@ -2042,8 +1972,12 @@ class CcmProvisioner {
   }
 
   private boolean clusterStateExists(String instanceId, Path ccmDirectory) throws IOException {
-    return pathState(ownedClusterDirectory(ccmDirectory, instanceId).resolve("cluster.conf"))
-        != PathState.ABSENT;
+    Path clusterDirectory = ownedClusterDirectory(ccmDirectory, instanceId);
+    PathState state = pathState(clusterDirectory.resolve("cluster.conf"));
+    if (state == PathState.UNKNOWN) {
+      throw new IOException("Cannot determine CCM cluster state for '" + instanceId + "'");
+    }
+    return state == PathState.PRESENT;
   }
 
   private Path currentClusterDirectory(Path ccmDirectory) throws IOException {
@@ -2056,6 +1990,7 @@ class CcmProvisioner {
     if (currentState == PathState.UNKNOWN) {
       throw new IOException("Unable to determine CCM CURRENT state under " + ccmDirectory);
     }
+    rejectSymlink(currentPath);
     String current = Files.readString(currentPath, StandardCharsets.UTF_8).trim();
     if (current.isEmpty()) {
       return null;
@@ -2069,26 +2004,33 @@ class CcmProvisioner {
     if (!Files.exists(clusterDirectory, LinkOption.NOFOLLOW_LINKS)) {
       return clusterDirectory;
     }
-    if (Files.isSymbolicLink(clusterDirectory)
-        || !Files.isDirectory(clusterDirectory, LinkOption.NOFOLLOW_LINKS)) {
-      throw new IOException("Refusing unsafe CCM cluster directory " + clusterDirectory);
-    }
-    Path realParent = clusterDirectory.toRealPath().getParent();
-    if (!ccmDirectory.equals(realParent)) {
-      throw new IOException(
-          "Refusing CCM cluster outside its config directory: " + clusterDirectory);
-    }
+    validateOwnedDirectory(ccmDirectory, clusterDirectory, "cluster");
     return clusterDirectory;
   }
 
-  private Path requireOwnedCcmDirectory(Path ccmDirectory) throws IOException {
+  private Path validateCcmDirectoryLocation(Path ccmDirectory, boolean requireExists)
+      throws IOException {
     validateOwnedDirectory(runDirectory, clustersDirectory, "clusters");
     Path normalized = ccmDirectory.toAbsolutePath().normalize();
     if (!clustersDirectory.equals(normalized.getParent())) {
       throw new IOException("Refusing CCM config outside run state: " + ccmDirectory);
     }
+    PathState state = pathState(normalized);
+    if (state == PathState.UNKNOWN) {
+      throw new IOException("Cannot determine CCM config state: " + ccmDirectory);
+    }
+    if (state == PathState.ABSENT) {
+      if (requireExists) {
+        throw new IOException("CCM config directory does not exist: " + ccmDirectory);
+      }
+      return normalized;
+    }
     validateOwnedDirectory(clustersDirectory, normalized, "CCM config");
     return normalized;
+  }
+
+  private Path requireOwnedCcmDirectory(Path ccmDirectory) throws IOException {
+    return validateCcmDirectoryLocation(ccmDirectory, true);
   }
 
   private static void validateOwnedDirectory(Path parent, Path directory, String description)
@@ -2112,33 +2054,20 @@ class CcmProvisioner {
     deleteRecursively(clusterDirectory);
 
     Path currentPath = ccmDirectory.resolve("CURRENT");
-    if (pathState(currentPath) == PathState.PRESENT
-        && instanceId.equals(Files.readString(currentPath, StandardCharsets.UTF_8).trim())) {
-      Files.deleteIfExists(currentPath);
+    if (pathState(currentPath) == PathState.PRESENT) {
+      rejectSymlink(currentPath);
+      if (instanceId.equals(Files.readString(currentPath, StandardCharsets.UTF_8).trim())) {
+        Files.delete(currentPath);
+      }
     }
-  }
-
-  private void reapAndCleanupAbsentClusterState(String instanceId, Path ccmDirectory)
-      throws IOException {
-    try {
-      reapRetainedCommandGroups(ccmDirectory);
-    } catch (IOException exception) {
-      throw exception;
-    } catch (Exception exception) {
-      throw new IOException("Unable to reap retained CCM processes before rollback", exception);
-    }
-    Path clusterDirectory =
-        ownedClusterDirectory(ccmDirectory, instanceId).toAbsolutePath().normalize();
-    List<OwnedNodeState> ownedNodes =
-        retainNodeStates(ccmDirectory, snapshotOwnedNodes(clusterDirectory));
-    reapOwnedNodes(ownedNodes);
-    cleanupAbsentClusterState(instanceId, ccmDirectory);
-    clearRetainedNodeStates(ccmDirectory, null);
   }
 
   private static void deleteRecursively(Path root) throws IOException {
     if (pathState(root) == PathState.ABSENT) {
       return;
+    }
+    if (Files.isSymbolicLink(root)) {
+      throw new IOException("Refusing to recursively delete symlink " + root);
     }
     Files.walkFileTree(
         root,
@@ -2163,10 +2092,10 @@ class CcmProvisioner {
   }
 
   private static PathState pathState(Path path) {
-    if (Files.exists(path)) {
+    if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
       return PathState.PRESENT;
     }
-    return Files.notExists(path) ? PathState.ABSENT : PathState.UNKNOWN;
+    return Files.notExists(path, LinkOption.NOFOLLOW_LINKS) ? PathState.ABSENT : PathState.UNKNOWN;
   }
 
   private static boolean clearInterrupt(Exception exception) {
@@ -2191,7 +2120,12 @@ class CcmProvisioner {
   }
 
   private void runCcm(Path ccmDirectory, List<String> arguments) throws Exception {
-    reapRetainedCommandGroups(ccmDirectory);
+    if (!arguments.isEmpty() && !"create".equals(arguments.get(0))) {
+      Path currentCluster = currentClusterDirectory(ccmDirectory);
+      if (currentCluster != null) {
+        validateClusterMetadataIfPresent(currentCluster, currentCluster.getFileName().toString());
+      }
+    }
     List<String> command = new ArrayList<>();
     command.add(ccmExecutable);
     command.addAll(arguments);
@@ -2199,153 +2133,111 @@ class CcmProvisioner {
   }
 
   private void runCommand(Path ccmDirectory, List<String> command) throws Exception {
-    if (!System.getProperty("os.name").toLowerCase().contains("linux")) {
+    if (!System.getProperty("os.name").toLowerCase(java.util.Locale.ROOT).contains("linux")) {
       throw new UnsupportedOperationException(
           "The native scylla-ccm harness currently supports Linux only");
     }
     ccmDirectory = requireOwnedCcmDirectory(ccmDirectory);
+    String commandText = String.join(" ", command);
     Path outputPath = Files.createTempFile(ccmDirectory, "ccm-command-", ".log");
-    Process process;
+    Files.writeString(
+        outputPath,
+        "> " + commandText + "\n",
+        StandardCharsets.UTF_8,
+        java.nio.file.StandardOpenOption.TRUNCATE_EXISTING);
+
     List<String> launchedCommand = new ArrayList<>();
     launchedCommand.add("setsid");
     launchedCommand.addAll(command);
+    ProcessBuilder processBuilder =
+        new ProcessBuilder(launchedCommand)
+            .redirectErrorStream(true)
+            .redirectOutput(ProcessBuilder.Redirect.appendTo(outputPath.toFile()));
+    processBuilder.environment().put("SCYLLA_CCM_RUN_DIR", runDirectory.toString());
+
+    Process process;
     try {
-      process =
-          new ProcessBuilder(launchedCommand)
-              .redirectErrorStream(true)
-              .redirectOutput(outputPath.toFile())
-              .start();
-    } catch (IOException startException) {
+      process = processBuilder.start();
+    } catch (IOException startFailure) {
       try {
-        Files.deleteIfExists(outputPath);
-      } catch (IOException cleanupException) {
-        startException.addSuppressed(cleanupException);
+        appendCommandOutcome(outputPath, "start failed");
+        appendAggregateLog(ccmDirectory, outputPath);
+      } catch (IOException diagnosticFailure) {
+        startFailure.addSuppressed(diagnosticFailure);
       }
-      throw startException;
+      throw startFailure;
     }
-    boolean exited = false;
+
     boolean timedOut = false;
     InterruptedException interruption = null;
     Exception terminationFailure = null;
-    boolean cleanupInterrupted = false;
-    Map<Long, OwnedProcess> observedProcesses = new HashMap<>();
-    snapshotProcessTree(process.toHandle(), observedProcesses);
-    long commandDeadline = System.nanoTime() + commandTimeout.toNanos();
+    boolean exited = false;
     try {
-      while (!exited) {
-        long remainingNanos = commandDeadline - System.nanoTime();
-        if (remainingNanos <= 0) {
-          timedOut = true;
-          terminationFailure = terminateProcessGroup(process, observedProcesses, ccmDirectory);
-          cleanupInterrupted |= Thread.interrupted();
-          break;
-        }
-        long waitMillis = Math.max(1, Math.min(100, TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
-        exited = process.waitFor(waitMillis, TimeUnit.MILLISECONDS);
-        snapshotProcessTree(process.toHandle(), observedProcesses);
-      }
+      exited = process.waitFor(commandTimeout.toNanos(), TimeUnit.NANOSECONDS);
+      timedOut = !exited;
     } catch (InterruptedException exception) {
       interruption = exception;
-      snapshotProcessTree(process.toHandle(), observedProcesses);
-      terminationFailure = terminateProcessGroup(process, observedProcesses, ccmDirectory);
-      cleanupInterrupted |= Thread.interrupted();
-    }
-    if (exited && process.exitValue() != 0) {
-      terminationFailure = terminateProcessGroup(process, observedProcesses, ccmDirectory);
-      cleanupInterrupted |= Thread.interrupted();
-    }
-    long reapDeadline = System.nanoTime() + PROCESS_KILL_TIMEOUT.toNanos();
-    while (process.isAlive() && System.nanoTime() < reapDeadline) {
-      try {
-        process.waitFor(100, TimeUnit.MILLISECONDS);
-      } catch (InterruptedException exception) {
-        if (interruption == null) {
-          interruption = exception;
-        } else {
-          interruption.addSuppressed(exception);
-        }
-        Exception retryFailure = terminateProcessGroup(process, observedProcesses, ccmDirectory);
-        cleanupInterrupted |= Thread.interrupted();
-        if (terminationFailure == null) {
-          terminationFailure = retryFailure;
-        } else if (retryFailure != null && retryFailure != terminationFailure) {
-          terminationFailure.addSuppressed(retryFailure);
-        }
-      }
-    }
-    if (process.isAlive()) {
-      if (!(terminationFailure instanceof CcmProcessCleanupException)) {
-        terminationFailure =
-            new CcmProcessCleanupException(
-                "Direct CCM command process survived termination: " + process.pid());
-        retainCommandGroup(ccmDirectory, process.pid(), observedProcesses, false);
-      }
-    }
-    if (cleanupInterrupted && interruption == null) {
-      interruption = new InterruptedException("CCM command cleanup was interrupted");
     }
 
-    byte[] output;
+    if (timedOut || interruption != null || (exited && process.exitValue() != 0)) {
+      try {
+        terminateCommandProcessGroup(process);
+      } catch (Exception exception) {
+        if (exception instanceof InterruptedException) {
+          Thread.currentThread().interrupt();
+        }
+        terminationFailure =
+            exception instanceof CcmProcessCleanupException
+                ? exception
+                : new CcmProcessCleanupException(
+                    "Unable to prove cleanup of CCM command process group " + process.pid(),
+                    exception);
+      }
+    }
+
+    String outcome;
+    if (interruption != null) {
+      outcome = "interrupted";
+    } else if (timedOut) {
+      outcome = "timeout";
+    } else {
+      outcome = Integer.toString(process.exitValue());
+    }
+    IOException diagnosticFailure = null;
     try {
-      output = Files.readAllBytes(outputPath);
-    } catch (IOException outputException) {
+      appendCommandOutcome(outputPath, outcome);
+      appendAggregateLog(ccmDirectory, outputPath);
+    } catch (IOException exception) {
+      diagnosticFailure = exception;
+    }
+
+    String output;
+    try {
+      output = Files.readString(outputPath, StandardCharsets.UTF_8);
+    } catch (IOException exception) {
       if (terminationFailure != null) {
-        terminationFailure.addSuppressed(outputException);
+        terminationFailure.addSuppressed(exception);
+        if (diagnosticFailure != null) {
+          terminationFailure.addSuppressed(diagnosticFailure);
+        }
         if (interruption != null) {
           terminationFailure.addSuppressed(interruption);
           Thread.currentThread().interrupt();
         }
         throw terminationFailure;
       }
+      if (diagnosticFailure != null) {
+        exception.addSuppressed(diagnosticFailure);
+      }
       if (interruption != null) {
-        outputException.addSuppressed(interruption);
+        exception.addSuppressed(interruption);
         Thread.currentThread().interrupt();
       }
-      try {
-        Files.deleteIfExists(outputPath);
-      } catch (IOException cleanupException) {
-        outputException.addSuppressed(cleanupException);
-      }
-      throw outputException;
+      throw exception;
     }
-    String commandText = String.join(" ", command);
-    String outcome =
-        interruption != null
-            ? "interrupted"
-            : timedOut ? "timeout" : Integer.toString(process.exitValue());
-    String log =
-        "> "
-            + commandText
-            + "\n"
-            + new String(output, StandardCharsets.UTF_8)
-            + "[exit "
-            + outcome
-            + "]\n";
-    IOException diagnosticFailure = null;
-    try {
-      Files.writeString(
-          ccmDirectory.resolve("ccm-commands.log"),
-          log,
-          StandardCharsets.UTF_8,
-          java.nio.file.StandardOpenOption.CREATE,
-          java.nio.file.StandardOpenOption.APPEND);
-      System.out.print(log);
-    } catch (IOException exception) {
-      diagnosticFailure = exception;
-    }
-    try {
-      Files.deleteIfExists(outputPath);
-    } catch (IOException exception) {
-      if (diagnosticFailure == null) {
-        diagnosticFailure = exception;
-      } else {
-        diagnosticFailure.addSuppressed(exception);
-      }
-    }
+    System.out.print(output);
+
     if (interruption != null) {
-      if (diagnosticFailure != null) {
-        interruption.addSuppressed(diagnosticFailure);
-      }
       if (terminationFailure != null) {
         terminationFailure.addSuppressed(interruption);
         if (diagnosticFailure != null) {
@@ -2353,6 +2245,9 @@ class CcmProvisioner {
         }
         Thread.currentThread().interrupt();
         throw terminationFailure;
+      }
+      if (diagnosticFailure != null) {
+        interruption.addSuppressed(diagnosticFailure);
       }
       Thread.currentThread().interrupt();
       throw interruption;
@@ -2363,475 +2258,267 @@ class CcmProvisioner {
       }
       throw terminationFailure;
     }
-    if (!exited || process.exitValue() != 0) {
-      CcmCommandException commandException =
-          new CcmCommandException(
-              commandText,
-              timedOut ? -1 : process.exitValue(),
-              new String(output, StandardCharsets.UTF_8));
+    if (timedOut || process.exitValue() != 0) {
+      CcmCommandException commandFailure =
+          new CcmCommandException(commandText, timedOut ? -1 : process.exitValue(), output);
       if (diagnosticFailure != null) {
-        commandException.addSuppressed(diagnosticFailure);
+        commandFailure.addSuppressed(diagnosticFailure);
       }
-      throw commandException;
+      throw commandFailure;
     }
     if (diagnosticFailure != null) {
       throw diagnosticFailure;
     }
   }
 
-  private Exception terminateProcessGroup(
-      Process process, Map<Long, OwnedProcess> previouslyObserved, Path ccmDirectory) {
-    Map<Long, OwnedProcess> owned = new HashMap<>(previouslyObserved);
-    snapshotProcessTree(process.toHandle(), owned);
+  void terminateCommandProcessGroup(Process process) throws Exception {
+    terminateProcessGroup(process);
+  }
+
+  private static void appendCommandOutcome(Path outputPath, String outcome) throws IOException {
+    Files.writeString(
+        outputPath,
+        "[exit " + outcome + "]\n",
+        StandardCharsets.UTF_8,
+        java.nio.file.StandardOpenOption.APPEND);
+  }
+
+  private static void appendAggregateLog(Path ccmDirectory, Path outputPath) throws IOException {
+    Files.writeString(
+        ccmDirectory.resolve("ccm-commands.log"),
+        Files.readString(outputPath, StandardCharsets.UTF_8),
+        StandardCharsets.UTF_8,
+        java.nio.file.StandardOpenOption.CREATE,
+        java.nio.file.StandardOpenOption.APPEND);
+  }
+
+  private static void terminateProcessGroup(Process process) throws Exception {
+    long processGroup = process.pid();
+    boolean restoreInterrupt = Thread.interrupted();
+    Exception failure = null;
     try {
-      Set<ProcessHandle> initialGroup =
-          verifiedGroupMembers(process.pid(), owned, ccmDirectory, false);
-      initialGroup.forEach(member -> rememberProcess(member, owned));
-      if (!initialGroup.isEmpty()) {
-        signalProcessGroup(process.pid(), "TERM");
-      }
-    } catch (Exception exception) {
-      retainCommandGroup(ccmDirectory, process.pid(), owned, false);
-      CcmProcessCleanupException cleanupFailure =
-          new CcmProcessCleanupException(
-              "Unable to capture the initial CCM process group " + process.pid());
-      cleanupFailure.addSuppressed(exception);
-      return cleanupFailure;
-    }
-    waitForProcesses(currentObservedProcesses(owned), PROCESS_TERMINATION_GRACE);
-    waitForProcessGroup(process.pid(), PROCESS_TERMINATION_GRACE);
-    snapshotProcessTree(process.toHandle(), owned);
-    Set<ProcessHandle> remainingObserved = currentObservedProcesses(owned);
-    Set<ProcessHandle> remainingGroup;
-    try {
-      remainingGroup = verifiedGroupMembers(process.pid(), owned, ccmDirectory, false);
-      remainingGroup.forEach(member -> rememberProcess(member, owned));
-    } catch (Exception exception) {
-      retainCommandGroup(ccmDirectory, process.pid(), owned, false);
-      CcmProcessCleanupException cleanupFailure =
-          new CcmProcessCleanupException(
-              "Unable to verify CCM process group " + process.pid() + " during termination");
-      cleanupFailure.addSuppressed(exception);
-      return cleanupFailure;
-    }
-    if (!remainingGroup.isEmpty() || !remainingObserved.isEmpty()) {
       try {
-        if (!remainingGroup.isEmpty()) {
-          signalProcessGroup(process.pid(), "KILL");
-        }
+        signalProcessGroup(processGroup, "TERM");
       } catch (Exception exception) {
-        retainCommandGroup(ccmDirectory, process.pid(), owned, false);
-        CcmProcessCleanupException cleanupFailure =
-            new CcmProcessCleanupException("Unable to kill CCM process group " + process.pid());
-        cleanupFailure.addSuppressed(exception);
-        return cleanupFailure;
+        failure = exception;
       }
-      remainingObserved.stream()
-          .filter(CcmProvisioner::isProcessAlive)
-          .sorted(Comparator.comparingLong(ProcessHandle::pid).reversed())
-          .forEach(ProcessHandle::destroyForcibly);
-      waitForProcesses(currentObservedProcesses(owned), PROCESS_KILL_TIMEOUT);
-      waitForProcessGroup(process.pid(), PROCESS_KILL_TIMEOUT);
-    }
-    List<Long> survivors = new ArrayList<>();
-    for (OwnedProcess observed : owned.values()) {
-      if (ownedProcessStillAlive(observed)) {
-        survivors.add(observed.pid);
-      }
-    }
-    try {
-      Set<ProcessHandle> finalGroup =
-          verifiedGroupMembers(process.pid(), owned, ccmDirectory, false);
-      finalGroup.forEach(member -> rememberProcess(member, owned));
-      survivors.addAll(
-          finalGroup.stream()
-              .map(ProcessHandle::pid)
-              .filter(pid -> !survivors.contains(pid))
-              .collect(java.util.stream.Collectors.toList()));
-    } catch (Exception exception) {
-      retainCommandGroup(ccmDirectory, process.pid(), owned, false);
-      CcmProcessCleanupException cleanupFailure =
-          new CcmProcessCleanupException(
-              "Unable to verify that CCM process group " + process.pid() + " exited");
-      cleanupFailure.addSuppressed(exception);
-      return cleanupFailure;
-    }
-    if (!survivors.isEmpty()) {
-      IOException survivorFailure =
-          new CcmProcessCleanupException(
-              "CCM command processes survived termination: " + survivors);
-      retainCommandGroup(ccmDirectory, process.pid(), owned, true);
-      return survivorFailure;
-    }
-    return null;
-  }
-
-  private void retainCommandGroup(
-      Path ccmDirectory,
-      long processGroup,
-      Map<Long, OwnedProcess> observedProcesses,
-      boolean completeIdentitySnapshot) {
-    Path key = ccmDirectory.toAbsolutePath().normalize();
-    List<OwnedProcess> observed = new ArrayList<>(observedProcesses.values());
-    synchronized (retainedCommandGroups) {
-      List<RetainedCommandGroup> groups =
-          retainedCommandGroups.computeIfAbsent(key, ignored -> new ArrayList<>());
-      for (int index = 0; index < groups.size(); index++) {
-        RetainedCommandGroup existing = groups.get(index);
-        if (existing.processGroup == processGroup) {
-          Map<Long, OwnedProcess> merged = new LinkedHashMap<>();
-          boolean identitiesComplete = completeIdentitySnapshot;
-          for (OwnedProcess process : existing.observedProcesses) {
-            merged.put(process.pid, process);
-            identitiesComplete &= process.startTicks.isPresent();
+      restoreInterrupt |= waitForProcessGroup(processGroup, PROCESS_TERMINATION_GRACE);
+      if (processGroupHasLiveMembers(processGroup)) {
+        try {
+          signalProcessGroup(processGroup, "KILL");
+        } catch (Exception exception) {
+          if (failure == null) {
+            failure = exception;
+          } else {
+            failure.addSuppressed(exception);
           }
-          for (OwnedProcess process : observed) {
-            OwnedProcess previous = merged.putIfAbsent(process.pid, process);
-            identitiesComplete &= process.startTicks.isPresent();
-            if (previous != null
-                && (!previous.startTicks.isPresent()
-                    || !previous.startTicks.equals(process.startTicks))) {
-              // An identity that could not be captured, or a reused PID, can never be upgraded
-              // into a complete snapshot after the fact.
-              identitiesComplete = false;
-            }
-          }
-          groups.set(
-              index,
-              new RetainedCommandGroup(
-                  processGroup,
-                  key,
-                  new ArrayList<>(merged.values()),
-                  existing.completeIdentitySnapshot && identitiesComplete));
-          return;
         }
+        restoreInterrupt |= waitForProcessGroup(processGroup, PROCESS_KILL_TIMEOUT);
       }
-      completeIdentitySnapshot &=
-          observed.stream().allMatch(process -> process.startTicks.isPresent());
-      groups.add(new RetainedCommandGroup(processGroup, key, observed, completeIdentitySnapshot));
-    }
-  }
-
-  private Set<ProcessHandle> verifiedGroupMembers(
-      long processGroup,
-      Map<Long, OwnedProcess> observed,
-      Path ccmDirectory,
-      boolean allowReusedGroup)
-      throws IOException {
-    Set<ProcessHandle> observedCurrent = currentObservedProcesses(observed);
-    Set<ProcessHandle> verified = new HashSet<>();
-    List<ProcessHandle> members = processesInGroup(processGroup);
-    boolean hasObservedAnchor = members.stream().anyMatch(observedCurrent::contains);
-    boolean hasRecognizedAnchor = false;
-    if (members.isEmpty()) {
-      // An empty /proc group scan is definitive even when an earlier identity snapshot was
-      // incomplete: there is no numeric process group left to retain or accidentally signal.
-      return verified;
-    }
-    if (!hasObservedAnchor) {
-      for (ProcessHandle member : members) {
-        if (commandProcessBelongsTo(member, ccmDirectory)) {
-          hasRecognizedAnchor = true;
-          break;
-        }
-      }
-    }
-    if (!hasObservedAnchor && !hasRecognizedAnchor) {
-      if (allowReusedGroup) {
-        // The old process group number was reused after every retained process exited.
-        return verified;
-      }
-      throw new IOException(
-          "Cannot distinguish retained process group " + processGroup + " from a reused group");
-    }
-    verified.addAll(members);
-    return verified;
-  }
-
-  private boolean commandProcessBelongsTo(ProcessHandle process, Path ccmDirectory)
-      throws IOException {
-    Path expectedDirectory = ccmDirectory.toAbsolutePath().normalize();
-    String directoryPrefix = expectedDirectory + "/";
-    List<String> arguments = readProcessArguments(process);
-    if (arguments.isEmpty()) {
-      return false;
-    }
-    boolean referencesDirectory =
-        arguments.stream()
-            .anyMatch(
-                argument ->
-                    argument.equals(expectedDirectory.toString())
-                        || argument.startsWith(directoryPrefix));
-    if (!referencesDirectory) {
-      return false;
-    }
-    for (int index = 0; index < arguments.size(); index++) {
-      String argument = arguments.get(index);
-      String fileName;
-      try {
-        Path argumentPath = Path.of(argument);
-        Path name = argumentPath.getFileName();
-        fileName = name == null ? argument : name.toString();
-      } catch (RuntimeException ignored) {
-        fileName = argument;
-      }
-      if (index <= 1 && (argument.equals(ccmExecutable) || fileName.equals("ccm"))) {
-        return true;
-      }
-    }
-    String executable = arguments.get(0);
-    String executableName;
-    try {
-      Path name = Path.of(executable).getFileName();
-      executableName = name == null ? executable : name.toString();
-    } catch (RuntimeException ignored) {
-      executableName = executable;
-    }
-    if ("openssl".equals(executableName)
-        || (executable.startsWith(directoryPrefix) && executable.endsWith("/bin/scylla"))) {
-      return true;
-    }
-    if (executable.startsWith(directoryPrefix) && executable.endsWith("/bin/symlinks/scylla-jmx")) {
-      return hasCcmJmxJarOperand(arguments, directoryPrefix);
-    }
-    if ("java".equals(executableName) && hasCcmJmxJarOperand(arguments, directoryPrefix)) {
-      return true;
-    }
-    if (!"scylla-manager-agent".equals(executableName)) {
-      return false;
-    }
-    for (int index = 1; index + 1 < arguments.size(); index++) {
-      String config = arguments.get(index + 1);
-      if ("--config-file".equals(arguments.get(index))
-          && config.startsWith(directoryPrefix)
-          && config.endsWith("/conf/scylla-manager-agent.yaml")) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static boolean hasCcmJmxJarOperand(List<String> arguments, String directoryPrefix) {
-    for (int index = 1; index + 1 < arguments.size(); index++) {
-      String jar = arguments.get(index + 1);
-      if ("-jar".equals(arguments.get(index))
-          && jar.startsWith(directoryPrefix)
-          && jar.contains("/bin/scylla-jmx-")
-          && jar.endsWith(".jar")) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private void reapRetainedCommandGroups(Path ccmDirectory) throws Exception {
-    Path key = ccmDirectory.toAbsolutePath().normalize();
-    List<RetainedCommandGroup> groups;
-    synchronized (retainedCommandGroups) {
-      groups = new ArrayList<>(retainedCommandGroups.getOrDefault(key, List.of()));
-    }
-    for (RetainedCommandGroup group : groups) {
-      try {
-        reapRetainedCommandGroup(group);
-      } catch (CcmProcessCleanupException exception) {
-        throw exception;
-      } catch (Exception exception) {
-        CcmProcessCleanupException cleanupFailure =
+      restoreInterrupt |= waitForDirectProcess(process, PROCESS_KILL_TIMEOUT);
+      if (processGroupHasLiveMembers(processGroup) || process.isAlive()) {
+        CcmProcessCleanupException survivors =
             new CcmProcessCleanupException(
-                "Unable to reap retained CCM process group " + group.processGroup);
-        cleanupFailure.addSuppressed(exception);
-        throw cleanupFailure;
-      }
-      synchronized (retainedCommandGroups) {
-        List<RetainedCommandGroup> retained = retainedCommandGroups.get(key);
-        if (retained != null) {
-          retained.removeIf(candidate -> candidate.processGroup == group.processGroup);
-          if (retained.isEmpty()) {
-            retainedCommandGroups.remove(key);
-          }
+                "CCM command process group " + processGroup + " survived termination");
+        if (failure != null) {
+          survivors.addSuppressed(failure);
         }
+        throw survivors;
       }
-    }
-  }
-
-  private void reapRetainedCommandGroup(RetainedCommandGroup group) throws Exception {
-    Map<Long, OwnedProcess> observed = new HashMap<>();
-    for (OwnedProcess process : group.observedProcesses) {
-      observed.put(process.pid, process);
-    }
-    Set<ProcessHandle> owned = currentObservedProcesses(observed);
-    Set<ProcessHandle> groupMembers =
-        verifiedGroupMembers(
-            group.processGroup, observed, group.ccmDirectory, group.completeIdentitySnapshot);
-    owned.addAll(groupMembers);
-    if (!groupMembers.isEmpty()) {
-      signalProcessGroup(group.processGroup, "TERM");
-    }
-    for (ProcessHandle process : owned) {
-      if (isProcessAlive(process)) {
-        process.destroy();
+      if (failure != null) {
+        // A failed signal is harmless only if the group is now provably empty.
+        return;
       }
-    }
-    waitForProcesses(owned, PROCESS_TERMINATION_GRACE);
-    waitForProcessGroup(group.processGroup, PROCESS_TERMINATION_GRACE);
-
-    groupMembers =
-        verifiedGroupMembers(
-            group.processGroup, observed, group.ccmDirectory, group.completeIdentitySnapshot);
-    owned = currentObservedProcesses(observed);
-    owned.addAll(groupMembers);
-    if (!groupMembers.isEmpty()) {
-      signalProcessGroup(group.processGroup, "KILL");
-    }
-    for (ProcessHandle process : owned) {
-      if (isProcessAlive(process)) {
-        process.destroyForcibly();
+    } finally {
+      if (restoreInterrupt) {
+        Thread.currentThread().interrupt();
       }
-    }
-    waitForProcesses(owned, PROCESS_KILL_TIMEOUT);
-    waitForProcessGroup(group.processGroup, PROCESS_KILL_TIMEOUT);
-
-    groupMembers =
-        verifiedGroupMembers(
-            group.processGroup, observed, group.ccmDirectory, group.completeIdentitySnapshot);
-    List<Long> observedSurvivors =
-        observed.values().stream()
-            .filter(CcmProvisioner::ownedProcessStillAlive)
-            .map(process -> process.pid)
-            .collect(java.util.stream.Collectors.toList());
-    if (!groupMembers.isEmpty() || !observedSurvivors.isEmpty()) {
-      throw new CcmProcessCleanupException(
-          "Retained CCM processes still survive cleanup: group="
-              + group.processGroup
-              + ", pids="
-              + observedSurvivors);
-    }
-  }
-
-  private static boolean sameProcess(OwnedProcess expected, ProcessHandle actual) {
-    Optional<Long> currentStart = readProcessStartTicks(actual.pid());
-    return expected.startTicks.isPresent() && expected.startTicks.equals(currentStart);
-  }
-
-  private static void snapshotProcessTree(ProcessHandle root, Map<Long, OwnedProcess> owned) {
-    rememberProcess(root, owned);
-    root.descendants().forEach(process -> rememberProcess(process, owned));
-  }
-
-  private static void rememberProcess(ProcessHandle process, Map<Long, OwnedProcess> owned) {
-    // Never upgrade an identity that could not be captured. The PID may have been reused between
-    // observations; retaining the incomplete first snapshot is the fail-closed representation.
-    owned.computeIfAbsent(process.pid(), ignored -> new OwnedProcess(process));
-  }
-
-  private static Set<ProcessHandle> currentObservedProcesses(Map<Long, OwnedProcess> observed) {
-    Set<ProcessHandle> current = new HashSet<>();
-    for (OwnedProcess expected : observed.values()) {
-      ProcessHandle.of(expected.pid)
-          .filter(CcmProvisioner::isProcessAlive)
-          .filter(process -> sameProcess(expected, process))
-          .ifPresent(current::add);
-    }
-    return current;
-  }
-
-  private static void waitForProcesses(Set<ProcessHandle> processes, Duration timeout) {
-    boolean interrupted = false;
-    long deadline = System.nanoTime() + timeout.toNanos();
-    while (System.nanoTime() < deadline
-        && processes.stream().anyMatch(CcmProvisioner::isProcessAlive)) {
-      try {
-        Thread.sleep(20);
-      } catch (InterruptedException ignored) {
-        interrupted = true;
-      }
-    }
-    if (interrupted) {
-      Thread.currentThread().interrupt();
-    }
-  }
-
-  private static void waitForProcessGroup(long processGroup, Duration timeout) {
-    boolean interrupted = false;
-    long deadline = System.nanoTime() + timeout.toNanos();
-    while (System.nanoTime() < deadline && processGroupExists(processGroup)) {
-      try {
-        Thread.sleep(20);
-      } catch (InterruptedException ignored) {
-        interrupted = true;
-      }
-    }
-    if (interrupted) {
-      Thread.currentThread().interrupt();
     }
   }
 
   private static void signalProcessGroup(long processGroup, String signal) throws Exception {
-    Process signalProcess =
-        new ProcessBuilder("kill", "-" + signal, "--", "-" + processGroup)
-            .redirectErrorStream(true)
-            .start();
-    byte[] output = signalProcess.getInputStream().readAllBytes();
+    UtilityResult result = runUtility(List.of("kill", "-" + signal, "--", "-" + processGroup));
+    if (result.exitCode != 0 && processGroupHasLiveMembers(processGroup)) {
+      throw new IOException(
+          "Unable to signal CCM process group " + processGroup + ": " + result.output.trim());
+    }
+  }
+
+  private static boolean waitForProcessGroup(long processGroup, Duration timeout)
+      throws IOException {
     boolean interrupted = false;
-    while (true) {
+    long deadline = System.nanoTime() + timeout.toNanos();
+    while (processGroupHasLiveMembers(processGroup) && System.nanoTime() < deadline) {
       try {
-        if (signalProcess.waitFor() != 0
-            && ProcessHandle.of(processGroup).map(CcmProvisioner::isProcessAlive).orElse(false)) {
-          throw new IOException(
-              "Unable to signal CCM process group "
-                  + processGroup
-                  + ": "
-                  + new String(output, StandardCharsets.UTF_8));
-        }
-        break;
-      } catch (InterruptedException exception) {
+        Thread.sleep(20);
+      } catch (InterruptedException ignored) {
         interrupted = true;
       }
     }
-    if (interrupted) {
-      Thread.currentThread().interrupt();
-    }
+    return interrupted;
   }
 
-  private static boolean processGroupExists(long processGroup) {
+  private static boolean waitForDirectProcess(Process process, Duration timeout) {
+    boolean interrupted = false;
+    long deadline = System.nanoTime() + timeout.toNanos();
+    while (process.isAlive() && System.nanoTime() < deadline) {
+      try {
+        process.waitFor(20, TimeUnit.MILLISECONDS);
+      } catch (InterruptedException ignored) {
+        interrupted = true;
+      }
+    }
+    return interrupted;
+  }
+
+  private static boolean processGroupHasLiveMembers(long processGroup) throws IOException {
+    UtilityResult result =
+        runUtility(List.of("ps", "-o", "stat=", "-g", Long.toString(processGroup)));
+    if (result.exitCode != 0 && !result.output.trim().isEmpty()) {
+      throw new IOException(
+          "Unable to inspect CCM process group " + processGroup + ": " + result.output.trim());
+    }
+    for (String state : result.output.split("\\R")) {
+      String trimmed = state.trim();
+      if (!trimmed.isEmpty() && !trimmed.startsWith("Z")) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static UtilityResult runUtility(List<String> command) throws IOException {
+    Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+    boolean interrupted = false;
+    long deadline = System.nanoTime() + PROCESS_KILL_TIMEOUT.toNanos();
     try {
-      return !processesInGroup(processGroup).isEmpty();
-    } catch (IOException exception) {
-      // Failure to inspect /proc must retain ownership and prevent rollback.
-      return true;
-    }
-  }
-
-  private static List<ProcessHandle> processesInGroup(long processGroup) throws IOException {
-    List<ProcessHandle> result = new ArrayList<>();
-    try (java.nio.file.DirectoryStream<Path> processes =
-        Files.newDirectoryStream(Path.of("/proc"))) {
-      for (Path process : processes) {
-        String name = process.getFileName().toString();
-        if (!name.matches("[0-9]+")) {
-          continue;
-        }
+      while (process.isAlive() && System.nanoTime() < deadline) {
         try {
-          String stat = Files.readString(process.resolve("stat"), StandardCharsets.US_ASCII);
-          int commandEnd = stat.lastIndexOf(')');
-          if (commandEnd < 0 || commandEnd + 2 >= stat.length()) {
-            continue;
-          }
-          String[] fields = stat.substring(commandEnd + 2).split("\\s+");
-          if (fields.length > 2
-              && !"Z".equals(fields[0])
-              && Long.parseLong(fields[2]) == processGroup) {
-            ProcessHandle.of(Long.parseLong(name)).ifPresent(result::add);
-          }
-        } catch (java.nio.file.NoSuchFileException ignored) {
-          // The process exited while /proc was being scanned.
-        } catch (IOException | NumberFormatException exception) {
-          if (Files.exists(process, LinkOption.NOFOLLOW_LINKS)) {
-            throw new IOException("Unable to inspect process group " + processGroup, exception);
+          process.waitFor(20, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ignored) {
+          interrupted = true;
+        }
+      }
+      if (process.isAlive()) {
+        process.destroyForcibly();
+        long killDeadline = System.nanoTime() + PROCESS_KILL_TIMEOUT.toNanos();
+        while (process.isAlive() && System.nanoTime() < killDeadline) {
+          try {
+            process.waitFor(20, TimeUnit.MILLISECONDS);
+          } catch (InterruptedException ignored) {
+            interrupted = true;
           }
         }
       }
-      return result;
+      if (process.isAlive()) {
+        throw new IOException("Cleanup utility did not terminate: " + String.join(" ", command));
+      }
+      byte[] output = process.getInputStream().readAllBytes();
+      return new UtilityResult(process.exitValue(), new String(output, StandardCharsets.UTF_8));
+    } finally {
+      if (interrupted) {
+        Thread.currentThread().interrupt();
+      }
+    }
+  }
+
+  private static final class UtilityResult {
+    final int exitCode;
+    final String output;
+
+    UtilityResult(int exitCode, String output) {
+      this.exitCode = exitCode;
+      this.output = output;
+    }
+  }
+
+  void cleanupStaleCluster(String instanceId, int ccmId, Path ccmDirectory) throws Exception {
+    if (ccmId < 1 || ccmId > 99) {
+      throw new IOException("Invalid CCM ID " + ccmId);
+    }
+    Path normalized = validateCcmDirectoryLocation(ccmDirectory, false);
+    if (!Files.exists(normalized, LinkOption.NOFOLLOW_LINKS)) {
+      return;
+    }
+    validateOwnedDirectory(clustersDirectory, normalized, "CCM config");
+
+    // Command logs exist before metadata is complete, so snapshot them first.
+    collectDiagnostics(instanceId, normalized);
+    Path clusterDirectory = ownedClusterDirectory(normalized, instanceId);
+    PathState state = pathState(clusterDirectory.resolve("cluster.conf"));
+    if (state == PathState.ABSENT) {
+      cleanupAbsentClusterState(instanceId, normalized);
+      return;
+    }
+    if (state == PathState.UNKNOWN) {
+      throw new IOException("Cannot determine stale CCM cluster state for '" + instanceId + "'");
+    }
+    validateClusterMetadataIfPresent(clusterDirectory, instanceId);
+    sanitizeStaleProcessReferences(clusterDirectory);
+    removeByName(instanceId, normalized);
+  }
+
+  private static void sanitizeStaleProcessReferences(Path clusterDirectory) throws IOException {
+    Map<String, Object> cluster = readYamlMap(clusterDirectory.resolve("cluster.conf"));
+    Object configuredNodes = cluster.get("nodes");
+    if (!(configuredNodes instanceof Iterable)) {
+      throw new IOException("Invalid nodes list in " + clusterDirectory.resolve("cluster.conf"));
+    }
+    for (Object value : (Iterable<?>) configuredNodes) {
+      if (!(value instanceof String) || !isCcmNodeName((String) value)) {
+        throw new IOException("Unsafe node name in stale CCM metadata: " + value);
+      }
+      Path nodeDirectory = ownedChild(clusterDirectory, (String) value);
+      if (!Files.exists(nodeDirectory, LinkOption.NOFOLLOW_LINKS)) {
+        continue;
+      }
+      validateOwnedDirectory(clusterDirectory, nodeDirectory, "node");
+      Path nodeConfig = nodeDirectory.resolve("node.conf");
+      if (Files.exists(nodeConfig, LinkOption.NOFOLLOW_LINKS)) {
+        sanitizeStaleNodeConfig(nodeConfig, nodeDirectory);
+      }
+      for (String pidFile : List.of("cassandra.pid", "scylla-jmx.pid", "scylla-agent.pid")) {
+        Path path = nodeDirectory.resolve(pidFile);
+        if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+          rejectSymlink(path);
+          Files.delete(path);
+        }
+      }
+    }
+  }
+
+  private static void sanitizeStaleNodeConfig(Path nodeConfig, Path nodeDirectory)
+      throws IOException {
+    Map<String, Object> config = readYamlMap(nodeConfig);
+    validateNativeNodeMetadata(config, nodeDirectory);
+    if (config.remove("pid") == null) {
+      return;
+    }
+
+    Path temporary = Files.createTempFile(nodeDirectory, ".ccm-sanitize-node.conf-", ".tmp");
+    try {
+      Files.writeString(
+          temporary,
+          dumpYamlMap(config),
+          StandardCharsets.UTF_8,
+          java.nio.file.StandardOpenOption.TRUNCATE_EXISTING);
+      try {
+        Files.setPosixFilePermissions(
+            temporary, Files.getPosixFilePermissions(nodeConfig, LinkOption.NOFOLLOW_LINKS));
+      } catch (UnsupportedOperationException ignored) {
+        // The atomic same-directory replacement is the required safety property.
+      }
+      try {
+        Files.move(
+            temporary,
+            nodeConfig,
+            StandardCopyOption.ATOMIC_MOVE,
+            StandardCopyOption.REPLACE_EXISTING);
+      } catch (AtomicMoveNotSupportedException exception) {
+        throw new IOException("Atomic stale node.conf sanitization is unsupported", exception);
+      }
+    } finally {
+      Files.deleteIfExists(temporary);
     }
   }
 
@@ -2851,9 +2538,13 @@ class CcmProvisioner {
     }
   }
 
-  private static final class CcmProcessCleanupException extends IOException {
+  static final class CcmProcessCleanupException extends IOException {
     CcmProcessCleanupException(String message) {
       super(message);
+    }
+
+    CcmProcessCleanupException(String message, Throwable cause) {
+      super(message, cause);
     }
   }
 
