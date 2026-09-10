@@ -93,6 +93,27 @@ jobs:
         run: |
           make release-prepare
 
+      - name: Recheck for open release blockers
+        if: inputs.dry-run == false
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          blocker=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --label release-blocker \
+            --limit 1 \
+            --json title,url \
+            --jq '.[0] // empty')
+          if [[ -n "$blocker" ]]; then
+            blocker_title=$(jq -r '.title' <<< "$blocker")
+            blocker_url=$(jq -r '.url' <<< "$blocker")
+            echo "Release blocked by open release blocker:"
+            echo "${blocker_title} (${blocker_url})"
+            exit 1
+          fi
+
       - name: Perform release
         if: inputs.dry-run == false
         env:
