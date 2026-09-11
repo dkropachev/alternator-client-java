@@ -41,9 +41,9 @@ import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.*;
 
 /**
- * Integration test that verifies HTTP connections to a real Scylla cluster stay in the pool and are
- * reused across multiple {@code /localnodes} requests, rather than being created and destroyed for
- * each request.
+ * Integration smoke tests for connection-pool boundedness and usability against a real Scylla
+ * cluster. Exact connection reuse is covered by loopback socket-identity unit tests, because a
+ * snapshot of current connections cannot detect close-and-reopen churn.
  *
  * <p>Tests run against both HTTP and HTTPS endpoints. Requires a running ScyllaDB cluster with
  * Alternator enabled. Set environment variables:
@@ -86,11 +86,11 @@ public class ConnectionPoolIT {
   }
 
   /**
-   * Verifies that connections are pooled and reused. After many {@code refreshDiscoveredNodes()} calls,
-   * all requests should succeed without hanging (which would indicate connection leaks).
+   * Verifies that the polling pool does not exhaust. After many {@code refreshDiscoveredNodes()}
+   * calls, all requests should succeed without hanging.
    */
   @Test(timeout = 10_000)
-  public void testConnectionsArePooledAndReused() throws Exception {
+  public void testPollingPoolDoesNotExhaust() throws Exception {
     AlternatorLiveNodes liveNodes = createLiveNodes();
 
     try {
@@ -108,12 +108,10 @@ public class ConnectionPoolIT {
   }
 
   /**
-   * Verifies that pooled connections to a real Scylla cluster survive idle periods and are reused
-   * after sitting idle.
+   * Verifies that the polling pool remains usable after an idle period.
    *
-   * <p>This guards against connections being evicted or closed by the client-side pool. After the
-   * idle period, making more requests should succeed without timeout, proving connections are still
-   * usable.
+   * <p>After the idle period, making more requests should succeed without timeout. This test does
+   * not claim physical connection identity; the socket-level unit tests make that assertion.
    *
    * <p>Uses a 10-second idle period which is sufficient to verify connection survival without
    * triggering the default 60-second idle reaper.
@@ -134,10 +132,7 @@ public class ConnectionPoolIT {
       // without hitting the default 60-second idle reaper
       Thread.sleep(10_000);
 
-      // Use the connections again — they should be reused from the pool.
-      // If connections were dropped, these requests would still succeed
-      // but would need new connections. If connections are leaked,
-      // this would hang due to pool exhaustion.
+      // Use the pool again. A leak would eventually hang due to pool exhaustion.
       for (int i = 0; i < 30; i++) {
         liveNodes.refreshDiscoveredNodes();
       }
@@ -161,10 +156,10 @@ public class ConnectionPoolIT {
    * cluster. When multiple test forks (Failsafe {@code forkCount > 1}) run in parallel, each fork
    * creates its own connections, inflating the counter and causing flaky assertion failures.
    *
-   * <p>Using {@code ss} filtered by PID gives us a per-JVM snapshot of currently established
-   * connections. This is the right measurement for connection reuse: if connections are pooled, the
-   * count stays stable across many requests; if they are churned (closed and reopened), we would
-   * see the count drop between requests during idle gaps.
+   * <p>Using {@code ss} filtered by PID gives us a per-JVM snapshot suitable for a coarse
+   * boundedness check. It cannot prove connection identity: a socket can close and reopen between
+   * samples without changing the count. Loopback unit tests separately record accepted connections
+   * and client ports for exact reuse assertions.
    */
   private static long countEstablishedConnections(int port) throws Exception {
     long pid = ProcessHandle.current().pid();
@@ -208,12 +203,12 @@ public class ConnectionPoolIT {
   }
 
   /**
-   * Runs the DynamoDB connection reuse test with the given client wrapper and table name.
+   * Runs the DynamoDB connection-pool smoke test with the given client wrapper and table name.
    *
    * <p>Performs warmup requests, then verifies the established TCP connection count stays stable
    * during 500ms idle gaps, bulk requests, and a 10-second idle period.
    */
-  private void runDynamoDbConnectionReuseTest(
+  private void runDynamoDbConnectionPoolSmokeTest(
       AlternatorDynamoDbClientWrapper wrapper, String tableName) throws Exception {
     DynamoDbClient client = wrapper.getClient();
     int port = seedUri.getPort();
@@ -293,7 +288,7 @@ public class ConnectionPoolIT {
       long pooledBaseline = afterGaps;
       long idleMinAcceptable = Math.max(1, pooledBaseline / 3);
 
-      // Perform many more operations back-to-back — connections should be reused
+      // Perform many more operations back-to-back — the pool should remain bounded.
       for (int i = 0; i < 50; i++) {
         client.putItem(
             PutItemRequest.builder()
@@ -315,11 +310,10 @@ public class ConnectionPoolIT {
               + ")",
           afterBulk <= pooledBaseline * 1.5);
 
-      // Let connections sit idle for 10 seconds — enough to verify survival
-      // without hitting the default 60-second idle reaper
+      // Let connections sit idle for 10 seconds, below the main client's 600-second default.
       Thread.sleep(10_000);
 
-      // Connections should still be alive and reused after idle period
+      // The established-connection count should remain nonzero after the idle period.
       for (int i = 0; i < 10; i++) {
         client.putItem(
             PutItemRequest.builder()
@@ -379,29 +373,28 @@ public class ConnectionPoolIT {
   }
 
   /**
-   * Verifies that DynamoDB SDK operations reuse pooled TCP connections rather than creating a new
-   * connection for every request.
+   * Verifies that the DynamoDB SDK connection pool stays bounded under sequential traffic.
    *
    * <p>This test performs DynamoDB PutItem operations and checks that the number of ESTABLISHED TCP
    * connections to the Alternator port stays bounded (does not grow with the number of requests).
-   * It also verifies that connections are not dropped during 500ms idle gaps and survive a
-   * 10-second idle period.
+   * It also samples established-connection counts around 500ms gaps and a 10-second idle period.
    */
   @Test(timeout = 60_000)
-  public void testDynamoDbOperationsReuseConnections() throws Exception {
-    runDynamoDbConnectionReuseTest(buildDynamoWrapper(), "conn_pool_it_default");
+  public void testDynamoDbConnectionPoolRemainsBounded() throws Exception {
+    runDynamoDbConnectionPoolSmokeTest(buildDynamoWrapper(), "conn_pool_it_default");
   }
 
   /**
-   * Verifies that DynamoDB SDK operations reuse pooled TCP connections when headers optimization is
+   * Verifies that the DynamoDB SDK connection pool stays bounded when header optimization is
    * enabled.
    */
   @Test(timeout = 180_000)
-  public void testDynamoDbOperationsReuseConnectionsWithHeadersOptimization() throws Exception {
-    runDynamoDbConnectionReuseTest(buildDynamoWrapperWithHeaders(), "conn_pool_it_headers_opt");
+  public void testDynamoDbConnectionPoolRemainsBoundedWithHeadersOptimization() throws Exception {
+    runDynamoDbConnectionPoolSmokeTest(
+        buildDynamoWrapperWithHeaders(), "conn_pool_it_headers_opt");
   }
 
-  // --- Async client connection reuse tests (Netty HTTP stack) ---
+  // --- Async client connection-pool tests (Netty HTTP stack) ---
 
   private AlternatorDynamoDbAsyncClientWrapper buildAsyncWrapper() {
     AlternatorDynamoDbAsyncClient.AlternatorDynamoDbAsyncClientBuilder builder =
@@ -416,13 +409,13 @@ public class ConnectionPoolIT {
   }
 
   /**
-   * Runs the async DynamoDB connection reuse test with the given client wrapper and table name.
+   * Runs the async DynamoDB connection-pool smoke test with the given client wrapper and table
+   * name.
    *
-   * <p>Mirrors the sync {@link #runDynamoDbConnectionReuseTest} but uses the async client which
-   * runs on a Netty HTTP stack instead of Apache HttpClient. Verifies that the Netty connection
-   * pool keeps TCP connections stable during idle gaps, bulk requests, and idle periods.
+   * <p>Mirrors the sync {@link #runDynamoDbConnectionPoolSmokeTest} but uses the async client, which
+   * runs on a Netty HTTP stack instead of Apache HttpClient.
    */
-  private void runAsyncDynamoDbConnectionReuseTest(
+  private void runAsyncDynamoDbConnectionPoolSmokeTest(
       AlternatorDynamoDbAsyncClientWrapper wrapper, String tableName) throws Exception {
     DynamoDbAsyncClient client = wrapper.getClient();
     int port = seedUri.getPort();
@@ -508,7 +501,7 @@ public class ConnectionPoolIT {
       long pooledBaseline = afterGaps;
       long idleMinAcceptable = Math.max(1, pooledBaseline / 3);
 
-      // Perform many more operations back-to-back — connections should be reused
+      // Perform many more operations back-to-back — the pool should remain bounded.
       for (int i = 0; i < 30; i++) {
         client
             .putItem(
@@ -535,7 +528,7 @@ public class ConnectionPoolIT {
       // Let connections sit idle for 3 seconds
       Thread.sleep(3_000);
 
-      // Connections should still be alive and reused after idle period
+      // The established-connection count should remain nonzero after the idle period.
       for (int i = 0; i < 5; i++) {
         client
             .putItem(
@@ -574,31 +567,26 @@ public class ConnectionPoolIT {
   }
 
   /**
-   * Verifies that the async DynamoDB client (Netty HTTP stack) reuses pooled TCP connections rather
-   * than creating a new connection for every request.
+   * Verifies that the async DynamoDB client (Netty HTTP stack) keeps its pool bounded.
    *
-   * <p>This is the async counterpart of {@link #testDynamoDbOperationsReuseConnections()}. The
-   * async client uses Netty's connection pool instead of Apache HttpClient, so this test validates
-   * that Netty's pool behaves correctly with Alternator load balancing.
+   * <p>This is the async counterpart of {@link #testDynamoDbConnectionPoolRemainsBounded()}.
    */
   @Test(timeout = 30_000)
-  public void testAsyncDynamoDbOperationsReuseConnections() throws Exception {
-    runAsyncDynamoDbConnectionReuseTest(buildAsyncWrapper(), "conn_pool_it_async_default");
+  public void testAsyncDynamoDbConnectionPoolRemainsBounded() throws Exception {
+    runAsyncDynamoDbConnectionPoolSmokeTest(buildAsyncWrapper(), "conn_pool_it_async_default");
   }
 
-  // --- /localnodes polling path connection reuse tests ---
+  // --- /localnodes polling path connection-pool tests ---
 
   /**
-   * Verifies that the {@code /localnodes} polling path reuses TCP connections by measuring actual
-   * TCP socket counts via {@code ss}.
+   * Verifies that the {@code /localnodes} polling path keeps its TCP connection count bounded as
+   * measured by {@code ss}.
    *
-   * <p>This complements {@link #testConnectionsArePooledAndReused()} which only checks for pool
-   * exhaustion (hanging). This test directly measures that the TCP connection count stays stable
-   * across many polling cycles, confirming that the polling HTTP client is actually reusing
-   * connections rather than creating new ones for each request.
+   * <p>This complements {@link #testPollingPoolDoesNotExhaust()} with a coarse connection-count
+   * check. Exact polling connection identity is covered by socket-level unit tests.
    */
   @Test(timeout = 30_000)
-  public void testPollingConnectionsStableUnderSs() throws Exception {
+  public void testPollingConnectionsRemainBoundedUnderSs() throws Exception {
     AlternatorLiveNodes liveNodes = createLiveNodes();
     int port = seedUri.getPort();
 

@@ -15,18 +15,17 @@
  */
 package com.scylladb.alternator.internal;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertTrue;
 
 import com.scylladb.alternator.AlternatorConfig;
-import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.net.InetSocketAddress;
-import java.net.URI;
 import java.nio.ByteBuffer;
-import java.time.Duration;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.After;
 import org.junit.Before;
@@ -43,42 +42,30 @@ import software.amazon.awssdk.http.async.SdkAsyncHttpResponseHandler;
 import software.amazon.awssdk.http.async.SdkHttpContentPublisher;
 
 /**
- * Tests that Netty's {@code connectionTimeToLive(Duration.ZERO)} means "unlimited" rather than
- * "instant expiry".
+ * Tests Netty connection identity with unlimited and short connection time-to-live settings.
  *
- * <p>Uses a real HTTP server and makes actual requests through SDK clients created by {@link
- * NettyAsyncClientFactory}.
+ * <p>Uses a raw loopback HTTP server so a successful replacement connection cannot masquerade as
+ * connection reuse.
  */
 public class NettyConnectionTimeToLiveTest {
 
-  private HttpServer server;
-  private int port;
-  private final AtomicInteger requestCount = new AtomicInteger(0);
+  private static final int REQUESTS = 2;
+  private static final long REUSE_IDLE_PERIOD_MS = 100;
+  private static final long SHORT_TTL_MS = 25;
+  private static final long EXPIRY_WAIT_MS = 200;
+
+  private SocketTrackingHttpServer server;
 
   @Before
   public void setUp() throws IOException {
-    requestCount.set(0);
-    server = HttpServer.create(new InetSocketAddress(0), 0);
-    port = server.getAddress().getPort();
-
-    server.createContext(
-        "/test",
-        exchange -> {
-          requestCount.incrementAndGet();
-          byte[] body = "OK".getBytes();
-          exchange.sendResponseHeaders(200, body.length);
-          try (OutputStream os = exchange.getResponseBody()) {
-            os.write(body);
-          }
-        });
-
+    server = new SocketTrackingHttpServer(request -> SocketTrackingHttpServer.Response.text("OK"));
     server.start();
   }
 
   @After
-  public void tearDown() {
+  public void tearDown() throws Exception {
     if (server != null) {
-      server.stop(0);
+      server.close();
     }
   }
 
@@ -88,57 +75,94 @@ public class NettyConnectionTimeToLiveTest {
    */
   @Test(timeout = 30000)
   public void testZeroTtlMeansUnlimited() throws Exception {
-    AlternatorConfig config = AlternatorConfig.builder().build();
+    AlternatorConfig config = AlternatorConfig.builder().withMaxConnections(1).build();
     assertEquals(
         "Default connectionTimeToLiveMs should be 0", 0, config.getConnectionTimeToLiveMs());
 
+    assertConnectionReused(config);
+  }
+
+  /** Verifies that explicit idle zero does not immediately expire a connection. */
+  @Test(timeout = 30000)
+  public void testZeroIdleTimeDoesNotImmediatelyExpireConnection() throws Exception {
+    AlternatorConfig config =
+        AlternatorConfig.builder().withMaxConnections(1).withConnectionMaxIdleTimeMs(0).build();
+
+    assertConnectionReused(config);
+  }
+
+  /** Verifies that a connection older than a positive TTL is replaced. */
+  @Test(timeout = 30000)
+  public void testShortTtlExpireConnections() throws Exception {
+    AlternatorConfig config =
+        AlternatorConfig.builder()
+            .withMaxConnections(1)
+            .withConnectionTimeToLiveMs(SHORT_TTL_MS)
+            .build();
+    assertEquals(SHORT_TTL_MS, config.getConnectionTimeToLiveMs());
+
     SdkAsyncHttpClient client = NettyAsyncClientFactory.create(null, config, null);
     try {
-      // Make multiple requests with small delays — all should succeed
-      for (int i = 0; i < 5; i++) {
-        executeRequest(client);
-        Thread.sleep(50);
-      }
-      assertEquals("All 5 requests should have reached the server", 5, requestCount.get());
+      executeRequest(client);
+      Thread.sleep(EXPIRY_WAIT_MS);
+      executeRequest(client);
+      assertConnectionIdentity(2);
     } finally {
       client.close();
     }
   }
 
-  /**
-   * Control test: a very short TTL still works because the SDK creates new connections when old
-   * ones expire.
-   */
-  @Test(timeout = 30000)
-  public void testShortTtlExpireConnections() throws Exception {
-    AlternatorConfig config = AlternatorConfig.builder().build();
-
-    // Use customizer to set a very short TTL
-    SdkAsyncHttpClient client =
-        NettyAsyncClientFactory.create(
-            builder -> builder.connectionTimeToLive(Duration.ofMillis(1)), config, null);
+  private void assertConnectionReused(AlternatorConfig config) throws Exception {
+    SdkAsyncHttpClient client = NettyAsyncClientFactory.create(null, config, null);
     try {
       executeRequest(client);
-      Thread.sleep(100);
-
-      // Subsequent requests succeed — SDK creates new connections after old ones expire
-      for (int i = 0; i < 4; i++) {
-        executeRequest(client);
-      }
-      assertEquals("All 5 requests should have reached the server", 5, requestCount.get());
+      Thread.sleep(REUSE_IDLE_PERIOD_MS);
+      executeRequest(client);
+      assertConnectionIdentity(1);
     } finally {
       client.close();
+    }
+  }
+
+  private void assertConnectionIdentity(int expectedConnections) throws Exception {
+    assertTrue(
+        "Both requests should reach the server",
+        server.awaitRequestCount(REQUESTS, 5, TimeUnit.SECONDS));
+    server.assertHealthy();
+
+    List<SocketTrackingHttpServer.Request> requests = server.requestsSince(0);
+    assertEquals("Both requests should reach the server", REQUESTS, server.requestCount());
+    assertEquals(
+        "Unexpected number of accepted TCP connections",
+        expectedConnections,
+        server.acceptedConnections());
+    assertEquals(
+        "Unexpected number of client TCP ports",
+        expectedConnections,
+        server.uniqueRemotePorts().size());
+    assertEquals("A remote port should be recorded for each request", REQUESTS, requests.size());
+    if (expectedConnections == 1) {
+      assertEquals(
+          "The unlimited-TTL connection should be reused",
+          requests.get(0).remotePort(),
+          requests.get(1).remotePort());
+    } else {
+      assertNotEquals(
+          "The expired connection should be replaced",
+          requests.get(0).remotePort(),
+          requests.get(1).remotePort());
     }
   }
 
   private void executeRequest(SdkAsyncHttpClient client) throws Exception {
     SdkHttpRequest request =
         SdkHttpRequest.builder()
-            .uri(URI.create("http://127.0.0.1:" + port + "/test"))
+            .uri(server.uri().resolve("/test"))
             .method(SdkHttpMethod.GET)
+            .putHeader("Connection", "keep-alive")
             .build();
-
     CompletableFuture<Integer> statusFuture = new CompletableFuture<>();
+    AtomicInteger statusCode = new AtomicInteger(-1);
 
     AsyncExecuteRequest executeRequest =
         AsyncExecuteRequest.builder()
@@ -148,12 +172,11 @@ public class NettyConnectionTimeToLiveTest {
                 new SdkAsyncHttpResponseHandler() {
                   @Override
                   public void onHeaders(SdkHttpResponse headers) {
-                    statusFuture.complete(headers.statusCode());
+                    statusCode.set(headers.statusCode());
                   }
 
                   @Override
                   public void onStream(Publisher<ByteBuffer> stream) {
-                    // Drain the stream
                     stream.subscribe(
                         new Subscriber<ByteBuffer>() {
                           @Override
@@ -165,10 +188,14 @@ public class NettyConnectionTimeToLiveTest {
                           public void onNext(ByteBuffer byteBuffer) {}
 
                           @Override
-                          public void onError(Throwable t) {}
+                          public void onError(Throwable error) {
+                            statusFuture.completeExceptionally(error);
+                          }
 
                           @Override
-                          public void onComplete() {}
+                          public void onComplete() {
+                            statusFuture.complete(statusCode.get());
+                          }
                         });
                   }
 
@@ -179,8 +206,8 @@ public class NettyConnectionTimeToLiveTest {
                 })
             .build();
 
-    client.execute(executeRequest).get();
-    int status = statusFuture.get();
+    client.execute(executeRequest).get(5, TimeUnit.SECONDS);
+    int status = statusFuture.get(5, TimeUnit.SECONDS);
     assertEquals("Request should succeed with 200", 200, status);
   }
 
