@@ -15,18 +15,18 @@
  */
 package com.scylladb.alternator.internal;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertTrue;
 
 import com.scylladb.alternator.AlternatorConfig;
-import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.net.InetSocketAddress;
-import java.net.URI;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import software.amazon.awssdk.http.AbortableInputStream;
 import software.amazon.awssdk.http.HttpExecuteRequest;
 import software.amazon.awssdk.http.HttpExecuteResponse;
 import software.amazon.awssdk.http.SdkHttpClient;
@@ -34,104 +34,159 @@ import software.amazon.awssdk.http.SdkHttpMethod;
 import software.amazon.awssdk.http.SdkHttpRequest;
 
 /**
- * Tests that Apache's idle connection reaper is properly disabled when {@code
- * connectionMaxIdleTimeMs=0} (the default).
+ * Tests Apache connection identity across the default, disabled, and short idle-time settings.
  *
- * <p>Uses a real HTTP server and makes actual requests through SDK clients created by {@link
- * ApacheSyncClientFactory}.
+ * <p>Uses a raw loopback HTTP server so a successful replacement connection cannot masquerade as
+ * connection reuse.
  */
 public class ApacheIdleConnectionReaperTest {
 
-  private HttpServer server;
-  private int port;
-  private final AtomicInteger requestCount = new AtomicInteger(0);
+  private static final int REQUESTS = 2;
+  private static final long REUSE_IDLE_PERIOD_MS = 100;
+  private static final long SHORT_IDLE_TIME_MS = 25;
+  private static final long EXPIRY_WAIT_MS = 200;
+
+  private SocketTrackingHttpServer server;
 
   @Before
   public void setUp() throws IOException {
-    requestCount.set(0);
-    server = HttpServer.create(new InetSocketAddress(0), 0);
-    port = server.getAddress().getPort();
-
-    server.createContext(
-        "/test",
-        exchange -> {
-          requestCount.incrementAndGet();
-          byte[] body = "OK".getBytes();
-          exchange.sendResponseHeaders(200, body.length);
-          try (OutputStream os = exchange.getResponseBody()) {
-            os.write(body);
-          }
-        });
-
+    server = new SocketTrackingHttpServer(request -> SocketTrackingHttpServer.Response.text("OK"));
     server.start();
   }
 
   @After
-  public void tearDown() {
+  public void tearDown() throws Exception {
     if (server != null) {
-      server.stop(0);
+      server.close();
     }
   }
 
-  /**
-   * Verifies that connectionMaxIdleTimeMs=0 disables idle reaping and connections remain usable
-   * after idle periods.
-   */
+  /** Verifies that the ten-minute default does not replace a briefly idle connection. */
   @Test(timeout = 30000)
-  public void testZeroIdleTimeDisablesReaping() throws Exception {
-    AlternatorConfig config = AlternatorConfig.builder().withConnectionMaxIdleTimeMs(0).build();
+  public void testDefaultIdleTimeReusesConnection() throws Exception {
+    AlternatorConfig config = AlternatorConfig.builder().withMaxConnections(1).build();
+    assertEquals(
+        "Default connectionMaxIdleTimeMs should be ten minutes",
+        AlternatorConfig.DEFAULT_CONNECTION_MAX_IDLE_TIME_MS,
+        config.getConnectionMaxIdleTimeMs());
+
+    assertConnectionReused(config, REUSE_IDLE_PERIOD_MS);
+  }
+
+  /** Verifies that an explicit zero does not immediately expire a connection. */
+  @Test(timeout = 30000)
+  public void testZeroIdleTimeDoesNotImmediatelyExpireConnection() throws Exception {
+    AlternatorConfig config =
+        AlternatorConfig.builder().withMaxConnections(1).withConnectionMaxIdleTimeMs(0).build();
     assertEquals("connectionMaxIdleTimeMs should be 0", 0, config.getConnectionMaxIdleTimeMs());
 
-    SdkHttpClient client = ApacheSyncClientFactory.create(null, config, null);
-    try {
-      // Make multiple requests with brief idle periods — all should succeed
-      for (int i = 0; i < 5; i++) {
-        executeRequest(client);
-        Thread.sleep(50);
-      }
-      assertEquals("All 5 requests should have reached the server", 5, requestCount.get());
-    } finally {
-      client.close();
-    }
+    assertConnectionReused(config, REUSE_IDLE_PERIOD_MS);
   }
 
-  /**
-   * Control test: with a non-zero idle time, the reaper is enabled but requests still succeed
-   * because the SDK creates new connections after idle ones are reaped.
-   */
+  /** Verifies that a connection older than a positive idle timeout is replaced. */
   @Test(timeout = 30000)
-  public void testIdleReaperEnabledWithNonZeroIdleTime() throws Exception {
-    AlternatorConfig config = AlternatorConfig.builder().withConnectionMaxIdleTimeMs(1).build();
+  public void testPositiveIdleTimeExpiresConnection() throws Exception {
+    AlternatorConfig config =
+        AlternatorConfig.builder()
+            .withMaxConnections(1)
+            .withConnectionMaxIdleTimeMs(SHORT_IDLE_TIME_MS)
+            .build();
 
     SdkHttpClient client = ApacheSyncClientFactory.create(null, config, null);
     try {
       executeRequest(client);
-      Thread.sleep(200);
-
-      // Subsequent requests succeed — SDK creates new connections after idle ones are reaped
-      for (int i = 0; i < 4; i++) {
-        executeRequest(client);
-      }
-      assertEquals("All 5 requests should have reached the server", 5, requestCount.get());
+      Thread.sleep(EXPIRY_WAIT_MS);
+      executeRequest(client);
+      assertConnectionIdentity(2);
     } finally {
       client.close();
+    }
+  }
+
+  /** Verifies that a connection older than a positive TTL is replaced. */
+  @Test(timeout = 30000)
+  public void testPositiveTtlExpiresConnection() throws Exception {
+    AlternatorConfig config =
+        AlternatorConfig.builder()
+            .withMaxConnections(1)
+            .withConnectionTimeToLiveMs(SHORT_IDLE_TIME_MS)
+            .build();
+
+    SdkHttpClient client = ApacheSyncClientFactory.create(null, config, null);
+    try {
+      executeRequest(client);
+      Thread.sleep(EXPIRY_WAIT_MS);
+      executeRequest(client);
+      assertConnectionIdentity(2);
+    } finally {
+      client.close();
+    }
+  }
+
+  private void assertConnectionReused(AlternatorConfig config, long idlePeriodMs) throws Exception {
+    SdkHttpClient client = ApacheSyncClientFactory.create(null, config, null);
+    try {
+      executeRequest(client);
+      Thread.sleep(idlePeriodMs);
+      executeRequest(client);
+      assertConnectionIdentity(1);
+    } finally {
+      client.close();
+    }
+  }
+
+  private void assertConnectionIdentity(int expectedConnections) throws Exception {
+    assertTrue(
+        "Both requests should reach the server",
+        server.awaitRequestCount(REQUESTS, 5, TimeUnit.SECONDS));
+    server.assertHealthy();
+
+    List<SocketTrackingHttpServer.Request> requests = server.requestsSince(0);
+    assertEquals("Both requests should reach the server", REQUESTS, server.requestCount());
+    assertEquals(
+        "Unexpected number of accepted TCP connections",
+        expectedConnections,
+        server.acceptedConnections());
+    assertEquals(
+        "Unexpected number of client TCP ports",
+        expectedConnections,
+        server.uniqueRemotePorts().size());
+    assertEquals("A remote port should be recorded for each request", REQUESTS, requests.size());
+    if (expectedConnections == 1) {
+      assertEquals(
+          "The idle connection should be reused",
+          requests.get(0).remotePort(),
+          requests.get(1).remotePort());
+    } else {
+      assertNotEquals(
+          "The expired connection should be replaced",
+          requests.get(0).remotePort(),
+          requests.get(1).remotePort());
     }
   }
 
   private void executeRequest(SdkHttpClient client) throws Exception {
     SdkHttpRequest request =
         SdkHttpRequest.builder()
-            .uri(URI.create("http://127.0.0.1:" + port + "/test"))
+            .uri(server.uri().resolve("/test"))
             .method(SdkHttpMethod.GET)
+            .putHeader("Connection", "keep-alive")
             .build();
-
-    HttpExecuteRequest executeRequest = HttpExecuteRequest.builder().request(request).build();
-    HttpExecuteResponse response = client.prepareRequest(executeRequest).call();
+    HttpExecuteResponse response =
+        client.prepareRequest(HttpExecuteRequest.builder().request(request).build()).call();
     assertEquals("Request should succeed with 200", 200, response.httpResponse().statusCode());
 
-    // Consume response to release the connection back to the pool
     if (response.responseBody().isPresent()) {
-      response.responseBody().get().close();
+      drainAndClose(response.responseBody().get());
+    }
+  }
+
+  private void drainAndClose(AbortableInputStream body) throws IOException {
+    try (AbortableInputStream stream = body) {
+      byte[] buffer = new byte[256];
+      while (stream.read(buffer) != -1) {
+        // Drain the response so the connection is returned to the pool.
+      }
     }
   }
 }

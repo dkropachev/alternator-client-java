@@ -20,18 +20,9 @@ import static org.junit.Assert.assertTrue;
 
 import com.scylladb.alternator.AlternatorConfig;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.ServerSocket;
-import java.net.Socket;
 import java.net.URI;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -105,13 +96,14 @@ public class HttpClientNon2xxConnectionReuseTest {
 
   private void assertSyncClientReusesConnections(
       String clientName, int status, SdkHttpClient client) throws Exception {
-    ReuseProbeServer server = new ReuseProbeServer(status);
-    server.start();
-    try {
+    try (SocketTrackingHttpServer server =
+        new SocketTrackingHttpServer(
+            request -> SocketTrackingHttpServer.Response.status(status, "response-" + status))) {
+      server.start();
       for (int i = 0; i < REQUESTS; i++) {
         HttpExecuteResponse response =
             client
-                .prepareRequest(HttpExecuteRequest.builder().request(server.request()).build())
+                .prepareRequest(HttpExecuteRequest.builder().request(request(server)).build())
                 .call();
         assertEquals(status, response.httpResponse().statusCode());
         if (response.responseBody().isPresent()) {
@@ -119,8 +111,6 @@ public class HttpClientNon2xxConnectionReuseTest {
         }
       }
       assertConnectionReuse(clientName, status, server);
-    } finally {
-      server.stop();
     }
   }
 
@@ -137,22 +127,24 @@ public class HttpClientNon2xxConnectionReuseTest {
 
   private void assertAsyncClientReusesConnections(
       String clientName, int status, SdkAsyncHttpClient client) throws Exception {
-    ReuseProbeServer server = new ReuseProbeServer(status);
-    server.start();
-    try {
+    try (SocketTrackingHttpServer server =
+        new SocketTrackingHttpServer(
+            request -> SocketTrackingHttpServer.Response.status(status, "response-" + status))) {
+      server.start();
       for (int i = 0; i < REQUESTS; i++) {
         assertEquals(
-            status, executeAsync(client, server.request()).get(10, TimeUnit.SECONDS).intValue());
+            status, executeAsync(client, request(server)).get(10, TimeUnit.SECONDS).intValue());
       }
       assertConnectionReuse(clientName, status, server);
-    } finally {
-      server.stop();
     }
   }
 
-  private void assertConnectionReuse(String clientName, int status, ReuseProbeServer server)
+  private void assertConnectionReuse(String clientName, int status, SocketTrackingHttpServer server)
       throws Exception {
-    server.awaitRequests();
+    assertTrue(
+        clientName + " status " + status + " should reach the server",
+        server.awaitRequestCount(REQUESTS, 5, TimeUnit.SECONDS));
+    server.assertHealthy();
     assertEquals(
         clientName + " status " + status + " should reach the server",
         REQUESTS,
@@ -167,7 +159,7 @@ public class HttpClientNon2xxConnectionReuseTest {
           server.acceptedConnections() <= 2);
       assertTrue(
           clientName + " status " + status + " should reuse client TCP ports",
-          server.uniqueRemotePorts() <= 2);
+          server.uniqueRemotePorts().size() <= 2);
       return;
     }
     assertEquals(
@@ -177,7 +169,15 @@ public class HttpClientNon2xxConnectionReuseTest {
     assertEquals(
         clientName + " status " + status + " should use one client TCP port",
         1,
-        server.uniqueRemotePorts());
+        server.uniqueRemotePorts().size());
+  }
+
+  private SdkHttpRequest request(SocketTrackingHttpServer server) {
+    return SdkHttpRequest.builder()
+        .uri(URI.create("http://127.0.0.1:" + server.port() + "/test"))
+        .method(SdkHttpMethod.GET)
+        .putHeader("Connection", "keep-alive")
+        .build();
   }
 
   private boolean allowsCrtSyncServerErrorReconnect(String clientName, int status) {
@@ -248,172 +248,6 @@ public class HttpClientNon2xxConnectionReuseTest {
               }
             });
     return result;
-  }
-
-  private static class ReuseProbeServer {
-    private final int status;
-    private final List<Integer> remotePorts = new ArrayList<>();
-    private final List<Socket> activeSockets = new ArrayList<>();
-    private final AtomicInteger requestCount = new AtomicInteger(0);
-    private final AtomicInteger acceptedConnections = new AtomicInteger(0);
-    private volatile boolean running = true;
-    private volatile IOException serverError;
-    private ServerSocket server;
-    private Thread serverThread;
-    private int port;
-
-    ReuseProbeServer(int status) {
-      this.status = status;
-    }
-
-    void start() throws IOException {
-      server = new ServerSocket(0);
-      port = server.getLocalPort();
-      serverThread = new Thread(this::serve, "non-2xx-reuse-probe");
-      serverThread.setDaemon(true);
-      serverThread.start();
-    }
-
-    private void serve() {
-      try {
-        while (running && requestCount.get() < REQUESTS) {
-          Socket socket = server.accept();
-          acceptedConnections.incrementAndGet();
-          synchronized (activeSockets) {
-            activeSockets.add(socket);
-          }
-          handleSocket(socket);
-        }
-      } catch (IOException e) {
-        if (running) {
-          serverError = e;
-        }
-      }
-    }
-
-    private void handleSocket(Socket socket) throws IOException {
-      socket.setSoTimeout(10_000);
-      try (Socket current = socket) {
-        InputStream input = current.getInputStream();
-        OutputStream output = current.getOutputStream();
-        while (running && requestCount.get() < REQUESTS) {
-          if (!readRequest(input)) {
-            return;
-          }
-          synchronized (remotePorts) {
-            remotePorts.add(current.getPort());
-          }
-          requestCount.incrementAndGet();
-          writeResponse(output);
-        }
-      } finally {
-        synchronized (activeSockets) {
-          activeSockets.remove(socket);
-        }
-      }
-    }
-
-    private boolean readRequest(InputStream input) throws IOException {
-      String requestLine = readLine(input);
-      if (requestLine == null) {
-        return false;
-      }
-
-      int contentLength = 0;
-      while (true) {
-        String header = readLine(input);
-        if (header == null || header.isEmpty()) {
-          break;
-        }
-        if (header.regionMatches(true, 0, "Content-Length:", 0, "Content-Length:".length())) {
-          contentLength = Integer.parseInt(header.substring("Content-Length:".length()).trim());
-        }
-      }
-      drainBytes(input, contentLength);
-      return true;
-    }
-
-    private String readLine(InputStream input) throws IOException {
-      StringBuilder line = new StringBuilder();
-      while (true) {
-        int b = input.read();
-        if (b == -1) {
-          return line.length() == 0 ? null : line.toString();
-        }
-        if (b == '\r') {
-          continue;
-        }
-        if (b == '\n') {
-          return line.toString();
-        }
-        line.append((char) b);
-      }
-    }
-
-    private void drainBytes(InputStream input, int contentLength) throws IOException {
-      for (int i = 0; i < contentLength; i++) {
-        if (input.read() == -1) {
-          return;
-        }
-      }
-    }
-
-    private void writeResponse(OutputStream output) throws IOException {
-      byte[] body = ("response-" + status).getBytes(StandardCharsets.US_ASCII);
-      String response =
-          "HTTP/1.1 "
-              + status
-              + " Test\r\n"
-              + "Content-Length: "
-              + body.length
-              + "\r\n"
-              + "Connection: keep-alive\r\n"
-              + "\r\n";
-      output.write(response.getBytes(StandardCharsets.US_ASCII));
-      output.write(body);
-      output.flush();
-    }
-
-    SdkHttpRequest request() {
-      return SdkHttpRequest.builder()
-          .uri(URI.create("http://127.0.0.1:" + port + "/test"))
-          .method(SdkHttpMethod.GET)
-          .putHeader("Connection", "keep-alive")
-          .build();
-    }
-
-    void awaitRequests() throws Exception {
-      serverThread.join(2_000);
-      if (serverError != null) {
-        throw serverError;
-      }
-    }
-
-    int requestCount() {
-      return requestCount.get();
-    }
-
-    int acceptedConnections() {
-      return acceptedConnections.get();
-    }
-
-    int uniqueRemotePorts() {
-      synchronized (remotePorts) {
-        Set<Integer> uniquePorts = new LinkedHashSet<>(remotePorts);
-        return uniquePorts.size();
-      }
-    }
-
-    void stop() throws IOException, InterruptedException {
-      running = false;
-      synchronized (activeSockets) {
-        for (Socket socket : activeSockets) {
-          socket.close();
-        }
-      }
-      server.close();
-      serverThread.join(2_000);
-    }
   }
 
   private static class EmptyPublisher implements SdkHttpContentPublisher {
