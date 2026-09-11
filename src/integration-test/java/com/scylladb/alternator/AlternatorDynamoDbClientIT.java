@@ -47,14 +47,12 @@ import software.amazon.awssdk.services.dynamodb.model.*;
  * Integration tests for AlternatorDynamoDbClient. These tests require a running ScyllaDB cluster
  * with Alternator enabled.
  *
- * <p>Tests run against both HTTP and HTTPS endpoints. Set environment variables to configure:
+ * <p>Tests run against both HTTP and HTTPS endpoints provisioned by the CCM harness. Set
+ * environment variables to configure:
  *
  * <ul>
- *   <li>ALTERNATOR_HOST: Host address (default: 172.39.0.2)
- *   <li>ALTERNATOR_PORT: HTTP port number (default: 9998)
- *   <li>ALTERNATOR_HTTPS_PORT: HTTPS port number (default: 9999)
- *   <li>ALTERNATOR_DATACENTER: Datacenter name (default: datacenter1)
- *   <li>ALTERNATOR_RACK: Rack name (default: rack1)
+ *   <li>INTEGRATION_TESTS: Set to "true" to enable these tests
+ *   <li>SCYLLA_VERSION: CCM Scylla package selector
  * </ul>
  */
 @RunWith(Parameterized.class)

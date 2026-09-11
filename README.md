@@ -23,6 +23,7 @@ This library supports AWS SDK for Java Version 2 (requires 2.20 or above) and re
 
 The language-agnostic feature contracts are maintained in [`feature-specs`](feature-specs/README.md):
 
+- [CCM integration](feature-specs/ccm-integration.md)
 - [Compression](feature-specs/compression.md)
 - [Header optimization](feature-specs/header-optimization.md)
 - [Key-route affinity](feature-specs/key-route-affinity.md)
@@ -1107,3 +1108,63 @@ Key route affinity may not be beneficial for:
 - Read-heavy workloads (reads don't use Paxos)
 - Workloads with uniformly distributed writes across many keys
 - Async clients where partition-key names cannot be pre-configured
+
+## Integration testing with CCM
+
+Integration tests use [scylla-ccm](https://github.com/scylladb/scylla-ccm) and native Scylla
+relocatable packages. They require Linux, Python 3.9 or newer, OpenSSL, `setsid` from util-linux,
+external `kill` and `ps` executables from procps, and [`uv`](https://docs.astral.sh/uv/). Install the
+repository-pinned CCM revision and run the suite with:
+
+```sh
+make ccm-install
+make test-integration
+```
+
+The Java test harness owns provisioning, endpoint readiness, per-lease table namespaces,
+diagnostics, and cleanup. It keeps at most one physical cluster in a JVM. Matching reusable leases
+share that cluster and receive independent resource prefixes. An idle incompatible cluster is
+replaced; an incompatible or private request made while another lease is active fails immediately.
+Private leases are exclusive.
+
+The default cluster uses Scylla `release:2025.2.5`. Override the package selector or CCM executable
+with `SCYLLA_VERSION` or `SCYLLA_CCM_PATH`. A cluster may have at most nine nodes;
+`SCYLLA_CCM_MAX_NODES` may lower that limit. The harness does not schedule clusters from detected
+host or cgroup memory.
+
+Java stores live CCM runs and address reservations beneath the private, host-shared per-user root
+`/tmp/alternator-client-java-ccm-<uid>`. Set `SCYLLA_CCM_ROOT` to use another private root, and use
+the same override for concurrent processes that must coordinate addresses; distinct roots do not
+share reservations. Normal JVM shutdown attempts to remove the current run and retains it for
+recovery if cleanup fails. After a hard kill, the next test JVM detects the stale run,
+collects diagnostics under `target/ccm`, and attempts cleanup before provisioning. State that is
+malformed or cannot be removed remains quarantined with its address ID reserved, and provisioning
+continues with another ID. Direct IDE or Maven execution uses the same best-effort shutdown and
+next-run recovery; cleanup is not immediate after an uncatchable process kill. Set
+`SCYLLA_CCM_DIAGNOSTICS_DIR` to choose a different external diagnostics directory.
+
+Tests can acquire reusable or private cluster leases directly:
+
+```java
+try (ReusableClusterLease shared = TestClusters.acquireReusable(ClusterSpecs.defaultSpec());
+    AlternatorDynamoDbClientWrapper wrapper =
+        shared.cluster().clientBuilder(AlternatorTransport.HTTP).buildWithAlternatorAPI()) {
+  String tableName = shared.resources().newTableName("example");
+  DynamoDbClient client = wrapper.getClient();
+}
+
+ClusterSpec privateSpec =
+    ClusterSpecs.defaultSpec()
+        .withTopology(ClusterTopology.singleDatacenter(1))
+        .withTransports(AlternatorTransport.HTTP);
+try (PrivateClusterLease privateCluster = TestClusters.provisionPrivate(privateSpec)) {
+  privateCluster.control().stopNode(privateCluster.cluster().nodes().get(0));
+}
+```
+
+Reusable leases may share a matching healthy physical cluster but expose no node controls. Tests
+that stop, start, add, or remove nodes must request a private cluster. Each lease supplies unique
+table names and removes every table in its namespace when released. Private controls are
+serialized with lease and pool shutdown, reject stale or foreign node handles, and never permit
+removal of the final live node. A command with an ambiguous result makes the private cluster dirty;
+further mutation is rejected and whole-cluster cleanup is required.

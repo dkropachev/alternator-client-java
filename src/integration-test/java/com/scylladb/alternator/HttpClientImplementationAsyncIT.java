@@ -40,12 +40,12 @@ import software.amazon.awssdk.services.dynamodb.model.*;
  * Alternator load balancer, including headers optimization, compression, connection pool config, and
  * TLS.
  *
- * <p>Tests cover Netty and CRT async clients. Requires a running ScyllaDB cluster with Alternator
- * enabled. Set environment variables:
+ * <p>Tests cover Netty and CRT async clients against a CCM-provisioned ScyllaDB cluster. Set
+ * environment variables:
  *
  * <ul>
  *   <li>INTEGRATION_TESTS=true
- *   <li>ALTERNATOR_HOST, ALTERNATOR_PORT, ALTERNATOR_HTTPS_PORT
+ *   <li>SCYLLA_VERSION selects the CCM Scylla package
  * </ul>
  */
 public class HttpClientImplementationAsyncIT {
@@ -130,7 +130,7 @@ public class HttpClientImplementationAsyncIT {
   public void testNettyClientHttpsWithCustomCa() throws Exception {
     Path caCertPath = IntegrationTestConfig.CA_CERT_PATH;
     assumeTrue(
-        "Custom CA certificate path not set. Set ALTERNATOR_CA_CERT_PATH to enable this test.",
+        "CCM cluster did not provide a custom CA certificate.",
         caCertPath != null && Files.exists(caCertPath));
 
     TlsConfig tlsConfig =
@@ -157,7 +157,7 @@ public class HttpClientImplementationAsyncIT {
   public void testNettyClientHttpsWithCustomCaCrud() throws Exception {
     Path caCertPath = IntegrationTestConfig.CA_CERT_PATH;
     assumeTrue(
-        "Custom CA certificate path not set. Set ALTERNATOR_CA_CERT_PATH to enable this test.",
+        "CCM cluster did not provide a custom CA certificate.",
         caCertPath != null && Files.exists(caCertPath));
 
     TlsConfig tlsConfig =
@@ -284,7 +284,7 @@ public class HttpClientImplementationAsyncIT {
   public void testCrtAsyncClientHttpsWithCustomCaFailsOnInit() throws Exception {
     Path caCertPath = IntegrationTestConfig.CA_CERT_PATH;
     assumeTrue(
-        "Custom CA certificate path not set. Set ALTERNATOR_CA_CERT_PATH to enable this test.",
+        "CCM cluster did not provide a custom CA certificate.",
         caCertPath != null && Files.exists(caCertPath));
 
     TlsConfig tlsConfig =

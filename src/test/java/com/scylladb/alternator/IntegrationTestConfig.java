@@ -15,8 +15,12 @@
  */
 package com.scylladb.alternator;
 
+import com.scylladb.alternator.testinfra.AlternatorConnection;
+import com.scylladb.alternator.testinfra.AlternatorTransport;
+import com.scylladb.alternator.testinfra.ClusterSpecs;
+import com.scylladb.alternator.testinfra.ReusableClusterLease;
+import com.scylladb.alternator.testinfra.TestClusters;
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collection;
@@ -30,50 +34,59 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
  * <p>Environment variables:
  *
  * <ul>
- *   <li>{@code ALTERNATOR_HOST} - Host address (default: 172.39.0.2)
- *   <li>{@code ALTERNATOR_PORT} - HTTP port (default: 9998)
- *   <li>{@code ALTERNATOR_HTTPS_PORT} - HTTPS port (default: 9999)
- *   <li>{@code ALTERNATOR_DATACENTER} - Datacenter name (default: datacenter1)
- *   <li>{@code ALTERNATOR_RACK} - Rack name (default: rack1)
  *   <li>{@code INTEGRATION_TESTS} - Set to "true" to enable integration tests
- *   <li>{@code ALTERNATOR_CA_CERT_PATH} - Optional path to CA certificate for TLS tests
+ *   <li>{@code SCYLLA_VERSION} - CCM Scylla package selector (default: release:2025.2.5)
+ *   <li>{@code SCYLLA_CCM_PATH} - CCM executable selected by the Makefile
+ *   <li>{@code SCYLLA_CCM_ROOT} - Optional private root for runs and address reservations
+ *   <li>{@code SCYLLA_CCM_DIAGNOSTICS_DIR} - External diagnostic artifact directory
+ *   <li>{@code SCYLLA_CCM_MAX_NODES} - Optional lower override for the nine-node ceiling
  * </ul>
  */
 public final class IntegrationTestConfig {
-
-  public static final String HOST = System.getenv().getOrDefault("ALTERNATOR_HOST", "172.39.0.2");
-
-  public static final int HTTP_PORT =
-      Integer.parseInt(System.getenv().getOrDefault("ALTERNATOR_PORT", "9998"));
-
-  public static final int HTTPS_PORT =
-      Integer.parseInt(System.getenv().getOrDefault("ALTERNATOR_HTTPS_PORT", "9999"));
-
-  public static final String DATACENTER =
-      System.getenv().getOrDefault("ALTERNATOR_DATACENTER", "datacenter1");
-
-  public static final String RACK = System.getenv().getOrDefault("ALTERNATOR_RACK", "rack1");
-
   public static final boolean ENABLED =
       Boolean.parseBoolean(System.getenv().getOrDefault("INTEGRATION_TESTS", "false"));
 
+  public static final String HOST;
+  public static final int HTTP_PORT;
+  public static final int HTTPS_PORT;
+  public static final String DATACENTER;
+  public static final String RACK;
   public static final Path CA_CERT_PATH;
-
   public static final URI HTTP_SEED_URI;
   public static final URI HTTPS_SEED_URI;
+  public static final StaticCredentialsProvider CREDENTIALS;
 
-  public static final StaticCredentialsProvider CREDENTIALS =
-      StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
+  private static final ReusableClusterLease SUITE_CLUSTER;
 
   static {
-    String caCertEnv = System.getenv("ALTERNATOR_CA_CERT_PATH");
-    CA_CERT_PATH = (caCertEnv != null && !caCertEnv.isEmpty()) ? Path.of(caCertEnv) : null;
-
-    try {
-      HTTP_SEED_URI = new URI("http://" + HOST + ":" + HTTP_PORT);
-      HTTPS_SEED_URI = new URI("https://" + HOST + ":" + HTTPS_PORT);
-    } catch (URISyntaxException e) {
-      throw new ExceptionInInitializerError(e);
+    if (ENABLED) {
+      try {
+        SUITE_CLUSTER = TestClusters.acquireReusable(ClusterSpecs.defaultSpec());
+        AlternatorConnection http = SUITE_CLUSTER.cluster().connection(AlternatorTransport.HTTP);
+        AlternatorConnection https = SUITE_CLUSTER.cluster().connection(AlternatorTransport.HTTPS);
+        HTTP_SEED_URI = http.seedEndpoint();
+        HTTPS_SEED_URI = https.seedEndpoint();
+        HOST = HTTP_SEED_URI.getHost();
+        HTTP_PORT = HTTP_SEED_URI.getPort();
+        HTTPS_PORT = HTTPS_SEED_URI.getPort();
+        DATACENTER = SUITE_CLUSTER.cluster().nodes().get(0).datacenter();
+        RACK = SUITE_CLUSTER.cluster().nodes().get(0).rack();
+        CA_CERT_PATH = https.caCertificatePath();
+        CREDENTIALS = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
+      } catch (Exception exception) {
+        throw new ExceptionInInitializerError(exception);
+      }
+    } else {
+      SUITE_CLUSTER = null;
+      HOST = "127.0.0.1";
+      HTTP_PORT = 8080;
+      HTTPS_PORT = 8043;
+      DATACENTER = "dc1";
+      RACK = "RAC1";
+      CA_CERT_PATH = null;
+      HTTP_SEED_URI = URI.create("http://" + HOST + ":" + HTTP_PORT);
+      HTTPS_SEED_URI = URI.create("https://" + HOST + ":" + HTTPS_PORT);
+      CREDENTIALS = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
     }
   }
 

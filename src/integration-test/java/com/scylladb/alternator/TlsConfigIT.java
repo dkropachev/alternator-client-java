@@ -54,13 +54,12 @@ import software.amazon.awssdk.services.dynamodb.model.ListTablesRequest;
  *   <li>Both synchronous and asynchronous clients
  * </ul>
  *
- * <p>Set environment variables to configure:
+ * <p>The CCM harness supplies the HTTPS endpoint and a generated CA certificate. Set environment
+ * variables to configure:
  *
  * <ul>
- *   <li>ALTERNATOR_HOST: Host address (default: 172.39.0.2)
- *   <li>ALTERNATOR_HTTPS_PORT: Port number for HTTPS (default: 9999)
  *   <li>INTEGRATION_TESTS: Set to "true" to enable tests
- *   <li>ALTERNATOR_CA_CERT_PATH: Path to CA certificate (optional, for custom CA tests)
+ *   <li>SCYLLA_VERSION: CCM Scylla package selector
  * </ul>
  *
  * @author dmitry.kropachev
@@ -232,7 +231,7 @@ public class TlsConfigIT {
   @Test
   public void testSyncClientWithCustomCaCert() throws Exception {
     assumeTrue(
-        "Custom CA certificate path not set. Set ALTERNATOR_CA_CERT_PATH to enable this test.",
+        "CCM cluster did not provide a custom CA certificate.",
         customCaCertPath != null && Files.exists(customCaCertPath));
 
     TlsConfig tlsConfig =
@@ -262,7 +261,7 @@ public class TlsConfigIT {
   @Test
   public void testAsyncClientWithCustomCaCert() throws Exception {
     assumeTrue(
-        "Custom CA certificate path not set. Set ALTERNATOR_CA_CERT_PATH to enable this test.",
+        "CCM cluster did not provide a custom CA certificate.",
         customCaCertPath != null && Files.exists(customCaCertPath));
 
     TlsConfig tlsConfig =
@@ -283,7 +282,7 @@ public class TlsConfigIT {
   @Test
   public void testCustomCaCertCombinedWithSystemCAs() throws Exception {
     assumeTrue(
-        "Custom CA certificate path not set. Set ALTERNATOR_CA_CERT_PATH to enable this test.",
+        "CCM cluster did not provide a custom CA certificate.",
         customCaCertPath != null && Files.exists(customCaCertPath));
 
     // Trust both custom CA and system CAs
@@ -369,7 +368,7 @@ public class TlsConfigIT {
   @Test
   public void testHostnameVerificationEnabled() throws Exception {
     assumeTrue(
-        "Custom CA certificate path not set. Set ALTERNATOR_CA_CERT_PATH to enable this test.",
+        "CCM cluster did not provide a custom CA certificate.",
         customCaCertPath != null && Files.exists(customCaCertPath));
 
     TlsConfig tlsConfig =
@@ -399,7 +398,7 @@ public class TlsConfigIT {
   @Test
   public void testHostnameVerificationDisabled() throws Exception {
     assumeTrue(
-        "Custom CA certificate path not set. Set ALTERNATOR_CA_CERT_PATH to enable this test.",
+        "CCM cluster did not provide a custom CA certificate.",
         customCaCertPath != null && Files.exists(customCaCertPath));
 
     TlsConfig tlsConfig =
@@ -650,7 +649,7 @@ public class TlsConfigIT {
   @Test
   public void testSslContextWithCustomCaCert() throws Exception {
     assumeTrue(
-        "Custom CA certificate path not set. Set ALTERNATOR_CA_CERT_PATH to enable this test.",
+        "CCM cluster did not provide a custom CA certificate.",
         customCaCertPath != null && Files.exists(customCaCertPath));
 
     TlsConfig config =

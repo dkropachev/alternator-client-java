@@ -45,14 +45,12 @@ import software.amazon.awssdk.services.dynamodb.model.*;
  * reused across multiple {@code /localnodes} requests, rather than being created and destroyed for
  * each request.
  *
- * <p>Tests run against both HTTP and HTTPS endpoints. Requires a running ScyllaDB cluster with
- * Alternator enabled. Set environment variables:
+ * <p>Tests run against both HTTP and HTTPS endpoints on a CCM-provisioned ScyllaDB cluster. Set
+ * environment variables:
  *
  * <ul>
  *   <li>INTEGRATION_TESTS=true - Enable integration tests
- *   <li>ALTERNATOR_HOST - Host address (default: 172.39.0.2)
- *   <li>ALTERNATOR_PORT - HTTP port number (default: 9998)
- *   <li>ALTERNATOR_HTTPS_PORT - HTTPS port number (default: 9999)
+ *   <li>SCYLLA_VERSION - CCM Scylla package selector
  * </ul>
  */
 @RunWith(Parameterized.class)

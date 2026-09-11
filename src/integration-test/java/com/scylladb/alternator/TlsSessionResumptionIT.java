@@ -36,15 +36,14 @@ import software.amazon.awssdk.services.dynamodb.model.ListTablesRequest;
 /**
  * Integration tests for TLS session ticket support.
  *
- * <p>These tests require a running ScyllaDB cluster with Alternator enabled over HTTPS. The tests
- * verify that TLS session caching is properly configured and improves connection performance.
+ * <p>These tests use a CCM-provisioned ScyllaDB cluster with Alternator enabled over HTTPS. The
+ * tests verify that TLS session caching is properly configured and improves connection performance.
  *
  * <p>Set environment variables to configure:
  *
  * <ul>
- *   <li>ALTERNATOR_HOST: Host address (default: 172.39.0.2)
- *   <li>ALTERNATOR_PORT: Port number for HTTPS (default: 9999)
  *   <li>INTEGRATION_TESTS: Set to "true" to enable tests
+ *   <li>SCYLLA_VERSION: CCM Scylla package selector
  * </ul>
  */
 public class TlsSessionResumptionIT {

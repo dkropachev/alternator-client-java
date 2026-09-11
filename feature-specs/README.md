@@ -47,6 +47,7 @@ Every behavior change should:
 
 | Feature | Generic specification | Implementation details |
 | --- | --- | --- |
+| CCM integration | [CCM integration](ccm-integration.md) | [Implementation details](implementation/ccm-integration.md) |
 | Compression | [Compression](compression.md) | [Implementation details](implementation/compression.md) |
 | Header optimization | [Header optimization](header-optimization.md) | [Implementation details](implementation/header-optimization.md) |
 | Key-route affinity | [Key-route affinity](key-route-affinity.md) | [Implementation details](implementation/key-route-affinity.md) |
