@@ -54,8 +54,8 @@ public class AlternatorDynamoDbAsyncClientWrapper implements AutoCloseable {
   private final DynamoDbAsyncClient client;
   private final AlternatorLiveNodes liveNodes;
   private final AlternatorConfig config;
-  private final AffinityQueryPlanInterceptor affinityInterceptor;
-  private final SdkHttpClient pollingHttpClient;
+  private final AlternatorClientResources resources;
+  private boolean closed;
 
   /**
    * Creates a new wrapper with the given client and live nodes.
@@ -114,11 +114,26 @@ public class AlternatorDynamoDbAsyncClientWrapper implements AutoCloseable {
       AlternatorConfig config,
       AffinityQueryPlanInterceptor affinityInterceptor,
       SdkHttpClient pollingHttpClient) {
+    this(
+        client,
+        liveNodes,
+        config,
+        affinityInterceptor,
+        pollingHttpClient,
+        new AlternatorClientResources(liveNodes, affinityInterceptor, pollingHttpClient));
+  }
+
+  AlternatorDynamoDbAsyncClientWrapper(
+      DynamoDbAsyncClient client,
+      AlternatorLiveNodes liveNodes,
+      AlternatorConfig config,
+      AffinityQueryPlanInterceptor affinityInterceptor,
+      SdkHttpClient pollingHttpClient,
+      AlternatorClientResources resources) {
     this.client = client;
     this.liveNodes = liveNodes;
     this.config = config;
-    this.affinityInterceptor = affinityInterceptor;
-    this.pollingHttpClient = pollingHttpClient;
+    this.resources = resources;
   }
 
   /**
@@ -222,17 +237,35 @@ public class AlternatorDynamoDbAsyncClientWrapper implements AutoCloseable {
    *   <li>Stopping the LiveNodes background thread
    *   <li>Closing the polling HTTP client
    *   <li>Closing the underlying async DynamoDB client
+   *   <li>Closing the main HTTP client when it is owned by the Alternator builder
    * </ul>
    */
   @Override
-  public void close() {
-    if (affinityInterceptor != null) {
-      affinityInterceptor.getPartitionKeyResolver().shutdown();
+  public synchronized void close() {
+    if (closed) {
+      return;
     }
-    liveNodes.shutdownAndWait();
-    if (pollingHttpClient != null) {
-      pollingHttpClient.close();
+    closed = true;
+
+    RuntimeException failure = null;
+    try {
+      resources.close();
+    } catch (RuntimeException e) {
+      failure = e;
     }
-    client.close();
+
+    try {
+      client.close();
+    } catch (RuntimeException e) {
+      if (failure == null) {
+        failure = e;
+      } else {
+        failure.addSuppressed(e);
+      }
+    }
+
+    if (failure != null) {
+      throw failure;
+    }
   }
 }

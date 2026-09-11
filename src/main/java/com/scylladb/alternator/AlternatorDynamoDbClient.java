@@ -29,6 +29,7 @@ import java.net.URI;
 import java.util.Collection;
 import java.util.Objects;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
@@ -120,7 +121,7 @@ public class AlternatorDynamoDbClient {
     private HttpClientType httpClientType;
     private UnaryOperator<String> userAgentTransformer = AlternatorUserAgent.defaultUserAgent();
 
-    private AlternatorDynamoDbClientBuilder() {
+    AlternatorDynamoDbClientBuilder() {
       this.delegate = DynamoDbClient.builder();
       this.configBuilder = AlternatorConfig.builder();
     }
@@ -808,73 +809,84 @@ public class AlternatorDynamoDbClient {
       }
       delegate.overrideConfiguration(compressionOverrideBuilder.build());
 
-      TlsConfig tlsConfig = alternatorConfig.getTlsConfig();
-      SdkHttpClient mainClient = null;
-      SdkHttpClient pollingClient;
-      if (!httpClientSet) {
-        mainClient = createMainSyncClient(clientType, alternatorConfig, tlsConfig);
+      SdkHttpClient pollingClient = null;
+      AlternatorLiveNodes liveNodes = null;
+      AlternatorClientResources resources = null;
+      RoutingSdkHttpClientBuilder routingClientBuilder = null;
+      DynamoDbClient client = null;
+      try {
+        TlsConfig tlsConfig = alternatorConfig.getTlsConfig();
+        SdkHttpClient.Builder mainClientBuilder;
+        boolean closeMainClient;
+        SyncClientDetector.SyncClientType pollingType;
+        if (!httpClientSet) {
+          mainClientBuilder =
+              new FactorySdkHttpClientBuilder(
+                  () -> createMainSyncClient(clientType, alternatorConfig, tlsConfig));
+          closeMainClient = true;
+          pollingType = clientType;
+        } else if (customHttpClient != null) {
+          mainClientBuilder = new FixedSdkHttpClientBuilder(customHttpClient);
+          closeMainClient = false;
+          pollingType = SyncClientDetector.detect();
+        } else {
+          mainClientBuilder = customHttpClientBuilder;
+          closeMainClient = true;
+          pollingType = SyncClientDetector.detect();
+        }
+
         pollingClient =
-            SyncClientDetector.createPollingClient(
-                clientType,
-                tlsConfig,
-                alternatorConfig.getNodeHealthConfig().getHealthProbeConcurrency() + 1);
-      } else if (customHttpClient != null) {
-        mainClient = customHttpClient;
-        SyncClientDetector.SyncClientType pollingType = SyncClientDetector.detect();
-        pollingClient =
-            SyncClientDetector.createPollingClient(
+            createPollingClient(
                 pollingType,
                 tlsConfig,
                 alternatorConfig.getNodeHealthConfig().getHealthProbeConcurrency() + 1);
-      } else {
-        SyncClientDetector.SyncClientType pollingType = SyncClientDetector.detect();
-        pollingClient =
-            SyncClientDetector.createPollingClient(
-                pollingType,
-                tlsConfig,
-                alternatorConfig.getNodeHealthConfig().getHealthProbeConcurrency() + 1);
-      }
+        pollingClient = configurePollingSyncClient(pollingClient, alternatorConfig);
+        liveNodes = createLiveNodes(alternatorConfig, pollingClient);
 
-      pollingClient = configurePollingSyncClient(pollingClient, alternatorConfig);
-      AlternatorLiveNodes liveNodes = new AlternatorLiveNodes(alternatorConfig, pollingClient);
-      liveNodes.start();
+        ClientOverrideConfiguration.Builder overrideBuilder =
+            delegate.overrideConfiguration() != null
+                ? delegate.overrideConfiguration().toBuilder()
+                : ClientOverrideConfiguration.builder();
 
-      ClientOverrideConfiguration.Builder overrideBuilder =
-          delegate.overrideConfiguration() != null
-              ? delegate.overrideConfiguration().toBuilder()
-              : ClientOverrideConfiguration.builder();
-
-      AffinityQueryPlanInterceptor affinityInterceptor = null;
-      BasicQueryPlanInterceptor queryPlanInterceptor;
-      KeyRouteAffinityConfig keyAffinityConfig = alternatorConfig.getKeyRouteAffinityConfig();
-      if (keyAffinityConfig != null
-          && keyAffinityConfig.getType() != null
-          && keyAffinityConfig.getType() != KeyRouteAffinity.NONE) {
-        affinityInterceptor = new AffinityQueryPlanInterceptor(keyAffinityConfig, liveNodes);
-        queryPlanInterceptor = affinityInterceptor;
-      } else {
-        queryPlanInterceptor = new BasicQueryPlanInterceptor(liveNodes);
-      }
-      overrideBuilder.addExecutionInterceptor(queryPlanInterceptor);
-      delegate.overrideConfiguration(overrideBuilder.build());
-      if (customHttpClientBuilder != null) {
-        delegate.httpClientBuilder(
+        AffinityQueryPlanInterceptor affinityInterceptor = null;
+        BasicQueryPlanInterceptor queryPlanInterceptor;
+        KeyRouteAffinityConfig keyAffinityConfig = alternatorConfig.getKeyRouteAffinityConfig();
+        if (keyAffinityConfig != null
+            && keyAffinityConfig.getType() != null
+            && keyAffinityConfig.getType() != KeyRouteAffinity.NONE) {
+          affinityInterceptor = new AffinityQueryPlanInterceptor(keyAffinityConfig, liveNodes);
+          queryPlanInterceptor = affinityInterceptor;
+        } else {
+          queryPlanInterceptor = new BasicQueryPlanInterceptor(liveNodes);
+        }
+        resources = new AlternatorClientResources(liveNodes, affinityInterceptor, pollingClient);
+        overrideBuilder.addExecutionInterceptor(queryPlanInterceptor);
+        delegate.overrideConfiguration(overrideBuilder.build());
+        routingClientBuilder =
             new RoutingSdkHttpClientBuilder(
-                customHttpClientBuilder, alternatorConfig, queryPlanInterceptor));
-      } else {
-        delegate.httpClient(
-            configureMainSyncClient(mainClient, alternatorConfig, queryPlanInterceptor));
+                mainClientBuilder,
+                alternatorConfig,
+                queryPlanInterceptor,
+                resources,
+                closeMainClient);
+        delegate.httpClientBuilder(routingClientBuilder);
+
+        delegate.endpointOverride(seedUri);
+        if (region == null) {
+          delegate.region(Region.of("fake-aws-region"));
+        }
+
+        client = delegate.build();
+        AlternatorDynamoDbClientWrapper wrapper =
+            new AlternatorDynamoDbClientWrapper(
+                client, liveNodes, alternatorConfig, affinityInterceptor, pollingClient, resources);
+        liveNodes.start();
+        return wrapper;
+      } catch (RuntimeException | Error e) {
+        closeAfterBuildFailure(
+            e, client, routingClientBuilder, resources, liveNodes, pollingClient);
+        throw e;
       }
-
-      delegate.endpointOverride(seedUri);
-
-      if (region == null) {
-        delegate.region(Region.of("fake-aws-region"));
-      }
-
-      DynamoDbClient client = delegate.build();
-      return new AlternatorDynamoDbClientWrapper(
-          client, liveNodes, alternatorConfig, affinityInterceptor, pollingClient);
     }
 
     /**
@@ -945,7 +957,7 @@ public class AlternatorDynamoDbClient {
       }
     }
 
-    private SdkHttpClient createMainSyncClient(
+    SdkHttpClient createMainSyncClient(
         SyncClientDetector.SyncClientType clientType,
         AlternatorConfig config,
         TlsConfig tlsConfig) {
@@ -959,10 +971,22 @@ public class AlternatorDynamoDbClient {
       }
     }
 
+    SdkHttpClient createPollingClient(
+        SyncClientDetector.SyncClientType clientType, TlsConfig tlsConfig, int maxConnections) {
+      return SyncClientDetector.createPollingClient(clientType, tlsConfig, maxConnections);
+    }
+
+    AlternatorLiveNodes createLiveNodes(
+        AlternatorConfig alternatorConfig, SdkHttpClient pollingClient) {
+      return new AlternatorLiveNodes(alternatorConfig, pollingClient);
+    }
+
     private SdkHttpClient configureMainSyncClient(
         SdkHttpClient mainClient,
         AlternatorConfig alternatorConfig,
-        BasicQueryPlanInterceptor queryPlanInterceptor) {
+        BasicQueryPlanInterceptor queryPlanInterceptor,
+        AlternatorClientResources resources,
+        boolean closeMainClient) {
       SdkHttpClient configuredClient = mainClient;
       if (userAgentTransformer != null) {
         configuredClient = new UserAgentSdkHttpClient(configuredClient, userAgentTransformer);
@@ -972,7 +996,8 @@ public class AlternatorDynamoDbClient {
             new HeadersFilteringSdkHttpClient(
                 configuredClient, alternatorConfig.getHeadersWhitelist());
       }
-      return new AttemptRoutingSdkHttpClient(configuredClient, queryPlanInterceptor);
+      configuredClient = new AttemptRoutingSdkHttpClient(configuredClient, queryPlanInterceptor);
+      return new LifecycleSdkHttpClient(configuredClient, resources, closeMainClient);
     }
 
     private SdkHttpClient configurePollingSyncClient(
@@ -988,28 +1013,132 @@ public class AlternatorDynamoDbClient {
       private final SdkHttpClient.Builder delegateBuilder;
       private final AlternatorConfig alternatorConfig;
       private final BasicQueryPlanInterceptor queryPlanInterceptor;
+      private final AlternatorClientResources resources;
+      private final boolean closeDelegate;
+      private SdkHttpClient builtClient;
 
       private RoutingSdkHttpClientBuilder(
           SdkHttpClient.Builder delegateBuilder,
           AlternatorConfig alternatorConfig,
-          BasicQueryPlanInterceptor queryPlanInterceptor) {
+          BasicQueryPlanInterceptor queryPlanInterceptor,
+          AlternatorClientResources resources,
+          boolean closeDelegate) {
         this.delegateBuilder = delegateBuilder;
         this.alternatorConfig = alternatorConfig;
         this.queryPlanInterceptor = queryPlanInterceptor;
+        this.resources = resources;
+        this.closeDelegate = closeDelegate;
+      }
+
+      @Override
+      public synchronized SdkHttpClient build() {
+        return configure(delegateBuilder.build());
+      }
+
+      @Override
+      public synchronized SdkHttpClient buildWithDefaults(AttributeMap serviceDefaults) {
+        return configure(delegateBuilder.buildWithDefaults(serviceDefaults));
+      }
+
+      private SdkHttpClient configure(SdkHttpClient client) {
+        if (builtClient != null) {
+          if (closeDelegate) {
+            client.close();
+          }
+          throw new IllegalStateException("HTTP client builder may only build one client");
+        }
+        try {
+          builtClient =
+              configureMainSyncClient(
+                  client, alternatorConfig, queryPlanInterceptor, resources, closeDelegate);
+          return builtClient;
+        } catch (RuntimeException | Error e) {
+          if (closeDelegate) {
+            try {
+              client.close();
+            } catch (RuntimeException closeFailure) {
+              e.addSuppressed(closeFailure);
+            }
+          }
+          throw e;
+        }
+      }
+
+      private synchronized void closeBuiltClient() {
+        if (builtClient != null) {
+          builtClient.close();
+        }
+      }
+    }
+
+    private static final class FixedSdkHttpClientBuilder
+        implements SdkHttpClient.Builder<FixedSdkHttpClientBuilder> {
+      private final SdkHttpClient client;
+
+      private FixedSdkHttpClientBuilder(SdkHttpClient client) {
+        this.client = client;
       }
 
       @Override
       public SdkHttpClient build() {
-        return configureMainSyncClient(
-            delegateBuilder.build(), alternatorConfig, queryPlanInterceptor);
+        return client;
       }
 
       @Override
       public SdkHttpClient buildWithDefaults(AttributeMap serviceDefaults) {
-        return configureMainSyncClient(
-            delegateBuilder.buildWithDefaults(serviceDefaults),
-            alternatorConfig,
-            queryPlanInterceptor);
+        return client;
+      }
+    }
+
+    private static final class FactorySdkHttpClientBuilder
+        implements SdkHttpClient.Builder<FactorySdkHttpClientBuilder> {
+      private final Supplier<SdkHttpClient> clientFactory;
+
+      private FactorySdkHttpClientBuilder(Supplier<SdkHttpClient> clientFactory) {
+        this.clientFactory = clientFactory;
+      }
+
+      @Override
+      public SdkHttpClient build() {
+        return clientFactory.get();
+      }
+
+      @Override
+      public SdkHttpClient buildWithDefaults(AttributeMap serviceDefaults) {
+        return clientFactory.get();
+      }
+    }
+
+    private void closeAfterBuildFailure(
+        Throwable failure,
+        DynamoDbClient client,
+        RoutingSdkHttpClientBuilder routingClientBuilder,
+        AlternatorClientResources resources,
+        AlternatorLiveNodes liveNodes,
+        SdkHttpClient pollingClient) {
+      if (client != null) {
+        runCleanupAfterBuildFailure(failure, client::close);
+      }
+      if (routingClientBuilder != null) {
+        runCleanupAfterBuildFailure(failure, routingClientBuilder::closeBuiltClient);
+      }
+      if (resources != null) {
+        runCleanupAfterBuildFailure(failure, resources::close);
+      } else {
+        if (liveNodes != null) {
+          runCleanupAfterBuildFailure(failure, liveNodes::shutdownAndWait);
+        }
+        if (pollingClient != null) {
+          runCleanupAfterBuildFailure(failure, pollingClient::close);
+        }
+      }
+    }
+
+    private void runCleanupAfterBuildFailure(Throwable failure, Runnable cleanup) {
+      try {
+        cleanup.run();
+      } catch (RuntimeException closeFailure) {
+        failure.addSuppressed(closeFailure);
       }
     }
 
