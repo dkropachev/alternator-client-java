@@ -30,7 +30,9 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -103,6 +105,64 @@ public class ClusterInfrastructureTest {
         assertEquals(1, harness.provisioner.removeCount.get());
       }
     }
+  }
+
+  @Test
+  public void interruptedHealthValidationLeavesIdleClusterOwnedAndReusable() throws Exception {
+    try (Harness harness = new Harness(1)) {
+      ClusterSpec spec = oneNodeSpec("interrupted-health");
+      String instanceId;
+      try (ReusableClusterLease lease = harness.pool.acquireReusable(spec)) {
+        instanceId = lease.cluster().instanceId();
+      }
+      harness.provisioner.interruptHealth = true;
+
+      try {
+        assertThrows(InterruptedException.class, () -> harness.pool.acquireReusable(spec));
+        assertTrue(Thread.currentThread().isInterrupted());
+      } finally {
+        Thread.interrupted();
+      }
+
+      assertEquals(0, harness.provisioner.removeCount.get());
+      harness.provisioner.interruptHealth = false;
+      try (ReusableClusterLease lease = harness.pool.acquireReusable(spec)) {
+        assertEquals(instanceId, lease.cluster().instanceId());
+      }
+      assertEquals(1, harness.provisioner.provisionCount.get());
+    }
+  }
+
+  @Test
+  public void interruptedPoolCloseFinishesCleanupBeforeRestoringInterrupt() throws Exception {
+    Harness harness = new Harness(1);
+    try (ReusableClusterLease ignored =
+        harness.pool.acquireReusable(oneNodeSpec("interrupted-close"))) {}
+    Path runDirectory = harness.state.runDirectory();
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    AtomicBoolean interruptRestored = new AtomicBoolean();
+    Thread closing =
+        new Thread(
+            () -> {
+              Thread.currentThread().interrupt();
+              try {
+                harness.pool.close();
+              } catch (Throwable exception) {
+                failure.set(exception);
+              } finally {
+                interruptRestored.set(Thread.currentThread().isInterrupted());
+              }
+            });
+
+    closing.start();
+    closing.join(10_000);
+
+    assertFalse("Interrupted pool close did not finish", closing.isAlive());
+    assertEquals(null, failure.get());
+    assertTrue(interruptRestored.get());
+    assertFalse(harness.provisioner.removalSawInterrupt);
+    assertEquals(1, harness.provisioner.removeCount.get());
+    assertFalse(Files.exists(runDirectory));
   }
 
   @Test
@@ -212,6 +272,8 @@ public class ClusterInfrastructureTest {
     final AtomicInteger removeCount = new AtomicInteger();
     final AtomicInteger healthCount = new AtomicInteger();
     volatile boolean healthy = true;
+    volatile boolean interruptHealth;
+    volatile boolean removalSawInterrupt;
     volatile int lastCcmId;
 
     FakeProvisioner(Path runDirectory) throws Exception {
@@ -239,13 +301,18 @@ public class ClusterInfrastructureTest {
     }
 
     @Override
-    boolean isHealthy(PhysicalTestCluster cluster) {
+    boolean isHealthy(PhysicalTestCluster cluster) throws InterruptedException {
       healthCount.incrementAndGet();
+      if (interruptHealth) {
+        Thread.currentThread().interrupt();
+        throw new InterruptedException("injected health-check interruption");
+      }
       return healthy;
     }
 
     @Override
     void remove(PhysicalTestCluster cluster) {
+      removalSawInterrupt |= Thread.currentThread().isInterrupted();
       removeCount.incrementAndGet();
       healthy = true;
     }

@@ -70,7 +70,7 @@ test-unit:
 	${mvn} test
 
 test-integration: ccm-install
-	@for command in setsid kill ps; do
+	@for command in openssl setsid kill ps; do
 		executable=$$(type -P -- "$$command" || true)
 		[[ -n "$$executable" && -x "$$executable" ]] || {
 			echo "An external $$command executable is required for CCM integration tests" >&2
@@ -96,7 +96,8 @@ test-all: test-integration
 ccm-install:
 	@ccm_works() {
 		local executable=$$1
-		[[ -f "$$executable" && -x "$$executable" ]] \
+		[[ "$$executable" == */* ]] || executable=$$(type -P -- "$$executable" || true)
+		[[ -n "$$executable" && -f "$$executable" && -x "$$executable" ]] \
 			&& "$$executable" create --help >/dev/null 2>&1
 	}
 	install_complete() {

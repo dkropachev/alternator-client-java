@@ -49,6 +49,12 @@ public class CcmRunStateTest {
     assumeTrue(
         "CCM run-state tests require Linux",
         System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux"));
+    assumeTrue(
+        "CCM run-state tests require /usr/bin/env", Files.isExecutable(Path.of("/usr/bin/env")));
+    for (String command :
+        List.of("bash", "kill", "mkdir", "ps", "rm", "setsid", "sh", "sleep", "touch")) {
+      assumeTrue("CCM run-state tests require " + command, executableAvailable(command));
+    }
   }
 
   @Test(timeout = 60000)
@@ -518,7 +524,7 @@ public class CcmRunStateTest {
   private static Path writeFakeCcm(Path path, Path java, String classPath, Path serverLog)
       throws Exception {
     String script =
-        "#!/bin/bash\n"
+        "#!/usr/bin/env bash\n"
             + "set -euo pipefail\n"
             + "helper_java="
             + shellQuote(java.toString())
@@ -603,6 +609,20 @@ public class CcmRunStateTest {
 
   private static String shellQuote(String value) {
     return "'" + value.replace("'", "'\\\"'\\\"'") + "'";
+  }
+
+  private static boolean executableAvailable(String name) {
+    String path = System.getenv("PATH");
+    if (path == null) {
+      return false;
+    }
+    for (String directory : path.split(java.io.File.pathSeparator, -1)) {
+      Path candidate = directory.isEmpty() ? Path.of(name) : Path.of(directory).resolve(name);
+      if (Files.isRegularFile(candidate) && Files.isExecutable(candidate)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static Properties readProperties(Path path) throws Exception {

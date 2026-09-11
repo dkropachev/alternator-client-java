@@ -1146,9 +1146,11 @@ next-run recovery; cleanup is not immediate after an uncatchable process kill. S
 Tests can acquire reusable or private cluster leases directly:
 
 ```java
-try (ReusableClusterLease shared = TestClusters.acquireReusable(ClusterSpecs.defaultSpec())) {
+try (ReusableClusterLease shared = TestClusters.acquireReusable(ClusterSpecs.defaultSpec());
+    AlternatorDynamoDbClientWrapper wrapper =
+        shared.cluster().clientBuilder(AlternatorTransport.HTTP).buildWithAlternatorAPI()) {
   String tableName = shared.resources().newTableName("example");
-  DynamoDbClient client = shared.cluster().clientBuilder(AlternatorTransport.HTTP).build();
+  DynamoDbClient client = wrapper.getClient();
 }
 
 ClusterSpec privateSpec =

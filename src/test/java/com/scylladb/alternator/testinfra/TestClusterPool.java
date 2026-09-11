@@ -16,6 +16,8 @@
 package com.scylladb.alternator.testinfra;
 
 import java.io.IOException;
+import java.nio.channels.ClosedByInterruptException;
+import java.nio.channels.FileLockInterruptionException;
 import java.nio.file.Path;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
@@ -135,6 +137,7 @@ final class TestClusterPool implements AutoCloseable {
   synchronized ReusableClusterLease acquireReusable(ClusterSpec spec) throws Exception {
     validateDemand(spec);
     throwIfUnavailable();
+    throwIfInterrupted();
 
     if (current != null) {
       if (current.privateCluster) {
@@ -156,6 +159,7 @@ final class TestClusterPool implements AutoCloseable {
         return reusableLease(current);
       }
       retireCurrent();
+      throwIfInterrupted();
     }
 
     Slot created = provision(spec, false);
@@ -167,12 +171,14 @@ final class TestClusterPool implements AutoCloseable {
   synchronized PrivateClusterLease provisionPrivate(ClusterSpec spec) throws Exception {
     validateDemand(spec);
     throwIfUnavailable();
+    throwIfInterrupted();
 
     if (current != null) {
       if (current.privateCluster || current.references > 0) {
         throw new IllegalStateException("A CCM cluster lease is already active in this JVM");
       }
       retireCurrent();
+      throwIfInterrupted();
     }
 
     Slot created = provision(spec, true);
@@ -257,8 +263,11 @@ final class TestClusterPool implements AutoCloseable {
     }
 
     try {
-      cluster.removePhysical();
-      completeOwnership(retiring.ownership);
+      runCleanupPreservingInterrupt(
+          () -> {
+            cluster.removePhysical();
+            completeOwnership(retiring.ownership);
+          });
     } catch (Exception exception) {
       synchronized (this) {
         retiring.retiring = false;
@@ -283,8 +292,11 @@ final class TestClusterPool implements AutoCloseable {
       return;
     }
     try {
-      retiring.cluster.removePhysical();
-      completeOwnership(retiring.ownership);
+      runCleanupPreservingInterrupt(
+          () -> {
+            retiring.cluster.removePhysical();
+            completeOwnership(retiring.ownership);
+          });
       current = null;
       terminalFailure = null;
     } catch (Exception exception) {
@@ -392,14 +404,14 @@ final class TestClusterPool implements AutoCloseable {
     Exception failure = null;
     if (retiring != null) {
       try {
-        retireCluster(retiring.cluster);
+        runCleanupPreservingInterrupt(() -> retireCluster(retiring.cluster));
       } catch (Exception exception) {
         failure = exception;
       }
     }
     if (failure == null && runState != null) {
       try {
-        runState.close();
+        runCleanupPreservingInterrupt(runState::close);
       } catch (IOException exception) {
         failure = exception;
       }
@@ -448,5 +460,42 @@ final class TestClusterPool implements AutoCloseable {
     }
     first.addSuppressed(second);
     return first;
+  }
+
+  private static void throwIfInterrupted() throws InterruptedException {
+    if (Thread.currentThread().isInterrupted()) {
+      throw new InterruptedException("CCM cluster acquisition was interrupted");
+    }
+  }
+
+  private static void runCleanupPreservingInterrupt(CleanupOperation operation) throws Exception {
+    boolean interrupted = Thread.interrupted();
+    int interruptedAttempts = 0;
+    try {
+      while (true) {
+        try {
+          operation.run();
+          return;
+        } catch (InterruptedException
+            | ClosedByInterruptException
+            | FileLockInterruptionException exception) {
+          interrupted = true;
+          Thread.interrupted();
+          if (++interruptedAttempts == 2) {
+            throw exception;
+          }
+        }
+      }
+    } finally {
+      interrupted |= Thread.interrupted();
+      if (interrupted) {
+        Thread.currentThread().interrupt();
+      }
+    }
+  }
+
+  @FunctionalInterface
+  private interface CleanupOperation {
+    void run() throws Exception;
   }
 }

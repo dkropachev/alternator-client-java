@@ -235,7 +235,8 @@ public class ClusterProvisioningIT {
                 .withYamlOverride("hinted_handoff_enabled", "false")
                 .withYamlOverride("commitlog_sync", "batch")
                 .withYamlOverride("commitlog_sync_batch_window_in_ms", "17")
-                .withYamlOverride("commitlog_sync_period_in_ms", "null"))) {
+                .withYamlOverride("commitlog_sync_period_in_ms", "null")
+                .withYamlOverride("experimental_features", "null"))) {
       instanceId = lease.cluster().instanceId();
       lease.control().addNode("dc1", "RAC1");
       assertEquals(2, lease.cluster().nodes().size());
@@ -255,6 +256,8 @@ public class ClusterProvisioningIT {
       assertEquals(17, yaml.get("commitlog_sync_batch_window_in_ms"));
       assertTrue(yaml.containsKey("commitlog_sync_period_in_ms"));
       assertEquals(null, yaml.get("commitlog_sync_period_in_ms"));
+      assertTrue(yaml.containsKey("experimental_features"));
+      assertEquals(null, yaml.get("experimental_features"));
     }
   }
 

@@ -83,6 +83,8 @@ class CcmProvisioner {
           "commitlog_sync",
           "commitlog_sync_period_in_ms",
           "commitlog_sync_batch_window_in_ms");
+  private static final Set<String> UNSUPPORTED_CCM_ENVIRONMENT =
+      Set.of("SCYLLA_EXT_ENV", "SCYLLA_EXT_OPTS", "SCYLLA_MANAGER_PACKAGE");
 
   private final String ccmExecutable;
   private final Path runDirectory;
@@ -368,7 +370,7 @@ class CcmProvisioner {
 
   void start(PhysicalTestCluster cluster, List<TestClusterNode> nodes) throws Exception {
     for (TestClusterNode node : nodes) {
-      if (!isNodeRunning(cluster, node)) {
+      if (prepareNodeForStart(cluster, node)) {
         runCcm(cluster.ccmDirectory(), startArguments(cluster, node.name()));
       }
     }
@@ -380,16 +382,39 @@ class CcmProvisioner {
     if (clusterDirectory == null) {
       throw new IOException("CCM has no current cluster under " + cluster.ccmDirectory());
     }
-    prepareClusterProcessReferencesForCcm(clusterDirectory);
-    runCcm(
-        cluster.ccmDirectory(), List.of("stop", "--config-dir", cluster.ccmDirectory().toString()));
+    if (!prepareClusterProcessReferencesForCcm(clusterDirectory)) {
+      return;
+    }
+    runStopAndVerify(
+        cluster.ccmDirectory(),
+        clusterDirectory,
+        null,
+        List.of("stop", "--config-dir", cluster.ccmDirectory().toString()));
   }
 
   void startNode(PhysicalTestCluster cluster, TestClusterNode node) throws Exception {
-    if (!isNodeRunning(cluster, node)) {
+    if (prepareNodeForStart(cluster, node)) {
       runCcm(cluster.ccmDirectory(), startArguments(cluster, node.name()));
     }
     waitForNodeReady(cluster, node);
+  }
+
+  private boolean prepareNodeForStart(PhysicalTestCluster cluster, TestClusterNode node)
+      throws Exception {
+    if (isNodeRunning(cluster, node)) {
+      return false;
+    }
+    Path clusterDirectory = currentClusterDirectory(cluster.ccmDirectory());
+    if (clusterDirectory == null) {
+      throw new IOException("CCM has no current cluster under " + cluster.ccmDirectory());
+    }
+    if (prepareNodeProcessReferencesForCcm(clusterDirectory, node.name())) {
+      throw new CcmProcessCleanupException(
+          "Cannot restart CCM node '"
+              + node.name()
+              + "' while an ancillary node process remains alive");
+    }
+    return true;
   }
 
   void stopNode(PhysicalTestCluster cluster, TestClusterNode node) throws Exception {
@@ -397,10 +422,46 @@ class CcmProvisioner {
     if (clusterDirectory == null) {
       throw new IOException("CCM has no current cluster under " + cluster.ccmDirectory());
     }
-    prepareNodeProcessReferencesForCcm(clusterDirectory, node.name());
-    runCcm(
+    if (!prepareNodeProcessReferencesForCcm(clusterDirectory, node.name())) {
+      return;
+    }
+    runStopAndVerify(
         cluster.ccmDirectory(),
+        clusterDirectory,
+        node.name(),
         List.of(node.name(), "stop", "--config-dir", cluster.ccmDirectory().toString()));
+  }
+
+  private void runStopAndVerify(
+      Path ccmDirectory, Path clusterDirectory, String nodeName, List<String> arguments)
+      throws Exception {
+    Exception commandFailure = null;
+    boolean restoreInterrupt = false;
+    try {
+      runCcm(ccmDirectory, arguments);
+    } catch (Exception exception) {
+      commandFailure = exception;
+      restoreInterrupt = clearInterrupt(exception);
+    }
+    try {
+      try {
+        awaitStoppedProcessReferences(clusterDirectory, nodeName);
+      } catch (Exception verificationFailure) {
+        if (commandFailure != null) {
+          verificationFailure.addSuppressed(commandFailure);
+        }
+        throw verificationFailure;
+      }
+      if (commandFailure != null
+          && !(commandFailure instanceof CcmCommandException)
+          && !(commandFailure instanceof InterruptedException)) {
+        throw commandFailure;
+      }
+    } finally {
+      if (restoreInterrupt) {
+        Thread.currentThread().interrupt();
+      }
+    }
   }
 
   TestClusterNode addNode(PhysicalTestCluster cluster, String datacenter, String rack)
@@ -416,6 +477,7 @@ class CcmProvisioner {
     TestClusterNode node =
         new TestClusterNode(
             "node" + index, "127.0." + cluster.ccmId() + "." + index, datacenter, rack);
+    boolean startAttempted = false;
     try {
       runCcm(
           cluster.ccmDirectory(),
@@ -438,6 +500,7 @@ class CcmProvisioner {
       }
       applyYamlOverrides(cluster.spec(), cluster.ccmDirectory(), List.of(node), false);
       verifyYamlOverrides(cluster.spec(), cluster.ccmDirectory(), List.of(node));
+      startAttempted = true;
       startNode(cluster, node);
       return node;
     } catch (Exception provisioningException) {
@@ -467,7 +530,8 @@ class CcmProvisioner {
           throw new CcmNodeProvisioningException(
               node, true, provisioningException, rollbackException);
         }
-        throw new CcmNodeProvisioningException(node, false, provisioningException, null);
+        throw new CcmNodeProvisioningException(
+            node, false, startAttempted, provisioningException, null);
       } finally {
         if (restoreInterrupt) {
           Thread.currentThread().interrupt();
@@ -487,13 +551,16 @@ class CcmProvisioner {
     removeNodeByName(cluster.ccmDirectory(), node.name());
   }
 
-  boolean isHealthy(PhysicalTestCluster cluster) {
+  boolean isHealthy(PhysicalTestCluster cluster) throws InterruptedException {
+    if (Thread.currentThread().isInterrupted()) {
+      throw new InterruptedException("CCM cluster health validation was interrupted");
+    }
     try {
       waitForAlternator(cluster, cluster.nodes(), Duration.ofSeconds(10));
       return true;
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
-      return false;
+      throw interrupted;
     } catch (Exception ignored) {
       return false;
     }
@@ -513,7 +580,7 @@ class CcmProvisioner {
       java.util.Optional<ProcessHandle> process = ProcessHandle.of(pid);
       if (process.isPresent() && isProcessAlive(process.get())) {
         if (!nodeProcessBelongsTo(process.get(), nodeDirectory)) {
-          throw new IOException(
+          throw new CcmProcessCleanupException(
               "CCM node '" + node.name() + "' references an unrelated live PID " + pid);
         }
         return true;
@@ -766,7 +833,7 @@ class CcmProvisioner {
     applyYamlOverrides(spec, ccmDirectory, nodes, true);
   }
 
-  private void applyYamlOverrides(
+  void applyYamlOverrides(
       ClusterSpec spec, Path ccmDirectory, List<TestClusterNode> nodes, boolean updateClusterState)
       throws IOException {
     if (spec.scyllaYamlOverrides().isEmpty()) {
@@ -776,16 +843,7 @@ class CcmProvisioner {
     if (clusterDirectory == null) {
       throw new IOException("CCM has no current cluster under " + ccmDirectory);
     }
-    Map<String, String> implicitOverrideText = new LinkedHashMap<>();
-    for (Map.Entry<String, String> override : spec.scyllaYamlOverrides().entrySet()) {
-      if (CCM_IMPLICIT_NODE_KEYS.contains(override.getKey())) {
-        implicitOverrideText.put(override.getKey(), override.getValue());
-      }
-    }
-    if (implicitOverrideText.isEmpty()) {
-      return;
-    }
-    Map<String, Object> overrides = parseYamlOverrides(implicitOverrideText);
+    Map<String, Object> overrides = parseYamlOverrides(spec.scyllaYamlOverrides());
     if (updateClusterState) {
       Path clusterConfig = clusterDirectory.resolve("cluster.conf");
       Map<String, Object> clusterYaml = readYamlMap(clusterConfig);
@@ -815,7 +873,7 @@ class CcmProvisioner {
     }
   }
 
-  private void verifyYamlOverrides(ClusterSpec spec, Path ccmDirectory, List<TestClusterNode> nodes)
+  void verifyYamlOverrides(ClusterSpec spec, Path ccmDirectory, List<TestClusterNode> nodes)
       throws IOException {
     if (spec.scyllaYamlOverrides().isEmpty()) {
       return;
@@ -824,16 +882,7 @@ class CcmProvisioner {
     if (clusterDirectory == null) {
       throw new IOException("CCM has no current cluster under " + ccmDirectory);
     }
-    Map<String, String> implicitOverrideText = new LinkedHashMap<>();
-    for (Map.Entry<String, String> override : spec.scyllaYamlOverrides().entrySet()) {
-      if (CCM_IMPLICIT_NODE_KEYS.contains(override.getKey())) {
-        implicitOverrideText.put(override.getKey(), override.getValue());
-      }
-    }
-    if (implicitOverrideText.isEmpty()) {
-      return;
-    }
-    Map<String, Object> expected = parseYamlOverrides(implicitOverrideText);
+    Map<String, Object> expected = parseYamlOverrides(spec.scyllaYamlOverrides());
     Map<String, Object> clusterYaml = readYamlMap(clusterDirectory.resolve("cluster.conf"));
     Map<String, Object> configOptions = childMap(clusterYaml, "config_options", false);
     verifyDottedValues(
@@ -985,12 +1034,13 @@ class CcmProvisioner {
     }
   }
 
-  private void prepareClusterProcessReferencesForCcm(Path clusterDirectory) throws IOException {
+  private boolean prepareClusterProcessReferencesForCcm(Path clusterDirectory) throws IOException {
     Map<String, Object> cluster = readYamlMap(clusterDirectory.resolve("cluster.conf"));
     Object configuredNodes = cluster.get("nodes");
     if (!(configuredNodes instanceof Iterable)) {
       throw new IOException("Invalid nodes list in " + clusterDirectory.resolve("cluster.conf"));
     }
+    boolean ownedProcessRemains = false;
     for (Object configuredNode : (Iterable<?>) configuredNodes) {
       if (!(configuredNode instanceof String) || !isCcmNodeName((String) configuredNode)) {
         throw new IOException(
@@ -999,15 +1049,52 @@ class CcmProvisioner {
                 + ": "
                 + configuredNode);
       }
-      prepareNodeProcessReferencesForCcm(clusterDirectory, (String) configuredNode);
+      ownedProcessRemains |=
+          prepareNodeProcessReferencesForCcm(clusterDirectory, (String) configuredNode);
+    }
+    return ownedProcessRemains;
+  }
+
+  private void awaitStoppedProcessReferences(Path clusterDirectory, String nodeName)
+      throws IOException {
+    long deadline = System.nanoTime() + PROCESS_TERMINATION_GRACE.toNanos();
+    while (true) {
+      boolean ownedProcessRemains;
+      try {
+        ownedProcessRemains =
+            nodeName == null
+                ? prepareClusterProcessReferencesForCcm(clusterDirectory)
+                : prepareNodeProcessReferencesForCcm(clusterDirectory, nodeName);
+      } catch (CcmProcessCleanupException exception) {
+        throw exception;
+      } catch (IOException exception) {
+        throw new CcmProcessCleanupException(
+            "Cannot verify process cleanup after CCM stop", exception);
+      }
+      if (!ownedProcessRemains) {
+        return;
+      }
+      if (System.nanoTime() >= deadline) {
+        throw new CcmProcessCleanupException(
+            nodeName == null
+                ? "CCM cluster stop left owned node processes alive"
+                : "CCM stop left owned processes alive for node '" + nodeName + "'");
+      }
+      try {
+        Thread.sleep(20);
+      } catch (InterruptedException exception) {
+        Thread.currentThread().interrupt();
+        throw new CcmProcessCleanupException(
+            "Interrupted while verifying process cleanup after CCM stop", exception);
+      }
     }
   }
 
-  private void prepareNodeProcessReferencesForCcm(Path clusterDirectory, String nodeName)
+  private boolean prepareNodeProcessReferencesForCcm(Path clusterDirectory, String nodeName)
       throws IOException {
     Path nodeDirectory = ownedChild(clusterDirectory, nodeName);
     if (!Files.exists(nodeDirectory, LinkOption.NOFOLLOW_LINKS)) {
-      return;
+      return false;
     }
     validateOwnedDirectory(clusterDirectory, nodeDirectory, "node");
 
@@ -1054,6 +1141,10 @@ class CcmProvisioner {
     deleteDeadPidReference(scyllaPidFile, scyllaState);
     deleteDeadPidReference(jmxPidFile, jmxState);
     deleteDeadPidReference(agentPidFile, agentState);
+    return configuredState == ProcessReferenceState.OWNED
+        || scyllaState == ProcessReferenceState.OWNED
+        || jmxState == ProcessReferenceState.OWNED
+        || agentState == ProcessReferenceState.OWNED;
   }
 
   private ProcessReferenceState inspectProcessReference(
@@ -1834,12 +1925,19 @@ class CcmProvisioner {
 
   private void removeNodeByName(Path ccmDirectory, String nodeName) throws Exception {
     Path normalized = requireOwnedCcmDirectory(ccmDirectory);
-    if (!nodeStateExists(normalized, nodeName)) {
-      return;
-    }
     Path clusterDirectory = currentClusterDirectory(normalized);
     if (clusterDirectory == null) {
       return;
+    }
+    NodeRemovalState initialState = nodeRemovalState(clusterDirectory, nodeName);
+    if (initialState == NodeRemovalState.ABSENT) {
+      return;
+    }
+    if (initialState == NodeRemovalState.ORPHANED) {
+      throw new CcmProcessCleanupException(
+          "CCM node '"
+              + nodeName
+              + "' has local state but is absent from cluster membership; next-run recovery is required");
     }
     prepareNodeProcessReferencesForCcm(clusterDirectory, nodeName);
 
@@ -1850,21 +1948,31 @@ class CcmProvisioner {
       commandFailure = exception;
     }
 
-    boolean nodeRemoved;
+    NodeRemovalState finalState;
     try {
-      nodeRemoved = !nodeStateExists(normalized, nodeName);
+      finalState = nodeRemovalState(clusterDirectory, nodeName);
     } catch (Exception verificationFailure) {
+      CcmProcessCleanupException unprovenCleanup =
+          new CcmProcessCleanupException(
+              "Cannot prove cleanup of CCM node '" + nodeName + "'", verificationFailure);
       if (commandFailure != null) {
-        verificationFailure.addSuppressed(commandFailure);
+        unprovenCleanup.addSuppressed(commandFailure);
       }
-      throw verificationFailure;
+      throw unprovenCleanup;
     }
-    if (nodeRemoved) {
+    if (finalState == NodeRemovalState.ABSENT) {
       if (commandFailure instanceof CcmProcessCleanupException) {
         throw commandFailure;
       }
       restoreRemovalInterrupt(commandFailure);
       return;
+    }
+    if (finalState == NodeRemovalState.ORPHANED) {
+      throw new CcmProcessCleanupException(
+          "CCM removed node '"
+              + nodeName
+              + "' from cluster membership before process cleanup could be proven",
+          commandFailure);
     }
     if (commandFailure != null) {
       throw commandFailure;
@@ -1872,10 +1980,23 @@ class CcmProvisioner {
     throw new IOException("CCM reported success but node '" + nodeName + "' still exists");
   }
 
-  private boolean nodeStateExists(Path ccmDirectory, String nodeName) throws IOException {
-    Path clusterDirectory = currentClusterDirectory(ccmDirectory);
-    if (clusterDirectory == null) {
-      return false;
+  private NodeRemovalState nodeRemovalState(Path clusterDirectory, String nodeName)
+      throws IOException {
+    PathState clusterState = pathState(clusterDirectory);
+    if (clusterState == PathState.ABSENT) {
+      return NodeRemovalState.ORPHANED;
+    }
+    if (clusterState == PathState.UNKNOWN) {
+      throw new IOException("Cannot determine CCM cluster state at " + clusterDirectory);
+    }
+    validateOwnedDirectory(clusterDirectory.getParent(), clusterDirectory, "cluster");
+    Path clusterConfig = clusterDirectory.resolve("cluster.conf");
+    PathState configState = pathState(clusterConfig);
+    if (configState == PathState.ABSENT) {
+      return NodeRemovalState.ORPHANED;
+    }
+    if (configState == PathState.UNKNOWN) {
+      throw new IOException("Cannot determine CCM cluster configuration state at " + clusterConfig);
     }
     validateClusterMetadataIfPresent(clusterDirectory, clusterDirectory.getFileName().toString());
     Path nodeDirectory = ownedChild(clusterDirectory, nodeName);
@@ -1886,8 +2007,13 @@ class CcmProvisioner {
     if (directoryState == PathState.PRESENT) {
       validateOwnedDirectory(clusterDirectory, nodeDirectory, "node");
     }
-    return directoryState == PathState.PRESENT
-        || !nodeAbsentFromClusterMetadata(clusterDirectory, nodeName);
+    boolean listed = !nodeAbsentFromClusterMetadata(clusterDirectory, nodeName);
+    if (directoryState == PathState.PRESENT && !listed) {
+      return NodeRemovalState.ORPHANED;
+    }
+    return directoryState == PathState.PRESENT || listed
+        ? NodeRemovalState.LISTED
+        : NodeRemovalState.ABSENT;
   }
 
   private static void restoreRemovalInterrupt(Exception removalFailure) {
@@ -2153,7 +2279,7 @@ class CcmProvisioner {
         new ProcessBuilder(launchedCommand)
             .redirectErrorStream(true)
             .redirectOutput(ProcessBuilder.Redirect.appendTo(outputPath.toFile()));
-    processBuilder.environment().put("SCYLLA_CCM_RUN_DIR", runDirectory.toString());
+    configureCcmEnvironment(processBuilder.environment(), runDirectory);
 
     Process process;
     try {
@@ -2432,6 +2558,13 @@ class CcmProvisioner {
     }
   }
 
+  static void configureCcmEnvironment(Map<String, String> environment, Path runDirectory) {
+    for (String variable : UNSUPPORTED_CCM_ENVIRONMENT) {
+      environment.remove(variable);
+    }
+    environment.put("SCYLLA_CCM_RUN_DIR", runDirectory.toString());
+  }
+
   void cleanupStaleCluster(String instanceId, int ccmId, Path ccmDirectory) throws Exception {
     if (ccmId < 1 || ccmId > 99) {
       throw new IOException("Invalid CCM ID " + ccmId);
@@ -2528,6 +2661,12 @@ class CcmProvisioner {
     UNKNOWN
   }
 
+  private enum NodeRemovalState {
+    ABSENT,
+    LISTED,
+    ORPHANED
+  }
+
   private static boolean containsNode(List<TestClusterNode> nodes, String name) {
     return nodes.stream().anyMatch(node -> node.name().equals(name));
   }
@@ -2574,15 +2713,34 @@ class CcmProvisioner {
   static final class CcmNodeProvisioningException extends Exception {
     private final TestClusterNode node;
     private final boolean nodeRemainsProvisioned;
+    private final boolean clusterStateAmbiguous;
 
     CcmNodeProvisioningException(
         TestClusterNode node,
         boolean nodeRemainsProvisioned,
         Exception provisioningException,
         Exception rollbackException) {
+      this(
+          node,
+          nodeRemainsProvisioned,
+          nodeRemainsProvisioned,
+          provisioningException,
+          rollbackException);
+    }
+
+    CcmNodeProvisioningException(
+        TestClusterNode node,
+        boolean nodeRemainsProvisioned,
+        boolean clusterStateAmbiguous,
+        Exception provisioningException,
+        Exception rollbackException) {
       super(
           rollbackException == null
-              ? "Failed to provision '" + node.name() + "'; CCM rollback succeeded"
+              ? clusterStateAmbiguous
+                  ? "Failed to provision '"
+                      + node.name()
+                      + "'; local rollback succeeded but cluster membership is ambiguous"
+                  : "Failed to provision '" + node.name() + "'; CCM rollback succeeded"
               : "Failed to provision '" + node.name() + "' and CCM rollback failed",
           provisioningException);
       if (rollbackException != null) {
@@ -2590,6 +2748,7 @@ class CcmProvisioner {
       }
       this.node = node;
       this.nodeRemainsProvisioned = nodeRemainsProvisioned;
+      this.clusterStateAmbiguous = clusterStateAmbiguous;
     }
 
     TestClusterNode node() {
@@ -2598,6 +2757,10 @@ class CcmProvisioner {
 
     boolean nodeRemainsProvisioned() {
       return nodeRemainsProvisioned;
+    }
+
+    boolean clusterStateAmbiguous() {
+      return clusterStateAmbiguous;
     }
   }
 }

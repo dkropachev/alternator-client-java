@@ -37,6 +37,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 
 /** Lifecycle tests for cached state and the dirty-cluster fail-safe. */
@@ -56,6 +57,44 @@ public class ClusterLifecycleTest {
     assertEquals(1, provisioner.stopNodeCount.get());
     assertEquals(1, provisioner.startNodeCount.get());
     assertFalse(cluster.isDirty());
+  }
+
+  @Test
+  public void nodeControlsRefreshCachedStateBeforeReturning() throws Exception {
+    LifecycleProvisioner provisioner = new LifecycleProvisioner();
+    PhysicalTestCluster cluster = provisioner.newCluster(oneNodeSpec(), "process-drift", 2);
+    TestClusterNode node = cluster.nodes().get(0);
+
+    provisioner.running.remove(node);
+    cluster.startNode(node);
+    assertEquals(1, provisioner.startNodeCount.get());
+
+    cluster.stopNode(node);
+    provisioner.running.add(node);
+    cluster.stopNode(node);
+    assertEquals(2, provisioner.stopNodeCount.get());
+
+    PhysicalTestCluster crashed =
+        provisioner.newCluster(oneNodeSpec(), "crashed-with-auxiliaries", 3);
+    TestClusterNode crashedNode = crashed.nodes().get(0);
+    provisioner.running.remove(crashedNode);
+    crashed.stopNode(crashedNode);
+    assertEquals(3, provisioner.stopNodeCount.get());
+    assertFalse(cluster.isDirty());
+  }
+
+  @Test
+  public void unsafeRunningStateProbeMakesClusterDirty() throws Exception {
+    LifecycleProvisioner provisioner = new LifecycleProvisioner();
+    PhysicalTestCluster cluster = provisioner.newCluster(oneNodeSpec(), "unsafe-pid", 4);
+    TestClusterNode node = cluster.nodes().get(0);
+    provisioner.failNextRunningProbe.set(true);
+
+    assertThrows(CcmProvisioner.CcmProcessCleanupException.class, () -> cluster.startNode(node));
+
+    assertTrue(cluster.isDirty());
+    assertThrows(IllegalStateException.class, () -> cluster.addNode("dc1", "RAC1"));
+    assertSameJvmRemovalRefused(cluster, provisioner);
   }
 
   @Test
@@ -222,6 +261,62 @@ public class ClusterLifecycleTest {
   }
 
   @Test
+  public void interruptedPoolCloseStillJoinsPrivateLeaseRemoval() throws Exception {
+    LifecycleProvisioner provisioner = new LifecycleProvisioner();
+    provisioner.blockRemove.set(true);
+    TestClusterPool pool = new TestClusterPool(provisioner, 1, resources -> {});
+    PrivateClusterLease lease = pool.provisionPrivate(oneNodeSpec());
+    AtomicReference<Throwable> leaseFailure = new AtomicReference<>();
+    AtomicReference<Throwable> poolFailure = new AtomicReference<>();
+    AtomicBoolean interruptRestored = new AtomicBoolean();
+    Thread leaseClosing =
+        new Thread(
+            () -> {
+              try {
+                lease.close();
+              } catch (Throwable exception) {
+                leaseFailure.set(exception);
+              }
+            });
+    Thread poolClosing =
+        new Thread(
+            () -> {
+              try {
+                pool.close();
+              } catch (Throwable exception) {
+                poolFailure.set(exception);
+              } finally {
+                interruptRestored.set(Thread.currentThread().isInterrupted());
+              }
+            });
+    try {
+      leaseClosing.start();
+      assertTrue(provisioner.removeStarted.await(5, TimeUnit.SECONDS));
+      poolClosing.start();
+      waitUntilWaiting(poolClosing);
+      poolClosing.interrupt();
+      Thread.sleep(50);
+      assertTrue("Interrupted pool close stopped joining removal", poolClosing.isAlive());
+
+      provisioner.allowRemove.countDown();
+      leaseClosing.join(5_000);
+      poolClosing.join(5_000);
+
+      assertFalse("Lease close did not finish", leaseClosing.isAlive());
+      assertFalse("Pool close did not finish", poolClosing.isAlive());
+      assertEquals(null, leaseFailure.get());
+      assertEquals(null, poolFailure.get());
+      assertTrue(interruptRestored.get());
+      assertEquals(1, provisioner.removeCount.get());
+    } finally {
+      provisioner.allowRemove.countDown();
+      leaseClosing.join(5_000);
+      poolClosing.join(5_000);
+      pool.close();
+    }
+  }
+
+  @Test
   public void reusableLeaseReleaseDoesNotRacePoolRemoval() throws Exception {
     LifecycleProvisioner provisioner = new LifecycleProvisioner();
     provisioner.blockRemove.set(true);
@@ -245,6 +340,15 @@ public class ClusterLifecycleTest {
   private static Void close(AutoCloseable closeable) throws Exception {
     closeable.close();
     return null;
+  }
+
+  private static void waitUntilWaiting(Thread thread) throws InterruptedException {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (thread.getState() != Thread.State.WAITING && System.nanoTime() < deadline) {
+      Thread.sleep(10);
+    }
+    assertEquals(
+        "Pool close did not wait for active removal", Thread.State.WAITING, thread.getState());
   }
 
   private static void assertSameJvmRemovalRefused(
@@ -291,6 +395,7 @@ public class ClusterLifecycleTest {
     final AtomicInteger addCount = new AtomicInteger();
     final AtomicInteger removeCount = new AtomicInteger();
     final AtomicBoolean failNextStop = new AtomicBoolean();
+    final AtomicBoolean failNextRunningProbe = new AtomicBoolean();
     final AtomicBoolean failAddWithSuccessfulRollback = new AtomicBoolean();
     final AtomicBoolean failAddWithFailedRollback = new AtomicBoolean();
     final AtomicBoolean failNextStartWithCleanup = new AtomicBoolean();
@@ -340,6 +445,18 @@ public class ClusterLifecycleTest {
       startNodeCount.incrementAndGet();
       running.add(node);
     }
+
+    @Override
+    boolean isNodeRunning(PhysicalTestCluster cluster, TestClusterNode node)
+        throws CcmProcessCleanupException {
+      if (failNextRunningProbe.getAndSet(false)) {
+        throw new CcmProcessCleanupException("injected unsafe PID reference");
+      }
+      return running.contains(node);
+    }
+
+    @Override
+    void waitForNodeReady(PhysicalTestCluster cluster, TestClusterNode node) {}
 
     @Override
     void stopNode(PhysicalTestCluster cluster, TestClusterNode node) {

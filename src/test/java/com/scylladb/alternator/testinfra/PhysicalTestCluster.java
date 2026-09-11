@@ -147,7 +147,14 @@ final class PhysicalTestCluster implements TestClusterInfo {
     ensureMutable();
     List<TestClusterNode> stopped = new ArrayList<>();
     for (TestClusterNode node : nodes) {
-      if (nodeStates.get(node) == NodeState.STOPPED) {
+      if (nodeStates.get(node) == NodeState.DECOMMISSIONED) {
+        continue;
+      }
+      if (probeNodeRunning(node)) {
+        provisioner.waitForNodeReady(this, node);
+        nodeStates.put(node, NodeState.RUNNING);
+      } else {
+        nodeStates.put(node, NodeState.STOPPED);
         stopped.add(node);
       }
     }
@@ -167,11 +174,21 @@ final class PhysicalTestCluster implements TestClusterInfo {
 
   synchronized void stop() throws Exception {
     ensureMutable();
-    boolean running = false;
-    for (NodeState state : nodeStates.values()) {
-      running |= state == NodeState.RUNNING;
+    boolean hasRunningNode = false;
+    for (TestClusterNode node : nodes) {
+      NodeState cachedState = nodeStates.get(node);
+      if (cachedState == NodeState.DECOMMISSIONED) {
+        continue;
+      }
+      if (probeNodeRunning(node)) {
+        nodeStates.put(node, NodeState.RUNNING);
+        hasRunningNode = true;
+      } else {
+        nodeStates.put(node, NodeState.STOPPED);
+        hasRunningNode |= cachedState == NodeState.RUNNING;
+      }
     }
-    if (!running) {
+    if (!hasRunningNode) {
       return;
     }
     try {
@@ -194,9 +211,12 @@ final class PhysicalTestCluster implements TestClusterInfo {
     if (state == NodeState.DECOMMISSIONED) {
       throw new IllegalStateException("Cannot start decommissioned node " + node.name());
     }
-    if (state == NodeState.RUNNING) {
+    if (probeNodeRunning(node)) {
+      provisioner.waitForNodeReady(this, node);
+      nodeStates.put(node, NodeState.RUNNING);
       return;
     }
+    nodeStates.put(node, NodeState.STOPPED);
     try {
       provisioner.startNode(this, node);
       nodeStates.put(node, NodeState.RUNNING);
@@ -213,9 +233,11 @@ final class PhysicalTestCluster implements TestClusterInfo {
     if (state == NodeState.DECOMMISSIONED) {
       throw new IllegalStateException("Cannot stop decommissioned node " + node.name());
     }
-    if (state == NodeState.STOPPED) {
+    if (!probeNodeRunning(node) && state == NodeState.STOPPED) {
+      nodeStates.put(node, NodeState.STOPPED);
       return;
     }
+    nodeStates.put(node, NodeState.RUNNING);
     try {
       provisioner.stopNode(this, node);
       nodeStates.put(node, NodeState.STOPPED);
@@ -235,6 +257,9 @@ final class PhysicalTestCluster implements TestClusterInfo {
     } catch (CcmProvisioner.CcmNodeProvisioningException exception) {
       if (CcmProvisioner.requiresNextRunRecovery(exception)) {
         recoveryRequired = true;
+        dirty = true;
+      }
+      if (exception.clusterStateAmbiguous()) {
         dirty = true;
       }
       if (exception.nodeRemainsProvisioned()) {
@@ -325,6 +350,15 @@ final class PhysicalTestCluster implements TestClusterInfo {
   private void recordAmbiguousFailure(Throwable failure) {
     dirty = true;
     recoveryRequired |= CcmProvisioner.requiresNextRunRecovery(failure);
+  }
+
+  private boolean probeNodeRunning(TestClusterNode node) throws Exception {
+    try {
+      return provisioner.isNodeRunning(this, node);
+    } catch (Exception exception) {
+      recordAmbiguousFailure(exception);
+      throw exception;
+    }
   }
 
   private TestClusterNode getNode(TestClusterNode requested) {

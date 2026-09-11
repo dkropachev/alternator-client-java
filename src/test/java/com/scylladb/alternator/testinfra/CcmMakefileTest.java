@@ -43,6 +43,14 @@ public class CcmMakefileTest {
     assumeTrue(
         "CCM Makefile tests require Linux",
         System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux"));
+    assumeTrue(
+        "CCM Makefile tests require /usr/bin/env", Files.isExecutable(Path.of("/usr/bin/env")));
+    for (String command :
+        List.of(
+            "bash", "chmod", "dirname", "flock", "kill", "make", "mkdir", "mktemp", "mv", "openssl",
+            "ps", "rm", "setsid", "sleep", "touch")) {
+      assumeTrue("CCM Makefile tests require " + command, executableAvailable(command));
+    }
   }
 
   @Test
@@ -102,11 +110,13 @@ public class CcmMakefileTest {
     Path mavenStarted = temporary.resolve("maven-started");
     Path maven =
         writeExecutable(
-            temporary, "fake-maven", "#!/bin/bash\n" + "touch \"$MAVEN_STARTED\"\n" + "exit 0\n");
+            temporary,
+            "fake-maven",
+            "#!/usr/bin/env bash\n" + "touch \"$MAVEN_STARTED\"\n" + "exit 0\n");
 
-    for (String missing : List.of("setsid", "kill", "ps")) {
+    for (String missing : List.of("openssl", "setsid", "kill", "ps")) {
       Path tools = Files.createDirectory(temporary.resolve("without-" + missing));
-      for (String command : List.of("bash", "setsid", "kill", "ps")) {
+      for (String command : List.of("bash", "openssl", "setsid", "kill", "ps")) {
         if (!command.equals(missing)) {
           Files.createSymbolicLink(tools.resolve(command), resolveExecutable(command));
         }
@@ -129,6 +139,22 @@ public class CcmMakefileTest {
               "An external " + missing + " executable is required for CCM integration tests"));
       assertTrue("Maven started despite the failed preflight", Files.notExists(mavenStarted));
     }
+  }
+
+  @Test
+  public void customCcmExecutableMayBeResolvedFromPath() throws Exception {
+    Path temporary = Files.createTempDirectory("ccm-make-path-override-");
+    Path ccm = writeWorkingCcm(temporary);
+
+    CommandResult result =
+        runMake(
+            "ccm-install",
+            List.of("SCYLLA_CCM_PATH=" + ccm.getFileName()),
+            Map.of("PATH", temporary + ":" + System.getenv("PATH")),
+            Duration.ofSeconds(20));
+
+    assertEquals(result.output, 0, result.exitCode);
+    assertTrue(result.output, result.output.contains("Using CCM executable: " + ccm.getFileName()));
   }
 
   @Test
@@ -345,6 +371,15 @@ public class CcmMakefileTest {
       }
     }
     throw new IllegalStateException("Executable not found on PATH: " + name);
+  }
+
+  private static boolean executableAvailable(String name) {
+    try {
+      resolveExecutable(name);
+      return true;
+    } catch (Exception unavailable) {
+      return false;
+    }
   }
 
   private static void waitForFile(Path file, Duration timeout) throws Exception {

@@ -29,8 +29,10 @@ import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -44,6 +46,13 @@ public class CcmProvisionerRecoveryTest {
     assumeTrue(
         "CCM process recovery tests require Linux",
         System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux"));
+    assumeTrue(
+        "CCM process recovery tests require /usr/bin/env",
+        Files.isExecutable(Path.of("/usr/bin/env")));
+    for (String command :
+        List.of("bash", "chmod", "grep", "kill", "mkdir", "ps", "rm", "setsid", "sleep", "touch")) {
+      assumeTrue("CCM process recovery tests require " + command, executableAvailable(command));
+    }
   }
 
   @Test
@@ -287,6 +296,50 @@ public class CcmProvisionerRecoveryTest {
   }
 
   @Test
+  public void failedStartedNodeAddDirtiesClusterAfterLocalRollback() throws Exception {
+    Path runDirectory = Files.createTempDirectory("ccm-started-node-rollback-");
+    Path ccm =
+        writeExecutable(
+            runDirectory,
+            "ccm",
+            "#!/usr/bin/env bash\n"
+                + "set -eu\n"
+                + "config=$3\n"
+                + "if [[ $1 == node2 ]]; then config=$4; fi\n"
+                + "printf '%s %s\\n' \"$1\" \"$2\" >> \"$config/invocations\"\n"
+                + "if [[ $1 == add ]]; then\n"
+                + "  mkdir -p \"$3/cluster/$4/conf\"\n"
+                + "  printf 'name: %s\\nstatus: DOWN\\n' \"$4\" > \"$3/cluster/$4/node.conf\"\n"
+                + "  printf 'cluster_name: cluster\\n' > \"$3/cluster/$4/conf/scylla.yaml\"\n"
+                + "  printf 'name: cluster\\nnodes: [node1, node2]\\n' > \"$3/cluster/cluster.conf\"\n"
+                + "  exit 0\n"
+                + "fi\n"
+                + "if [[ $1 == node2 && $2 == start ]]; then exit 31; fi\n"
+                + "if [[ $1 == node2 && $2 == remove ]]; then\n"
+                + "  rm -rf \"$config/cluster/node2\"\n"
+                + "  printf 'name: cluster\\nnodes: [node1]\\n' > \"$config/cluster/cluster.conf\"\n"
+                + "  exit 0\n"
+                + "fi\n"
+                + "exit 2\n");
+    CcmProvisioner provisioner = new CcmProvisioner(runDirectory, ccm.toString());
+    PhysicalTestCluster cluster = createCluster(provisioner, runDirectory, "cluster", 7);
+
+    CcmProvisioner.CcmNodeProvisioningException failure =
+        assertThrows(
+            CcmProvisioner.CcmNodeProvisioningException.class,
+            () -> cluster.addNode("dc1", "RAC1"));
+
+    assertFalse(failure.nodeRemainsProvisioned());
+    assertTrue(failure.clusterStateAmbiguous());
+    assertTrue(cluster.isDirty());
+    assertEquals(1, cluster.nodes().size());
+    assertThrows(IllegalStateException.class, cluster::start);
+    assertEquals(
+        "add --config-dir\nnode2 start\nnode2 remove\n",
+        Files.readString(cluster.ccmDirectory().resolve("invocations")));
+  }
+
+  @Test
   public void unprovenCommandCleanupSkipsNodeRollbackAndDirtiesCluster() throws Exception {
     Path runDirectory = Files.createTempDirectory("ccm-unproven-node-cleanup-");
     Path ccm =
@@ -504,6 +557,48 @@ public class CcmProvisionerRecoveryTest {
   }
 
   @Test
+  public void orphanedNodeRemovalRequiresNextRunProcessRecovery() throws Exception {
+    Path runDirectory = Files.createTempDirectory("ccm-orphaned-node-remove-");
+    Path ccm =
+        writeExecutable(
+            runDirectory,
+            "ccm",
+            "#!/usr/bin/env bash\n"
+                + "set -eu\n"
+                + "config=$4\n"
+                + "printf 'name: cluster\\nnodes: []\\n' > \"$config/cluster/cluster.conf\"\n"
+                + "exit 19\n");
+    CcmProvisioner provisioner = new CcmProvisioner(runDirectory, ccm.toString());
+    PhysicalTestCluster cluster = createCluster(provisioner, runDirectory, "cluster", 7);
+    TestClusterNode node = cluster.nodes().get(0);
+    Path nodeDirectory = Files.createDirectories(cluster.ccmDirectory().resolve("cluster/node1"));
+    Path executable = Files.createDirectories(nodeDirectory.resolve("bin")).resolve("scylla");
+    Files.copy(resolveExecutable("sleep"), executable);
+    Files.setPosixFilePermissions(executable, PosixFilePermissions.fromString("rwx------"));
+    ProcessBuilder processBuilder = new ProcessBuilder(executable.toString(), "30");
+    processBuilder.environment().put("SCYLLA_CCM_RUN_DIR", provisioner.runDirectory().toString());
+    Process process = processBuilder.start();
+    try {
+      Files.writeString(
+          nodeDirectory.resolve("node.conf"),
+          "name: node1\nstatus: UP\npid: " + process.pid() + "\n");
+      Files.writeString(nodeDirectory.resolve("cassandra.pid"), process.pid() + "\n");
+
+      CcmProvisioner.CcmProcessCleanupException failure =
+          assertThrows(
+              CcmProvisioner.CcmProcessCleanupException.class,
+              () -> provisioner.deleteNodeState(cluster, node));
+
+      assertTrue(CcmProvisioner.requiresNextRunRecovery(failure));
+      assertTrue("The orphaned node process was lost with its metadata", process.isAlive());
+      assertTrue(Files.isDirectory(nodeDirectory));
+    } finally {
+      process.destroyForcibly();
+      process.waitFor(5, TimeUnit.SECONDS);
+    }
+  }
+
+  @Test
   public void failedDiagnosticSnapshotPreventsDestructiveRemoval() throws Exception {
     Path runDirectory = Files.createTempDirectory("ccm-diagnostic-failure-");
     Path diagnostics = Files.createDirectories(runDirectory.resolve("external-diagnostics"));
@@ -658,12 +753,56 @@ public class CcmProvisionerRecoveryTest {
   }
 
   @Test
-  public void normalStopAcceptsTheExpectedOwnedNodeProcess() throws Exception {
+  public void failedStopExitDoesNotHideAnOwnedNodeProcess() throws Exception {
     Path runDirectory = Files.createTempDirectory("ccm-expected-owned-pid-");
     Path invoked = runDirectory.resolve("ccm-invoked");
     Path ccm =
         writeExecutable(
-            runDirectory, "ccm", "#!/usr/bin/env bash\n" + "touch \"" + invoked + "\"\n");
+            runDirectory,
+            "ccm",
+            "#!/usr/bin/env bash\n" + "touch \"" + invoked + "\"\n" + "exit 19\n");
+    CcmProvisioner provisioner = new CcmProvisioner(runDirectory, ccm.toString());
+    PhysicalTestCluster cluster = createCluster(provisioner, runDirectory, "cluster", 7);
+    TestClusterNode node = cluster.nodes().get(0);
+    Path nodeDirectory = Files.createDirectories(cluster.ccmDirectory().resolve("cluster/node1"));
+    Path executable = Files.createDirectories(nodeDirectory.resolve("bin")).resolve("scylla");
+    Files.copy(resolveExecutable("sleep"), executable);
+    Files.setPosixFilePermissions(executable, PosixFilePermissions.fromString("rwx------"));
+    ProcessBuilder processBuilder = new ProcessBuilder(executable.toString(), "30");
+    processBuilder.environment().put("SCYLLA_CCM_RUN_DIR", provisioner.runDirectory().toString());
+    Process process = processBuilder.start();
+    try {
+      Files.writeString(
+          nodeDirectory.resolve("node.conf"),
+          "name: node1\nstatus: UP\npid: " + process.pid() + "\n");
+      Files.writeString(nodeDirectory.resolve("cassandra.pid"), process.pid() + "\n");
+
+      CcmProvisioner.CcmProcessCleanupException failure =
+          assertThrows(
+              CcmProvisioner.CcmProcessCleanupException.class,
+              () -> provisioner.stopNode(cluster, node));
+
+      assertTrue(CcmProvisioner.requiresNextRunRecovery(failure));
+      assertTrue("Valid node process did not reach CCM", Files.exists(invoked));
+      assertTrue("CCM's failed exit hid the valid node process", process.isAlive());
+    } finally {
+      process.destroyForcibly();
+      process.waitFor(5, TimeUnit.SECONDS);
+    }
+  }
+
+  @Test
+  public void nonzeroStopIsSuccessWhenTheOwnedProcessIsGone() throws Exception {
+    Path runDirectory = Files.createTempDirectory("ccm-stopped-despite-error-");
+    Path ccm =
+        writeExecutable(
+            runDirectory,
+            "ccm",
+            "#!/usr/bin/env bash\n"
+                + "set -u\n"
+                + "pid=$(< \"$4/cluster/node1/cassandra.pid\")\n"
+                + "kill -TERM \"$pid\"\n"
+                + "exit 19\n");
     CcmProvisioner provisioner = new CcmProvisioner(runDirectory, ccm.toString());
     PhysicalTestCluster cluster = createCluster(provisioner, runDirectory, "cluster", 7);
     TestClusterNode node = cluster.nodes().get(0);
@@ -682,8 +821,49 @@ public class CcmProvisionerRecoveryTest {
 
       provisioner.stopNode(cluster, node);
 
-      assertTrue("Valid node process did not reach CCM", Files.exists(invoked));
-      assertTrue("Preflight killed the valid node process", process.isAlive());
+      assertTrue("Stopped process did not exit", process.waitFor(5, TimeUnit.SECONDS));
+      assertFalse(process.isAlive());
+    } finally {
+      process.destroyForcibly();
+      process.waitFor(5, TimeUnit.SECONDS);
+    }
+  }
+
+  @Test
+  public void restartRefusesToLoseAStillRunningAncillaryProcess() throws Exception {
+    Path runDirectory = Files.createTempDirectory("ccm-ancillary-before-start-");
+    Path invoked = runDirectory.resolve("ccm-invoked");
+    Path ccm =
+        writeExecutable(
+            runDirectory, "ccm", "#!/usr/bin/env bash\n" + "touch \"" + invoked + "\"\n");
+    CcmProvisioner provisioner = new CcmProvisioner(runDirectory, ccm.toString());
+    PhysicalTestCluster cluster = createCluster(provisioner, runDirectory, "cluster", 7);
+    TestClusterNode node = cluster.nodes().get(0);
+    Path nodeDirectory = Files.createDirectories(cluster.ccmDirectory().resolve("cluster/node1"));
+    Path agent =
+        Files.createDirectories(nodeDirectory.resolve("bin")).resolve("scylla-manager-agent");
+    Files.copy(resolveExecutable("bash"), agent);
+    Files.setPosixFilePermissions(agent, PosixFilePermissions.fromString("rwx------"));
+    Path agentConfig =
+        Files.createDirectories(nodeDirectory.resolve("conf")).resolve("scylla-manager-agent.yaml");
+    Files.writeString(agentConfig, "https: 127.0.7.1:10001\n");
+    ProcessBuilder processBuilder =
+        new ProcessBuilder(
+            agent.toString(), "-c", "sleep 30", "--config-file", agentConfig.toString());
+    processBuilder.environment().put("SCYLLA_CCM_RUN_DIR", provisioner.runDirectory().toString());
+    Process process = processBuilder.start();
+    try {
+      Files.writeString(nodeDirectory.resolve("node.conf"), "name: node1\nstatus: DOWN\n");
+      Files.writeString(nodeDirectory.resolve("scylla-agent.pid"), process.pid() + "\n");
+
+      CcmProvisioner.CcmProcessCleanupException failure =
+          assertThrows(
+              CcmProvisioner.CcmProcessCleanupException.class,
+              () -> provisioner.startNode(cluster, node));
+
+      assertTrue(CcmProvisioner.requiresNextRunRecovery(failure));
+      assertTrue(process.isAlive());
+      assertFalse("CCM start ran despite the live ancillary process", Files.exists(invoked));
     } finally {
       process.destroyForcibly();
       process.waitFor(5, TimeUnit.SECONDS);
@@ -773,6 +953,70 @@ public class CcmProvisionerRecoveryTest {
     assertEquals("1:20", CcmProvisioner.parseYamlValue("1:20"));
   }
 
+  @Test
+  public void everyYamlOverrideIsReappliedAndVerifiedAfterCcmUpdates() throws Exception {
+    Path runDirectory = Files.createTempDirectory("ccm-yaml-overrides-");
+    CcmProvisioner provisioner = new CcmProvisioner(runDirectory, "/bin/true");
+    PhysicalTestCluster cluster = createCluster(provisioner, runDirectory, "cluster", 7);
+    TestClusterNode node = cluster.nodes().get(0);
+    Path clusterDirectory = cluster.ccmDirectory().resolve(cluster.instanceId());
+    Path nodeDirectory =
+        Files.createDirectories(clusterDirectory.resolve(node.name()).resolve("conf"));
+    Path nodeConfig = nodeDirectory.getParent().resolve("node.conf");
+    Path scyllaConfig = nodeDirectory.resolve("scylla.yaml");
+    Files.writeString(
+        nodeConfig,
+        "name: node1\nconfig_options:\n  hinted_handoff_enabled: true\n",
+        StandardCharsets.UTF_8);
+    Files.writeString(scyllaConfig, "cluster_name: cluster\n", StandardCharsets.UTF_8);
+    ClusterSpec spec =
+        oneNodeSpec()
+            .withYamlOverride("hinted_handoff_enabled", "false")
+            .withYamlOverride("experimental_features", "null");
+
+    provisioner.applyYamlOverrides(spec, cluster.ccmDirectory(), List.of(node), true);
+    provisioner.verifyYamlOverrides(spec, cluster.ccmDirectory(), List.of(node));
+
+    Map<String, Object> clusterYaml = readYamlMapping(clusterDirectory.resolve("cluster.conf"));
+    Map<String, Object> clusterOptions = childMapping(clusterYaml, "config_options");
+    assertTrue(clusterOptions.containsKey("experimental_features"));
+    assertEquals(null, clusterOptions.get("experimental_features"));
+    Map<String, Object> scyllaYaml = readYamlMapping(scyllaConfig);
+    assertTrue(scyllaYaml.containsKey("experimental_features"));
+    assertEquals(null, scyllaYaml.get("experimental_features"));
+    assertFalse(
+        childMapping(readYamlMapping(nodeConfig), "config_options")
+            .containsKey("hinted_handoff_enabled"));
+
+    Files.writeString(scyllaConfig, "hinted_handoff_enabled: false\n", StandardCharsets.UTF_8);
+    IOException failure =
+        assertThrows(
+            IOException.class,
+            () -> provisioner.verifyYamlOverrides(spec, cluster.ccmDirectory(), List.of(node)));
+    assertTrue(failure.getMessage(), failure.getMessage().contains("experimental_features"));
+  }
+
+  @Test
+  public void ccmCommandsDropAmbientBehaviorOverridesAndSetExactRunMarker() {
+    Map<String, String> environment = new HashMap<>();
+    environment.put("JAVA_HOME", "/jdk");
+    environment.put("SCYLLA_ARCH", "aarch64");
+    environment.put("SCYLLA_CCM_RUN_DIR", "/wrong-run");
+    environment.put("SCYLLA_EXT_ENV", "SCYLLA_CCM_RUN_DIR=/unowned-run");
+    environment.put("SCYLLA_EXT_OPTS", "--alternator-port 9999");
+    environment.put("SCYLLA_MANAGER_PACKAGE", "latest");
+    Path runDirectory = Path.of("/tmp/owned-ccm-run");
+
+    CcmProvisioner.configureCcmEnvironment(environment, runDirectory);
+
+    assertFalse(environment.containsKey("SCYLLA_EXT_ENV"));
+    assertFalse(environment.containsKey("SCYLLA_EXT_OPTS"));
+    assertFalse(environment.containsKey("SCYLLA_MANAGER_PACKAGE"));
+    assertEquals(runDirectory.toString(), environment.get("SCYLLA_CCM_RUN_DIR"));
+    assertEquals("aarch64", environment.get("SCYLLA_ARCH"));
+    assertEquals("/jdk", environment.get("JAVA_HOME"));
+  }
+
   private static ClusterSpec oneNodeSpec() {
     return new ClusterSpec()
         .withTopology(ClusterTopology.singleDatacenter(1))
@@ -814,6 +1058,29 @@ public class CcmProvisionerRecoveryTest {
       }
     }
     throw new IOException("Executable not found on PATH: " + name);
+  }
+
+  private static boolean executableAvailable(String name) {
+    try {
+      resolveExecutable(name);
+      return true;
+    } catch (IOException unavailable) {
+      return false;
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> readYamlMapping(Path path) throws IOException {
+    Object parsed = CcmProvisioner.parseYamlValue(Files.readString(path, StandardCharsets.UTF_8));
+    assertTrue("Expected YAML mapping in " + path, parsed instanceof Map);
+    return (Map<String, Object>) parsed;
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> childMapping(Map<String, Object> mapping, String key) {
+    Object child = mapping.get(key);
+    assertTrue("Expected YAML mapping at " + key, child instanceof Map);
+    return (Map<String, Object>) child;
   }
 
   private static final class CleanupFailureProvisioner extends CcmProvisioner {

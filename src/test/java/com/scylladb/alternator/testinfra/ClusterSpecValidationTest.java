@@ -149,9 +149,12 @@ public class ClusterSpecValidationTest {
   public void additionalOwnedYamlRootsCannotBeOverridden() {
     for (String key :
         Arrays.asList(
+            "commitlog_use_o_dsync",
+            "default_log_level",
             "ignore_dead_nodes_for_replace",
             "join_ring",
             "load_ring_state",
+            "log_to_stdout",
             "maintenance_mode",
             "maintenance_socket",
             "maintenance_socket_group",
