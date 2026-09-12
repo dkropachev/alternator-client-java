@@ -37,13 +37,13 @@ public class NodeHealthStoreTest {
 
     assertEquals(Arrays.asList(node), store.getActiveNodes());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertEquals(Arrays.asList(node), store.getActiveNodes());
     assertTrue(store.getDownNodes().isEmpty());
     assertEquals(1, store.getNodeStatus(node).getConsecutiveFailures());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertTrue(store.getActiveNodes().isEmpty());
     assertTrue(store.getQuarantinedNodes().isEmpty());
@@ -59,7 +59,7 @@ public class NodeHealthStoreTest {
     NodeHealthConfig config = NodeHealthConfig.builder().withConsecutiveFailureThreshold(1).build();
     NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(configured));
 
-    store.reportNodeResult(reported, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, reported, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertTrue(store.getActiveNodes().isEmpty());
     assertEquals(Arrays.asList(configured), store.getDownNodes());
@@ -74,7 +74,7 @@ public class NodeHealthStoreTest {
     NodeHealthConfig config = NodeHealthConfig.builder().withConsecutiveFailureThreshold(1).build();
     NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(configured));
 
-    store.reportNodeResult(reported, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, reported, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertTrue(store.getActiveNodes().isEmpty());
     assertEquals(Arrays.asList(configured), store.getDownNodes());
@@ -89,7 +89,7 @@ public class NodeHealthStoreTest {
     NodeHealthConfig config = NodeHealthConfig.builder().withConsecutiveFailureThreshold(1).build();
     NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(configured));
 
-    store.reportNodeResult(reported, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, reported, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertEquals(Arrays.asList(configured), store.getDownNodes());
     assertEquals(NodeHealthState.DOWN, store.getNodeStatus(configured).getState());
@@ -104,8 +104,8 @@ public class NodeHealthStoreTest {
     NodeHealthConfig config = NodeHealthConfig.builder().withConsecutiveFailureThreshold(1).build();
     NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(http, https, otherPort));
 
-    store.reportNodeResult(
-        URI.create("http://node1.local:8080/other"), NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(
+        store, URI.create("http://node1.local:8080/other"), NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertEquals(NodeHealthState.DOWN, store.getNodeStatus(http).getState());
     assertEquals(NodeHealthState.ACTIVE, store.getNodeStatus(https).getState());
@@ -135,11 +135,11 @@ public class NodeHealthStoreTest {
     NodeHealthConfig config = NodeHealthConfig.builder().withConsecutiveFailureThreshold(2).build();
     NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(node));
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
     assertEquals(Arrays.asList(node), store.getActiveNodes());
     assertEquals(1, store.getNodeStatus(node).getConsecutiveFailures());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
     assertTrue(store.getActiveNodes().isEmpty());
     assertEquals(Arrays.asList(node), store.getDownNodes());
     assertEquals(NodeHealthState.DOWN, store.getNodeStatus(node).getState());
@@ -201,7 +201,7 @@ public class NodeHealthStoreTest {
     NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(node));
     AtomicInteger probes = new AtomicInteger();
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertTrue(
         store
@@ -224,14 +224,14 @@ public class NodeHealthStoreTest {
     NodeHealthConfig config = NodeHealthConfig.builder().withConsecutiveFailureThreshold(2).build();
     NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(node));
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
     store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
     store.reportNodeResult(node, NodeHealthObservation.PROBE_FAILURE);
 
     assertEquals(1, store.getNodeStatus(node).getConsecutiveFailures());
     assertEquals(NodeHealthState.ACTIVE, store.getNodeStatus(node).getState());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertEquals(Arrays.asList(node), store.getDownNodes());
     assertEquals(2, store.getNodeStatus(node).getConsecutiveFailures());
@@ -245,7 +245,7 @@ public class NodeHealthStoreTest {
 
     store.reportNodeResult(node, NodeHealthObservation.PROBE_FAILURE);
     store.reportNodeResult(node, NodeHealthObservation.PROBE_FAILURE);
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_SUCCESS);
     store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
 
     assertEquals(NodeHealthState.ACTIVE, store.getNodeStatus(node).getState());
@@ -266,8 +266,8 @@ public class NodeHealthStoreTest {
 
     reportFailures(store, node, config.getConsecutiveFailureThreshold());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS);
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_SUCCESS);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
 
     NodeHealthStatus status = store.getNodeStatus(node);
     assertEquals(NodeHealthState.DOWN, status.getState());
@@ -287,12 +287,12 @@ public class NodeHealthStoreTest {
             .build();
     NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(node));
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
     store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
     assertEquals(1, store.getNodeStatus(node).getConsecutiveSuccesses());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS);
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_SUCCESS);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertEquals(NodeHealthState.DOWN, store.getNodeStatus(node).getState());
     assertEquals(1, store.getNodeStatus(node).getConsecutiveSuccesses());
@@ -325,11 +325,11 @@ public class NodeHealthStoreTest {
     store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
     assertEquals(Arrays.asList(node), store.getQuarantinedNodes());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_SUCCESS);
     assertEquals(Arrays.asList(node), store.getQuarantinedNodes());
     assertEquals(1, store.getNodeStatus(node).getConsecutiveSuccesses());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_SUCCESS);
 
     assertEquals(Arrays.asList(node), store.getActiveNodes());
     assertTrue(store.getQuarantinedNodes().isEmpty());
@@ -349,7 +349,7 @@ public class NodeHealthStoreTest {
             .build();
     NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(node));
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
     store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
 
     assertEquals(Arrays.asList(node), store.getQuarantinedNodes());
@@ -357,7 +357,7 @@ public class NodeHealthStoreTest {
     assertEquals(NodeHealthState.QUARANTINED, store.getNodeStatus(node).getState());
     assertEquals(0, store.getNodeStatus(node).getConsecutiveSuccesses());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_SUCCESS);
 
     assertEquals(Arrays.asList(node), store.getActiveNodes());
     assertTrue(store.getQuarantinedNodes().isEmpty());
@@ -380,22 +380,110 @@ public class NodeHealthStoreTest {
     NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(node));
     long staleGeneration = store.getNodeStatus(node).getGeneration();
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
     store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
     assertEquals(NodeHealthState.QUARANTINED, store.getNodeStatus(node).getState());
+    NodeHealthStatus beforeStaleTraffic = store.getNodeStatus(node);
 
     assertFalse(
         store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS, staleGeneration));
     assertFalse(
         store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE, staleGeneration));
-    assertEquals(NodeHealthState.QUARANTINED, store.getNodeStatus(node).getState());
-    assertEquals(0, store.getNodeStatus(node).getConsecutiveFailures());
-    assertEquals(0, store.getNodeStatus(node).getConsecutiveSuccesses());
+    assertStatusEquals(beforeStaleTraffic, store.getNodeStatus(node));
 
     long currentGeneration = store.getNodeStatus(node).getGeneration();
     assertTrue(
         store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS, currentGeneration));
     assertEquals(NodeHealthState.ACTIVE, store.getNodeStatus(node).getState());
+  }
+
+  @Test
+  public void generationUnawareTrafficIsRejectedButProbeReportingRemainsSupported() {
+    URI node = node("node1.local");
+    NodeHealthConfig config =
+        NodeHealthConfig.builder()
+            .withConsecutiveFailureThreshold(1)
+            .withDownNodeRecoverySuccessThreshold(1)
+            .withQuarantineSuccessThreshold(1)
+            .build();
+    NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(node));
+    NodeHealthStatus activeStatus = store.getNodeStatus(node);
+
+    assertFalse(store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS));
+    assertFalse(store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE));
+    assertStatusEquals(activeStatus, store.getNodeStatus(node));
+
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
+    assertTrue(store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS));
+    NodeHealthStatus recoveredStatus = store.getNodeStatus(node);
+    assertEquals(NodeHealthState.QUARANTINED, recoveredStatus.getState());
+
+    assertFalse(store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS));
+    assertFalse(store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE));
+    assertStatusEquals(recoveredStatus, store.getNodeStatus(node));
+
+    assertTrue(store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS));
+    assertEquals(NodeHealthState.ACTIVE, store.getNodeStatus(node).getState());
+  }
+
+  @Test
+  @CoversRequirements("HEALTH-REQ-003")
+  public void downTrafficNeverChangesStateCountersOrUpdateTime() {
+    URI node = node("node1.local");
+    NodeHealthConfig config =
+        NodeHealthConfig.builder()
+            .withConsecutiveFailureThreshold(1)
+            .withDownNodeRecoverySuccessThreshold(2)
+            .build();
+    NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(node));
+
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
+    store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
+    NodeHealthStatus before = store.getNodeStatus(node);
+    assertEquals(NodeHealthState.DOWN, before.getState());
+    assertEquals(1, before.getConsecutiveSuccesses());
+    long currentGeneration = before.getGeneration();
+    long staleGeneration = currentGeneration - 1;
+    while (System.nanoTime() == before.getUpdatedAtNanos()) {
+      Thread.yield();
+    }
+
+    assertFalse(store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS));
+    assertFalse(store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE));
+    assertFalse(
+        store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS, currentGeneration));
+    assertFalse(
+        store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE, currentGeneration));
+    assertFalse(
+        store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS, staleGeneration));
+    assertFalse(
+        store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE, staleGeneration));
+
+    assertStatusEquals(before, store.getNodeStatus(node));
+  }
+
+  @Test
+  public void enteringDownInSecondHealthCycleIncrementsGenerationAgain() {
+    URI node = node("node1.local");
+    NodeHealthConfig config =
+        NodeHealthConfig.builder()
+            .withConsecutiveFailureThreshold(1)
+            .withDownNodeRecoverySuccessThreshold(1)
+            .withQuarantineSuccessThreshold(1)
+            .build();
+    NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(node));
+
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
+    assertEquals(1, store.getNodeStatus(node).getGeneration());
+    store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_SUCCESS);
+    assertEquals(NodeHealthState.ACTIVE, store.getNodeStatus(node).getState());
+
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
+
+    NodeHealthStatus secondDown = store.getNodeStatus(node);
+    assertEquals(NodeHealthState.DOWN, secondDown.getState());
+    assertEquals(2, secondDown.getGeneration());
   }
 
   @Test
@@ -413,7 +501,7 @@ public class NodeHealthStoreTest {
     store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
     assertEquals(Arrays.asList(node), store.getQuarantinedNodes());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_SUCCESS);
 
     assertTrue(store.getActiveNodes().isEmpty());
     assertEquals(Arrays.asList(node), store.getQuarantinedNodes());
@@ -444,16 +532,16 @@ public class NodeHealthStoreTest {
     store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
     assertEquals(Arrays.asList(node), store.getQuarantinedNodes());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_SUCCESS);
     assertEquals(1, store.getNodeStatus(node).getConsecutiveSuccesses());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertEquals(Arrays.asList(node), store.getQuarantinedNodes());
     assertEquals(0, store.getNodeStatus(node).getConsecutiveSuccesses());
     assertEquals(1, store.getNodeStatus(node).getConsecutiveFailures());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertTrue(store.getQuarantinedNodes().isEmpty());
     assertEquals(Arrays.asList(node), store.getDownNodes());
@@ -473,9 +561,9 @@ public class NodeHealthStoreTest {
             .build();
     NodeHealthStore store = new NodeHealthStore(config, Arrays.asList(node));
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
     store.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
     assertEquals(1, store.getNodeStatus(node).getConsecutiveFailures());
 
     store.reportNodeResult(node, NodeHealthObservation.PROBE_FAILURE);
@@ -484,7 +572,7 @@ public class NodeHealthStoreTest {
     assertEquals(1, store.getNodeStatus(node).getConsecutiveFailures());
     assertEquals(0, store.getNodeStatus(node).getConsecutiveSuccesses());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_SUCCESS);
 
     assertEquals(NodeHealthState.QUARANTINED, store.getNodeStatus(node).getState());
     assertEquals(0, store.getNodeStatus(node).getConsecutiveFailures());
@@ -496,7 +584,7 @@ public class NodeHealthStoreTest {
     assertEquals(0, store.getNodeStatus(node).getConsecutiveFailures());
     assertEquals(1, store.getNodeStatus(node).getConsecutiveSuccesses());
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_SUCCESS);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_SUCCESS);
 
     assertEquals(NodeHealthState.ACTIVE, store.getNodeStatus(node).getState());
     assertEquals(0, store.getNodeStatus(node).getConsecutiveFailures());
@@ -507,7 +595,7 @@ public class NodeHealthStoreTest {
     URI node = node("node1.local");
     NodeHealthStore store = new NodeHealthStore(NodeHealthConfig.disabled(), Arrays.asList(node));
 
-    store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertEquals(Arrays.asList(node), store.getActiveNodes());
     assertTrue(store.getQuarantinedNodes().isEmpty());
@@ -523,7 +611,20 @@ public class NodeHealthStoreTest {
 
   private static void reportFailures(NodeHealthStore store, URI node, int count) {
     for (int i = 0; i < count; i++) {
-      store.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+      reportTraffic(store, node, NodeHealthObservation.TRAFFIC_FAILURE);
     }
+  }
+
+  private static boolean reportTraffic(
+      NodeHealthStore store, URI node, NodeHealthObservation observation) {
+    return store.reportNodeResult(node, observation, store.getNodeStatus(node).getGeneration());
+  }
+
+  private static void assertStatusEquals(NodeHealthStatus expected, NodeHealthStatus actual) {
+    assertEquals(expected.getState(), actual.getState());
+    assertEquals(expected.getConsecutiveFailures(), actual.getConsecutiveFailures());
+    assertEquals(expected.getConsecutiveSuccesses(), actual.getConsecutiveSuccesses());
+    assertEquals(expected.getUpdatedAtNanos(), actual.getUpdatedAtNanos());
+    assertEquals(expected.getGeneration(), actual.getGeneration());
   }
 }

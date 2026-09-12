@@ -214,7 +214,8 @@ public class NodeHealthQueryPlanTest {
   }
 
   private static void markDown(AlternatorLiveNodes liveNodes, URI node) {
-    liveNodes.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    liveNodes.reportNodeResult(
+        node, NodeHealthObservation.TRAFFIC_FAILURE, liveNodes.getNodeHealthGeneration(node));
   }
 
   private static AlternatorLiveNodes liveNodes(List<URI> nodes) {

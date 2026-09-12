@@ -223,7 +223,8 @@ public class AlternatorLiveNodesTest {
 
   private static void markNodeDown(AlternatorLiveNodes liveNodes, URI node) {
     for (int i = 0; i < NodeHealthConfig.DEFAULT_CONSECUTIVE_FAILURE_THRESHOLD; i++) {
-      liveNodes.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+      liveNodes.reportNodeResult(
+          node, NodeHealthObservation.TRAFFIC_FAILURE, liveNodes.getNodeHealthGeneration(node));
     }
   }
 

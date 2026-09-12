@@ -114,17 +114,57 @@ public class AlternatorLiveNodesShutdownTest {
   }
 
   @Test
-  @CoversRequirements("HEALTH-REQ-009")
   public void testShutdownAndWaitClosesOwnedPollingClientWhenThreadNeverStarted() throws Exception {
     CloseCountingHttpClient client = new CloseCountingHttpClient();
     AlternatorLiveNodes liveNodes = newOwnedLiveNodes(client);
 
-    assertTrue("never-started live-node thread should be stopped", liveNodes.shutdownAndWait(0));
+    assertTrue(
+        "never-started live-node thread should be stopped", liveNodes.shutdownAndWait(5_000));
     assertTrue(
         "second shutdown should remain stopped and close should be idempotent",
-        liveNodes.shutdownAndWait(0));
+        liveNodes.shutdownAndWait(5_000));
 
     assertEquals("owned polling client should close exactly once", 1, client.closeCount.get());
+  }
+
+  @Test
+  @CoversRequirements("HEALTH-REQ-009")
+  public void shutdownAndWaitIncludesSlowCleanupInBoundedDeadline() throws Exception {
+    BlockingCloseHttpClient client = new BlockingCloseHttpClient();
+    AlternatorLiveNodes liveNodes = newOwnedLiveNodes(client);
+    try {
+      long startedAt = System.nanoTime();
+
+      assertFalse("blocked cleanup cannot report termination", liveNodes.shutdownAndWait(50));
+
+      long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+      assertTrue("owned client close should start", client.closeStarted.await(1, TimeUnit.SECONDS));
+      assertTrue("shutdown timeout must include cleanup work: " + elapsedMs, elapsedMs < 1_000);
+    } finally {
+      client.releaseClose.countDown();
+      assertTrue(liveNodes.shutdownAndWait(5_000));
+    }
+
+    assertEquals("owned polling client should close exactly once", 1, client.closeCount.get());
+  }
+
+  @Test
+  public void shutdownAndWaitPropagatesOwnedPollingClientCloseFailure() throws Exception {
+    RuntimeException closeFailure = new IllegalStateException("simulated close failure");
+    ThrowingCloseHttpClient client = new ThrowingCloseHttpClient(closeFailure);
+    AlternatorLiveNodes liveNodes = newOwnedLiveNodes(client);
+
+    liveNodes.shutdown();
+
+    RuntimeException first =
+        org.junit.Assert.assertThrows(
+            RuntimeException.class, () -> liveNodes.shutdownAndWait(5_000));
+    RuntimeException second =
+        org.junit.Assert.assertThrows(
+            RuntimeException.class, () -> liveNodes.shutdownAndWait(5_000));
+    assertTrue(first == closeFailure);
+    assertTrue(second == closeFailure);
+    assertEquals("owned polling client close should run once", 1, client.closeCount.get());
   }
 
   private static AlternatorLiveNodes newOwnedLiveNodes(SdkHttpClient client) throws Exception {
@@ -230,6 +270,55 @@ public class AlternatorLiveNodesShutdownTest {
     @Override
     public String clientName() {
       return "close-counting";
+    }
+  }
+
+  private static final class ThrowingCloseHttpClient implements SdkHttpClient {
+    private final RuntimeException failure;
+    private final AtomicInteger closeCount = new AtomicInteger();
+
+    private ThrowingCloseHttpClient(RuntimeException failure) {
+      this.failure = failure;
+    }
+
+    @Override
+    public ExecutableHttpRequest prepareRequest(HttpExecuteRequest request) {
+      throw new AssertionError("polling client should not be used by this test");
+    }
+
+    @Override
+    public void close() {
+      closeCount.incrementAndGet();
+      throw failure;
+    }
+  }
+
+  private static final class BlockingCloseHttpClient implements SdkHttpClient {
+    private final AtomicInteger closeCount = new AtomicInteger();
+    private final CountDownLatch closeStarted = new CountDownLatch(1);
+    private final CountDownLatch releaseClose = new CountDownLatch(1);
+
+    @Override
+    public ExecutableHttpRequest prepareRequest(HttpExecuteRequest request) {
+      throw new AssertionError("polling client should not be used by this test");
+    }
+
+    @Override
+    public void close() {
+      closeCount.incrementAndGet();
+      closeStarted.countDown();
+      while (releaseClose.getCount() > 0) {
+        try {
+          releaseClose.await();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+      }
+    }
+
+    @Override
+    public String clientName() {
+      return "blocking-close";
     }
   }
 

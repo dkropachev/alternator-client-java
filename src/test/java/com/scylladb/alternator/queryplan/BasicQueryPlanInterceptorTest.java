@@ -17,6 +17,7 @@ package com.scylladb.alternator.queryplan;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertThrows;
 
 import com.scylladb.alternator.AlternatorConfig;
 import com.scylladb.alternator.NodeHealthConfig;
@@ -70,7 +71,10 @@ public class BasicQueryPlanInterceptorTest {
       URI initiallySelected = endpoint(initiallyRouted);
 
       interceptor.beforeTransmission(new RequestContext(initiallyRouted), attributes);
-      liveNodes.reportNodeResult(initiallySelected, NodeHealthObservation.TRAFFIC_FAILURE);
+      liveNodes.reportNodeResult(
+          initiallySelected,
+          NodeHealthObservation.TRAFFIC_FAILURE,
+          liveNodes.getNodeHealthGeneration(initiallySelected));
 
       SdkHttpRequest finallyRouted = interceptor.routeAttempt(initiallyRouted);
 
@@ -127,6 +131,161 @@ public class BasicQueryPlanInterceptorTest {
 
       interceptor.afterExecution(null, attributes);
       assertEquals(0, routingExecutionCount(interceptor));
+    } finally {
+      liveNodes.shutdownAndWait();
+    }
+  }
+
+  @Test
+  public void signerFailureReusesPendingUnsentRouteWithoutReportingHealth() throws Exception {
+    List<URI> nodes =
+        Arrays.asList(URI.create("http://127.0.0.1:8000"), URI.create("http://127.0.0.2:8000"));
+    RecordingLiveNodes liveNodes = new RecordingLiveNodes(nodes);
+    try {
+      BasicQueryPlanInterceptor interceptor = new BasicQueryPlanInterceptor(liveNodes);
+      ExecutionAttributes attributes = ExecutionAttributes.builder().build();
+      interceptor.beforeExecution(null, attributes);
+      SdkHttpRequest initiallyRouted =
+          interceptor.modifyHttpRequest(new RequestContext(request("signer-retry")), attributes);
+
+      BasicQueryPlanInterceptor.RoutedRequest firstSigning =
+          interceptor.routeAttemptForSigning(initiallyRouted, attributes);
+      BasicQueryPlanInterceptor.RoutedRequest secondSigning =
+          interceptor.routeAttemptForSigning(initiallyRouted, attributes);
+
+      assertEquals(endpoint(firstSigning.request), endpoint(secondSigning.request));
+      assertEquals(0, liveNodes.generationAwareReports.get());
+    } finally {
+      liveNodes.shutdownAndWait();
+    }
+  }
+
+  @Test
+  public void failureAfterSigningButBeforeTransportDoesNotReportHealth() throws Exception {
+    List<URI> nodes =
+        Arrays.asList(URI.create("http://127.0.0.1:8000"), URI.create("http://127.0.0.2:8000"));
+    RecordingLiveNodes liveNodes = new RecordingLiveNodes(nodes);
+    try {
+      BasicQueryPlanInterceptor interceptor = new BasicQueryPlanInterceptor(liveNodes);
+      ExecutionAttributes attributes = ExecutionAttributes.builder().build();
+      interceptor.beforeExecution(null, attributes);
+      SdkHttpRequest initiallyRouted =
+          interceptor.modifyHttpRequest(new RequestContext(request("local-failure")), attributes);
+      BasicQueryPlanInterceptor.RoutedRequest signed =
+          interceptor.routeAttemptForSigning(initiallyRouted, attributes);
+
+      interceptor.beforeTransmission(new RequestContext(signed.request), attributes);
+      interceptor.onExecutionFailure(null, attributes);
+
+      assertEquals(0, liveNodes.generationAwareReports.get());
+    } finally {
+      liveNodes.shutdownAndWait();
+    }
+  }
+
+  @Test
+  public void pendingUnsentRouteThatBecomesDownIsSkippedBeforeResigning() throws Exception {
+    List<URI> nodes =
+        Arrays.asList(URI.create("http://127.0.0.1:8000"), URI.create("http://127.0.0.2:8000"));
+    RecordingLiveNodes liveNodes = new RecordingLiveNodes(nodes);
+    try {
+      BasicQueryPlanInterceptor interceptor = new BasicQueryPlanInterceptor(liveNodes);
+      ExecutionAttributes attributes = ExecutionAttributes.builder().build();
+      interceptor.beforeExecution(null, attributes);
+      SdkHttpRequest initiallyRouted =
+          interceptor.modifyHttpRequest(new RequestContext(request("pending-down")), attributes);
+      BasicQueryPlanInterceptor.RoutedRequest firstSigning =
+          interceptor.routeAttemptForSigning(initiallyRouted, attributes);
+      URI pendingNode = endpoint(firstSigning.request);
+      liveNodes.reportNodeResult(
+          pendingNode,
+          NodeHealthObservation.TRAFFIC_FAILURE,
+          liveNodes.getNodeHealthGeneration(pendingNode));
+      liveNodes.generationAwareReports.set(0);
+
+      BasicQueryPlanInterceptor.RoutedRequest retriedSigning =
+          interceptor.routeAttemptForSigning(initiallyRouted, attributes);
+
+      assertNotEquals(pendingNode, endpoint(retriedSigning.request));
+      assertEquals(0, liveNodes.generationAwareReports.get());
+    } finally {
+      liveNodes.shutdownAndWait();
+    }
+  }
+
+  @Test
+  public void pendingUnsentRouteRecapturesGenerationAfterRecovery() throws Exception {
+    List<URI> nodes =
+        Arrays.asList(URI.create("http://127.0.0.1:8000"), URI.create("http://127.0.0.2:8000"));
+    RecordingLiveNodes liveNodes = new RecordingLiveNodes(nodes);
+    try {
+      BasicQueryPlanInterceptor interceptor = new BasicQueryPlanInterceptor(liveNodes);
+      ExecutionAttributes attributes = ExecutionAttributes.builder().build();
+      interceptor.beforeExecution(null, attributes);
+      SdkHttpRequest initiallyRouted =
+          interceptor.modifyHttpRequest(
+              new RequestContext(request("pending-generation")), attributes);
+      BasicQueryPlanInterceptor.RoutedRequest firstSigning =
+          interceptor.routeAttemptForSigning(initiallyRouted, attributes);
+      URI pendingNode = endpoint(firstSigning.request);
+      liveNodes.reportNodeResult(
+          pendingNode,
+          NodeHealthObservation.TRAFFIC_FAILURE,
+          liveNodes.getNodeHealthGeneration(pendingNode));
+      for (int i = 0; i < 4; i++) {
+        liveNodes.reportNodeResult(pendingNode, NodeHealthObservation.PROBE_SUCCESS);
+      }
+      assertEquals(NodeHealthState.ACTIVE, liveNodes.getNodeHealthStatus(pendingNode).getState());
+      assertEquals(1, liveNodes.getNodeHealthGeneration(pendingNode));
+      liveNodes.generationAwareReports.set(0);
+
+      BasicQueryPlanInterceptor.RoutedRequest retriedSigning =
+          interceptor.routeAttemptForSigning(initiallyRouted, attributes);
+      interceptor.armTransportAttempt(retriedSigning);
+      interceptor.onExecutionFailure(null, attributes);
+
+      assertEquals(pendingNode, endpoint(retriedSigning.request));
+      assertEquals(1, liveNodes.generationAwareReports.get());
+      assertEquals(NodeHealthState.DOWN, liveNodes.getNodeHealthStatus(pendingNode).getState());
+      assertEquals(2, liveNodes.getNodeHealthGeneration(pendingNode));
+    } finally {
+      liveNodes.shutdownAndWait();
+    }
+  }
+
+  @Test
+  public void unsignedFallbackValidationFailureDoesNotArmNodeHealth() throws Exception {
+    List<URI> nodes =
+        Arrays.asList(URI.create("http://127.0.0.1:8000"), URI.create("http://127.0.0.2:8000"));
+    RecordingLiveNodes liveNodes = new RecordingLiveNodes(nodes);
+    try {
+      BasicQueryPlanInterceptor interceptor = new BasicQueryPlanInterceptor(liveNodes);
+      ExecutionAttributes attributes = ExecutionAttributes.builder().build();
+      interceptor.beforeExecution(null, attributes);
+      SdkHttpRequest initiallyRouted =
+          interceptor.modifyHttpRequest(
+              new RequestContext(request("fallback-validation")), attributes);
+      URI initiallySelected = endpoint(initiallyRouted);
+      interceptor.beforeTransmission(new RequestContext(initiallyRouted), attributes);
+      liveNodes.reportNodeResult(
+          initiallySelected,
+          NodeHealthObservation.TRAFFIC_FAILURE,
+          liveNodes.getNodeHealthGeneration(initiallySelected));
+      liveNodes.generationAwareReports.set(0);
+
+      SdkHttpRequest staleSignedRequest =
+          initiallyRouted.toBuilder().putHeader("Authorization", "stale-signature").build();
+      AttemptRoutingSdkHttpClient routingClient =
+          new AttemptRoutingSdkHttpClient(new NoOpHttpClient(), interceptor);
+
+      assertThrows(
+          IllegalStateException.class,
+          () ->
+              routingClient.prepareRequest(
+                  HttpExecuteRequest.builder().request(staleSignedRequest).build()));
+      interceptor.onExecutionFailure(null, attributes);
+
+      assertEquals(0, liveNodes.generationAwareReports.get());
     } finally {
       liveNodes.shutdownAndWait();
     }

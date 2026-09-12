@@ -50,6 +50,22 @@ public class NodeHealthConfigTest {
   }
 
   @Test
+  public void allHealthThresholdsBelowOneNormalizeToOne() {
+    NodeHealthConfig config =
+        NodeHealthConfig.builder()
+            .withConsecutiveFailureThreshold(0)
+            .withDownNodeRecoverySuccessThreshold(-1)
+            .withQuarantineSuccessThreshold(Integer.MIN_VALUE)
+            .withQuarantineFailureThreshold(0)
+            .build();
+
+    assertEquals(1, config.getConsecutiveFailureThreshold());
+    assertEquals(1, config.getDownNodeRecoverySuccessThreshold());
+    assertEquals(1, config.getQuarantineSuccessThreshold());
+    assertEquals(1, config.getQuarantineFailureThreshold());
+  }
+
+  @Test
   public void quarantineTrafficIdlePeriodDefaultsToOneHundredMilliseconds() {
     assertEquals(100, NodeHealthConfig.DEFAULT_QUARANTINE_TRAFFIC_IDLE_PERIOD_MS);
     assertEquals(100, NodeHealthConfig.getDefault().getQuarantineTrafficIdlePeriodMs());

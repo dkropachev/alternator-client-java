@@ -73,6 +73,9 @@ public class AlternatorLiveNodes extends Thread {
   private final AtomicBoolean running = new AtomicBoolean(false);
   private final AtomicBoolean shutdownRequested = new AtomicBoolean(false);
   private final AtomicBoolean shutdownStarted = new AtomicBoolean(false);
+  private final Object shutdownLock = new Object();
+  private volatile Thread shutdownThread;
+  private final AtomicReference<RuntimeException> shutdownFailure = new AtomicReference<>();
   private final AtomicBoolean pollingClientClosed = new AtomicBoolean(false);
   private final SdkHttpClient pollingHttpClient;
   private final boolean ownsPollingClient;
@@ -146,7 +149,11 @@ public class AlternatorLiveNodes extends Thread {
       }
     } finally {
       running.set(false);
-      closePollingClient();
+      try {
+        closePollingClient();
+      } catch (RuntimeException failure) {
+        recordShutdownFailure(failure);
+      }
       logger.log(Level.INFO, "AlternatorLiveNodes thread stopped");
     }
   }
@@ -163,27 +170,46 @@ public class AlternatorLiveNodes extends Thread {
   /**
    * Initiates a graceful shutdown of the background thread.
    *
-   * <p>This method signals the thread to stop and returns immediately. Use {@link #join()} or
-   * {@link #join(long)} to wait for the thread to terminate.
+   * <p>This method signals control-plane work to stop and returns immediately. Use {@link
+   * #shutdownAndWait()} or {@link #shutdownAndWait(long)} to wait for complete shutdown.
    *
    * @since 2.0.4
    */
   public void shutdown() {
     shutdownRequested.set(true);
-    if (shutdownStarted.compareAndSet(false, true)) {
-      nodeHealthManager.shutdown();
-      for (ExecutableHttpRequest request : activeControlPlaneRequests) {
-        abortQuietly(request);
-      }
-      closePollingClient();
-    }
+    nodeHealthManager.requestShutdown();
     this.interrupt();
+    synchronized (shutdownLock) {
+      if (shutdownStarted.compareAndSet(false, true)) {
+        Thread worker = new Thread(this::completeShutdown, "alternator-live-nodes-shutdown");
+        worker.setDaemon(true);
+        shutdownThread = worker;
+        worker.start();
+      }
+    }
+  }
+
+  private void completeShutdown() {
+    try {
+      nodeHealthManager.shutdown();
+    } catch (RuntimeException failure) {
+      recordShutdownFailure(failure);
+    }
+    for (ExecutableHttpRequest request : activeControlPlaneRequests) {
+      abortQuietly(request);
+    }
+    try {
+      closePollingClient();
+    } catch (RuntimeException failure) {
+      recordShutdownFailure(failure);
+    }
   }
 
   /**
    * Initiates shutdown and waits for the background thread to stop.
    *
    * @return true if the thread stopped before the default timeout, false otherwise
+   * @throws RuntimeException if asynchronous owned-resource cleanup failed
    * @since 2.0.5
    */
   public boolean shutdownAndWait() {
@@ -195,27 +221,70 @@ public class AlternatorLiveNodes extends Thread {
    *
    * @param timeoutMs maximum time to wait in milliseconds
    * @return true if the thread stopped before the timeout, false otherwise
+   * @throws RuntimeException if asynchronous owned-resource cleanup failed
    * @since 2.0.5
    */
   public boolean shutdownAndWait(long timeoutMs) {
+    long deadlineNanos =
+        timeoutMs > 0
+            ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+            : System.nanoTime();
     shutdown();
-    if (Thread.currentThread() == this || nodeHealthManager.isProbeWorkerThread()) {
+    Thread shutdownWorker = shutdownThread;
+    if (Thread.currentThread() == this
+        || Thread.currentThread() == shutdownWorker
+        || nodeHealthManager.isProbeWorkerThread()) {
       return false;
     }
     if (timeoutMs <= 0) {
-      return !isAlive() && nodeHealthManager.isTerminated();
+      boolean stopped =
+          !isAlive()
+              && (shutdownWorker == null || !shutdownWorker.isAlive())
+              && nodeHealthManager.isTerminated();
+      if (stopped) {
+        throwShutdownFailure();
+      }
+      return stopped;
     }
-    long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
     try {
+      if (shutdownWorker != null) {
+        long shutdownRemainingMs = remainingMillis(deadlineNanos);
+        if (shutdownRemainingMs > 0) {
+          shutdownWorker.join(shutdownRemainingMs);
+        }
+      }
       long remainingMs = remainingMillis(deadlineNanos);
       if (remainingMs > 0) {
         join(remainingMs);
       }
       boolean healthStopped = nodeHealthManager.awaitTermination(deadlineNanos);
-      return !isAlive() && healthStopped;
+      boolean stopped =
+          !isAlive() && (shutdownWorker == null || !shutdownWorker.isAlive()) && healthStopped;
+      if (stopped) {
+        throwShutdownFailure();
+      }
+      return stopped;
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       return false;
+    }
+  }
+
+  private void recordShutdownFailure(RuntimeException failure) {
+    RuntimeException existing = shutdownFailure.get();
+    if (existing == null && shutdownFailure.compareAndSet(null, failure)) {
+      return;
+    }
+    existing = shutdownFailure.get();
+    if (existing != failure) {
+      existing.addSuppressed(failure);
+    }
+  }
+
+  private void throwShutdownFailure() {
+    RuntimeException failure = shutdownFailure.get();
+    if (failure != null) {
+      throw failure;
     }
   }
 
@@ -685,14 +754,18 @@ public class AlternatorLiveNodes extends Thread {
     String requestQuery = query.isEmpty() ? null : query;
 
     DiscoveryAttempt liveAttempt =
-        discoverNodes(scope, liveDiscoveryCandidates(), requestQuery, "live node");
+        discoverNodes(scope, liveDiscoveryCandidates(), requestQuery, "live node", true);
     if (!liveAttempt.nodes.isEmpty()) {
       return liveAttempt.nodes;
     }
 
     DiscoveryAttempt seedAttempt =
         discoverNodes(
-            scope, initialDiscoveryCandidates(liveAttempt.candidates), requestQuery, "seed node");
+            scope,
+            initialDiscoveryCandidates(liveAttempt.candidates),
+            requestQuery,
+            "seed node",
+            false);
     if (!seedAttempt.nodes.isEmpty()) {
       return seedAttempt.nodes;
     }
@@ -707,15 +780,22 @@ public class AlternatorLiveNodes extends Thread {
   }
 
   private DiscoveryAttempt discoverNodes(
-      RoutingScope scope, List<URI> candidates, String requestQuery, String candidateDescription) {
+      RoutingScope scope,
+      List<URI> candidates,
+      String requestQuery,
+      String candidateDescription,
+      boolean candidatesFromDiscoveredSet) {
     IOException lastException = null;
     Set<URI> nodes = new LinkedHashSet<>();
     for (URI candidate : candidates) {
       boolean reportHealth = getQueryPlanNodeState(candidate) != NodeHealthState.DOWN;
+      boolean requireCurrentMembership =
+          candidatesFromDiscoveredSet || isCurrentlyDiscovered(candidate);
       try {
         List<URI> discoveredNodes =
             getNodes(withPathAndRawQuery(candidate, "/localnodes", requestQuery));
-        reportDiscoveryResult(candidate, NodeHealthObservation.PROBE_SUCCESS, reportHealth);
+        reportDiscoveryResult(
+            candidate, NodeHealthObservation.PROBE_SUCCESS, reportHealth, requireCurrentMembership);
         if (!discoveredNodes.isEmpty()) {
           if (!(scope instanceof ClusterScope)) {
             return new DiscoveryAttempt(candidates, discoveredNodes, lastException);
@@ -724,10 +804,12 @@ public class AlternatorLiveNodes extends Thread {
         }
       } catch (IOException e) {
         lastException =
-            recordDiscoveryFailure(scope, candidate, candidateDescription, e, reportHealth);
+            recordDiscoveryFailure(
+                scope, candidate, candidateDescription, e, reportHealth, requireCurrentMembership);
       } catch (RuntimeException e) {
         lastException =
-            recordDiscoveryFailure(scope, candidate, candidateDescription, e, reportHealth);
+            recordDiscoveryFailure(
+                scope, candidate, candidateDescription, e, reportHealth, requireCurrentMembership);
       } catch (URISyntaxException e) {
         throw new RuntimeException(e);
       }
@@ -741,8 +823,10 @@ public class AlternatorLiveNodes extends Thread {
       URI candidate,
       String candidateDescription,
       Exception failure,
-      boolean reportHealth) {
-    reportDiscoveryResult(candidate, NodeHealthObservation.PROBE_FAILURE, reportHealth);
+      boolean reportHealth,
+      boolean requireCurrentMembership) {
+    reportDiscoveryResult(
+        candidate, NodeHealthObservation.PROBE_FAILURE, reportHealth, requireCurrentMembership);
     logger.log(
         Level.WARNING,
         "Failed to contact "
@@ -760,16 +844,45 @@ public class AlternatorLiveNodes extends Thread {
   }
 
   private void reportDiscoveryResult(
-      URI candidate, NodeHealthObservation observation, boolean reportHealth) {
+      URI candidate,
+      NodeHealthObservation observation,
+      boolean reportHealth,
+      boolean requireCurrentMembership) {
     if (reportHealth && getQueryPlanNodeState(candidate) != NodeHealthState.DOWN) {
-      reportNodeResult(candidate, observation, false);
+      nodeHealthManager.reportControlPlaneResult(candidate, observation, requireCurrentMembership);
     }
   }
 
+  private boolean isCurrentlyDiscovered(URI candidate) {
+    URI key = NodeHealthStore.canonicalNodeKey(candidate);
+    for (URI discovered : getDiscoveredNodesInternal()) {
+      if (Objects.equals(key, NodeHealthStore.canonicalNodeKey(discovered))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private List<URI> liveDiscoveryCandidates() {
-    List<URI> active = getActiveNodesInternal();
-    List<URI> quarantined = getQuarantinedNodesInternal();
-    List<URI> down = getDownNodesInternal();
+    List<URI> discoveredSnapshot = new ArrayList<>(getDiscoveredNodesInternal());
+    List<URI> active = new ArrayList<>();
+    List<URI> quarantined = new ArrayList<>();
+    List<URI> down = new ArrayList<>();
+    Set<URI> classified = new HashSet<>();
+    for (URI node : discoveredSnapshot) {
+      URI key = NodeHealthStore.canonicalNodeKey(node);
+      if (node == null || key == null || !classified.add(key)) {
+        continue;
+      }
+      NodeHealthState state = getQueryPlanNodeState(node);
+      if (state == NodeHealthState.ACTIVE) {
+        active.add(node);
+      } else if (state == NodeHealthState.QUARANTINED) {
+        quarantined.add(node);
+      } else {
+        down.add(node);
+      }
+    }
     Collections.shuffle(active);
     Collections.shuffle(quarantined);
     Collections.shuffle(down);
@@ -1073,18 +1186,19 @@ public class AlternatorLiveNodes extends Thread {
     }
     try {
       List<URI> hostsWithFakeRack = getNodes(fakeRackUrl);
+      nodeHealthManager.reportControlPlaneResult(node, NodeHealthObservation.PROBE_SUCCESS, true);
       List<URI> hostsWithoutRack = getNodes(uri);
+      nodeHealthManager.reportControlPlaneResult(node, NodeHealthObservation.PROBE_SUCCESS, true);
       if (hostsWithoutRack.isEmpty()) {
         // This should not normally happen.
         // If list of nodes is empty, it is impossible to conclude if it supports rack/datacenter
         // filtering or not.
         throw new FailedToCheck(String.format("host %s returned empty list", uri));
       }
-      reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
       // When rack filtering is not supported server returns same nodes.
       return hostsWithFakeRack.size() != hostsWithoutRack.size();
     } catch (IOException | RuntimeException e) {
-      reportNodeResult(node, NodeHealthObservation.PROBE_FAILURE);
+      nodeHealthManager.reportControlPlaneResult(node, NodeHealthObservation.PROBE_FAILURE, true);
       throw new FailedToCheck("failed to read list of nodes from the node", e);
     }
   }
@@ -1141,34 +1255,67 @@ public class AlternatorLiveNodes extends Thread {
   }
 
   /**
-   * Reports a node request outcome to the health tracker.
+   * Reports a generation-independent probe outcome to the health tracker.
+   *
+   * <p>Traffic outcomes must use {@link #reportNodeResult(URI, NodeHealthObservation, long)} so a
+   * late result cannot update a later health generation.
    *
    * @param node node URI
-   * @param observation observed request result
+   * @param observation observed probe result
+   * @throws IllegalArgumentException when node health is enabled and {@code observation} is a
+   *     traffic outcome
    * @since 2.0.6
    */
   public void reportNodeResult(URI node, NodeHealthObservation observation) {
-    reportNodeResult(node, observation, true);
+    if (isTrafficObservation(observation)) {
+      if (config.getNodeHealthConfig().isDisabled()) {
+        markActivity();
+        return;
+      }
+      throw generationRequired();
+    }
+    markActivity();
+    nodeHealthManager.reportProbeResult(node, observation);
   }
 
   /**
    * Reports a routed traffic outcome only if it belongs to the node's current health generation.
+   * Probe observations remain generation-independent; for those, this method ignores {@code
+   * expectedTrafficGeneration} and behaves like the two-argument overload.
    *
    * @param node node URI
-   * @param observation observed request result
+   * @param observation observed traffic or probe result
    * @param expectedTrafficGeneration generation captured when the attempt was routed
    */
   public void reportNodeResult(
       URI node, NodeHealthObservation observation, long expectedTrafficGeneration) {
     markActivity();
-    nodeHealthManager.reportNodeResult(node, observation, expectedTrafficGeneration);
+    if (isTrafficObservation(observation)) {
+      nodeHealthManager.reportNodeResult(node, observation, expectedTrafficGeneration);
+    } else {
+      nodeHealthManager.reportProbeResult(node, observation);
+    }
   }
 
   void reportNodeResult(URI node, NodeHealthObservation observation, boolean markActivity) {
+    if (isTrafficObservation(observation)) {
+      throw generationRequired();
+    }
     if (markActivity) {
       markActivity();
     }
-    nodeHealthManager.reportNodeResult(node, observation);
+    nodeHealthManager.reportProbeResult(node, observation);
+  }
+
+  private static boolean isTrafficObservation(NodeHealthObservation observation) {
+    return observation == NodeHealthObservation.TRAFFIC_SUCCESS
+        || observation == NodeHealthObservation.TRAFFIC_FAILURE;
+  }
+
+  private static IllegalArgumentException generationRequired() {
+    return new IllegalArgumentException(
+        "traffic observations require an attempt generation; use "
+            + "reportNodeResult(URI, NodeHealthObservation, long)");
   }
 
   /** Runs and waits for one explicit probe batch for currently down nodes. */

@@ -22,16 +22,20 @@ import com.scylladb.alternator.CoversRequirements;
 import com.scylladb.alternator.NodeHealthConfig;
 import com.scylladb.alternator.NodeHealthObservation;
 import com.scylladb.alternator.NodeHealthState;
+import com.scylladb.alternator.NodeHealthStatus;
 import com.scylladb.alternator.routing.DatacenterScope;
 import com.scylladb.alternator.routing.RoutingScope;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.Test;
@@ -44,6 +48,216 @@ import software.amazon.awssdk.http.SdkHttpFullResponse;
 import software.amazon.awssdk.http.SdkHttpRequest;
 
 public class AlternatorLiveNodesNodeHealthTest {
+  @Test
+  public void generationUnawarePublicApiRejectsTrafficObservations() {
+    AlternatorLiveNodes liveNodes =
+        liveNodes(NodeHealthConfig.getDefault(), new LocalNodesHttpClient());
+    URI node = node("active.local");
+    NodeHealthStatus before = liveNodes.getNodeHealthStatus(node);
+
+    try {
+      liveNodes.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+      fail("expected generation-unaware traffic report to be rejected");
+    } catch (IllegalArgumentException expected) {
+      assertTrue(
+          expected.getMessage().contains("reportNodeResult(URI, NodeHealthObservation, long)"));
+    }
+
+    assertEquals(before.getState(), liveNodes.getNodeHealthStatus(node).getState());
+    assertEquals(
+        before.getConsecutiveFailures(),
+        liveNodes.getNodeHealthStatus(node).getConsecutiveFailures());
+  }
+
+  @Test
+  public void publicProbeReportsCannotActivateRemovedQuarantinedNode() throws Exception {
+    AlternatorLiveNodes liveNodes =
+        directLiveNodes(NodeHealthConfig.getDefault(), new LocalNodesHttpClient());
+    URI removed = node("candidate.local");
+    publishDiscoveredNodes(liveNodes, Arrays.asList(node("replacement.local")));
+
+    liveNodes.reportNodeResult(removed, NodeHealthObservation.PROBE_SUCCESS);
+    assertEquals(NodeHealthState.QUARANTINED, liveNodes.getNodeHealthStatus(removed).getState());
+
+    liveNodes.reportNodeResult(
+        removed, NodeHealthObservation.PROBE_SUCCESS, liveNodes.getNodeHealthGeneration(removed));
+    assertEquals(NodeHealthState.QUARANTINED, liveNodes.getNodeHealthStatus(removed).getState());
+  }
+
+  @Test
+  public void publicProbeReportsAdvanceDownNodeRecoveryWithoutUsingTrafficGeneration() {
+    AlternatorLiveNodes liveNodes =
+        directLiveNodes(
+            NodeHealthConfig.builder()
+                .withConsecutiveFailureThreshold(1)
+                .withDownNodeRecoverySuccessThreshold(2)
+                .build(),
+            new LocalNodesHttpClient());
+    URI node = node("candidate.local");
+    liveNodes.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
+    reportCurrentTraffic(liveNodes, node, NodeHealthObservation.TRAFFIC_FAILURE);
+    assertEquals(NodeHealthState.DOWN, liveNodes.getNodeHealthStatus(node).getState());
+
+    liveNodes.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS);
+    assertEquals(1, liveNodes.getNodeHealthStatus(node).getConsecutiveSuccesses());
+
+    liveNodes.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS, Long.MIN_VALUE);
+    assertEquals(NodeHealthState.QUARANTINED, liveNodes.getNodeHealthStatus(node).getState());
+  }
+
+  @Test
+  @CoversRequirements("HEALTH-REQ-008")
+  public void lateDiscoverySuccessCannotActivateRemovedQuarantinedNode() throws Exception {
+    BlockingLocalNodesHttpClient httpClient = new BlockingLocalNodesHttpClient("[]", 1);
+    AlternatorLiveNodes liveNodes = directLiveNodes(NodeHealthConfig.getDefault(), httpClient);
+    URI removed = node("candidate.local");
+    FutureTask<Void> refresh =
+        new FutureTask<>(
+            () -> {
+              liveNodes.refreshDiscoveredNodes();
+              return null;
+            });
+    Thread refreshThread = new Thread(refresh, "late-discovery-test");
+    refreshThread.setDaemon(true);
+    refreshThread.start();
+
+    try {
+      assertTrue(httpClient.awaitBlockedCall());
+      publishDiscoveredNodes(liveNodes, Arrays.asList(node("replacement.local")));
+    } finally {
+      httpClient.releaseBlockedCall();
+    }
+    refresh.get(5, TimeUnit.SECONDS);
+
+    assertFalse(liveNodes.getDiscoveredNodes().contains(removed));
+    assertEquals(NodeHealthState.QUARANTINED, liveNodes.getNodeHealthStatus(removed).getState());
+  }
+
+  @Test
+  public void absentSeedFallbackCanStillRecordSuccessfulDirectContact() throws Exception {
+    LocalNodesHttpClient httpClient =
+        new LocalNodesHttpClient("[\"current.local\"]", "current.local");
+    AlternatorConfig config =
+        AlternatorConfig.builder()
+            .withSeedHosts(Arrays.asList("seed.local", "current.local"))
+            .withScheme("http")
+            .withPort(8080)
+            .withActiveRefreshIntervalMs(60_000)
+            .withIdleRefreshIntervalMs(60_000)
+            .build();
+    AlternatorLiveNodes liveNodes = new AlternatorLiveNodes(config, httpClient);
+    URI seed = node("seed.local");
+    URI current = node("current.local");
+    publishDiscoveredNodes(liveNodes, Arrays.asList(current));
+
+    liveNodes.refreshDiscoveredNodes();
+
+    assertFalse(liveNodes.getDiscoveredNodes().contains(seed));
+    assertEquals(NodeHealthState.ACTIVE, liveNodes.getNodeHealthStatus(seed).getState());
+  }
+
+  @Test
+  public void lateFeatureCheckSuccessCannotActivateRemovedQuarantinedNode() throws Exception {
+    BlockingLocalNodesHttpClient httpClient =
+        new BlockingLocalNodesHttpClient("[\"candidate.local\"]", 1);
+    AlternatorLiveNodes liveNodes = directLiveNodes(NodeHealthConfig.getDefault(), httpClient);
+    URI removed = node("candidate.local");
+    FutureTask<Boolean> featureCheck =
+        new FutureTask<>(liveNodes::checkIfRackDatacenterFeatureIsSupported);
+    Thread featureThread = new Thread(featureCheck, "late-feature-check-test");
+    featureThread.setDaemon(true);
+    featureThread.start();
+
+    try {
+      assertTrue(httpClient.awaitBlockedCall());
+      publishDiscoveredNodes(liveNodes, Arrays.asList(node("replacement.local")));
+    } finally {
+      httpClient.releaseBlockedCall();
+    }
+
+    assertFalse(featureCheck.get(5, TimeUnit.SECONDS));
+    assertFalse(liveNodes.getDiscoveredNodes().contains(removed));
+    assertEquals(NodeHealthState.QUARANTINED, liveNodes.getNodeHealthStatus(removed).getState());
+  }
+
+  @Test
+  public void disabledHealthExposesActiveNodesAndIssuesNoPhysicalHealthProbes() throws Exception {
+    LocalNodesHttpClient httpClient = new LocalNodesHttpClient();
+    AlternatorLiveNodes liveNodes = directLiveNodes(NodeHealthConfig.disabled(), httpClient);
+    URI seed = node("candidate.local");
+    URI discovered = node("discovered.local");
+    publishDiscoveredNodes(liveNodes, Arrays.asList(seed, discovered));
+
+    assertEquals(Arrays.asList(seed, discovered), liveNodes.getActiveNodes());
+    assertTrue(liveNodes.getQuarantinedNodes().isEmpty());
+    assertTrue(liveNodes.getDownNodes().isEmpty());
+
+    for (int i = 0; i < NodeHealthConfig.DEFAULT_CONSECUTIVE_FAILURE_THRESHOLD + 1; i++) {
+      liveNodes.reportNodeResult(
+          seed, NodeHealthObservation.TRAFFIC_FAILURE, liveNodes.getNodeHealthGeneration(seed));
+    }
+    liveNodes.reportNodeResult(seed, NodeHealthObservation.TRAFFIC_FAILURE);
+    liveNodes.reportNodeResult(
+        discovered,
+        NodeHealthObservation.TRAFFIC_SUCCESS,
+        liveNodes.getNodeHealthGeneration(discovered));
+
+    assertEquals(Arrays.asList(seed, discovered), liveNodes.getActiveNodes());
+    assertTrue(liveNodes.probeQuarantinedNodes().isEmpty());
+    assertTrue(liveNodes.probeQuarantinedNodesAsync().get(5, TimeUnit.SECONDS).isEmpty());
+    assertTrue(liveNodes.runDownNodeProbes().isEmpty());
+    liveNodes.scheduleBackgroundHealthProbes();
+    assertTrue(httpClient.requests.isEmpty());
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void liveDiscoveryCandidatesUseOneTopologySnapshotAndOneClassificationPerEndpoint()
+      throws Exception {
+    URI active = URI.create("HTTP://ACTIVE.LOCAL:8080/path");
+    URI activeDuplicate = node("active.local");
+    URI quarantined = node("quarantined.local");
+    URI down = node("down.local");
+    List<URI> snapshot = Arrays.asList(quarantined, down, active, activeDuplicate);
+    AtomicLong topologyReads = new AtomicLong();
+    AtomicLong healthClassifications = new AtomicLong();
+    AlternatorConfig config =
+        AlternatorConfig.builder()
+            .withSeedHosts(Arrays.asList("candidate.local"))
+            .withScheme("http")
+            .withPort(8080)
+            .build();
+    AlternatorLiveNodes liveNodes =
+        new AlternatorLiveNodes(config, new LocalNodesHttpClient()) {
+          @Override
+          protected List<URI> getDiscoveredNodesInternal() {
+            topologyReads.incrementAndGet();
+            return snapshot;
+          }
+
+          @Override
+          NodeHealthState getQueryPlanNodeState(URI candidate) {
+            healthClassifications.incrementAndGet();
+            URI key = NodeHealthStore.canonicalNodeKey(candidate);
+            if (key.equals(NodeHealthStore.canonicalNodeKey(active))) {
+              return NodeHealthState.ACTIVE;
+            }
+            if (key.equals(NodeHealthStore.canonicalNodeKey(quarantined))) {
+              return NodeHealthState.QUARANTINED;
+            }
+            return NodeHealthState.DOWN;
+          }
+        };
+    Method method = AlternatorLiveNodes.class.getDeclaredMethod("liveDiscoveryCandidates");
+    method.setAccessible(true);
+
+    List<URI> candidates = (List<URI>) method.invoke(liveNodes);
+
+    assertEquals(Arrays.asList(active, quarantined, down), candidates);
+    assertEquals(1, topologyReads.get());
+    assertEquals(3, healthClassifications.get());
+  }
+
   @Test
   @CoversRequirements("HEALTH-REQ-005")
   public void discoveryActivatesContactedSeedButQuarantinesNewNodesUntilDirectProbe()
@@ -111,7 +325,7 @@ public class AlternatorLiveNodesNodeHealthTest {
     URI down = node("down.local");
     URI quarantined = node("quarantined.local");
     liveNodes.reportNodeResult(active, NodeHealthObservation.PROBE_SUCCESS);
-    liveNodes.reportNodeResult(down, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportCurrentTraffic(liveNodes, down, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertEquals(Arrays.asList(quarantined), liveNodes.probeQuarantinedNodes());
 
@@ -123,7 +337,6 @@ public class AlternatorLiveNodesNodeHealthTest {
   }
 
   @Test
-  @CoversRequirements("HEALTH-REQ-008")
   public void topologyRefreshUsesHealthBucketsAndDownFallbackIsHealthNeutral() throws Exception {
     LocalNodesHttpClient httpClient = new LocalNodesHttpClient("[]");
     AlternatorConfig config =
@@ -139,7 +352,7 @@ public class AlternatorLiveNodesNodeHealthTest {
     URI quarantined = node("quarantined.local");
     URI down = node("down.local");
     liveNodes.reportNodeResult(active, NodeHealthObservation.PROBE_SUCCESS);
-    liveNodes.reportNodeResult(down, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportCurrentTraffic(liveNodes, down, NodeHealthObservation.TRAFFIC_FAILURE);
     int downRecoveryBefore = liveNodes.getNodeHealthStatus(down).getConsecutiveSuccesses();
 
     liveNodes.refreshDiscoveredNodes();
@@ -259,6 +472,40 @@ public class AlternatorLiveNodesNodeHealthTest {
 
     assertEquals(0, liveNodes.getNodeHealthStatus(active).getConsecutiveFailures());
     assertTrue(liveNodes.getDownNodes().isEmpty());
+  }
+
+  @Test
+  public void featureCheckEmptyValidResponseStillActivatesContactedQuarantinedNode()
+      throws Exception {
+    LocalNodesHttpClient httpClient = new LocalNodesHttpClient("[]");
+    AlternatorLiveNodes liveNodes = directLiveNodes(NodeHealthConfig.getDefault(), httpClient);
+    URI candidate = node("candidate.local");
+
+    try {
+      liveNodes.checkIfRackDatacenterFeatureIsSupported();
+      fail("expected empty node list to prevent feature detection");
+    } catch (AlternatorLiveNodes.FailedToCheck expected) {
+      assertTrue(expected.getMessage().contains("returned empty list"));
+    }
+
+    assertEquals(NodeHealthState.ACTIVE, liveNodes.getNodeHealthStatus(candidate).getState());
+    assertEquals(2, httpClient.requests.size());
+  }
+
+  @Test
+  public void featureCheckFirstSuccessfulContactSurvivesSecondRequestFailure() throws Exception {
+    AlternatorLiveNodes liveNodes =
+        directLiveNodes(NodeHealthConfig.getDefault(), new SecondRequestFailureHttpClient());
+    URI candidate = node("candidate.local");
+
+    try {
+      liveNodes.checkIfRackDatacenterFeatureIsSupported();
+      fail("expected second feature-detection request to fail");
+    } catch (AlternatorLiveNodes.FailedToCheck expected) {
+      assertTrue(expected.getMessage().contains("failed to read list of nodes"));
+    }
+
+    assertEquals(NodeHealthState.ACTIVE, liveNodes.getNodeHealthStatus(candidate).getState());
   }
 
   @Test
@@ -387,11 +634,11 @@ public class AlternatorLiveNodesNodeHealthTest {
     liveNodes.runDownNodeProbes();
     assertEquals(Arrays.asList(recovering), liveNodes.getQuarantinedNodes());
 
-    liveNodes.reportNodeResult(recovering, NodeHealthObservation.TRAFFIC_SUCCESS);
+    reportCurrentTraffic(liveNodes, recovering, NodeHealthObservation.TRAFFIC_SUCCESS);
 
     assertEquals(Arrays.asList(recovering), liveNodes.getQuarantinedNodes());
 
-    liveNodes.reportNodeResult(recovering, NodeHealthObservation.TRAFFIC_SUCCESS);
+    reportCurrentTraffic(liveNodes, recovering, NodeHealthObservation.TRAFFIC_SUCCESS);
 
     assertTrue(liveNodes.getQuarantinedNodes().isEmpty());
     assertTrue(liveNodes.getDownNodes().isEmpty());
@@ -809,6 +1056,20 @@ public class AlternatorLiveNodesNodeHealthTest {
     return liveNodes(nodeHealthConfig, httpClient, null);
   }
 
+  private static AlternatorLiveNodes directLiveNodes(
+      NodeHealthConfig nodeHealthConfig, SdkHttpClient httpClient) {
+    AlternatorConfig config =
+        AlternatorConfig.builder()
+            .withSeedHosts(Arrays.asList("candidate.local"))
+            .withScheme("http")
+            .withPort(8080)
+            .withActiveRefreshIntervalMs(60_000)
+            .withIdleRefreshIntervalMs(60_000)
+            .withNodeHealthConfig(nodeHealthConfig)
+            .build();
+    return new AlternatorLiveNodes(config, httpClient);
+  }
+
   private static AlternatorLiveNodes liveNodes(
       NodeHealthConfig nodeHealthConfig, SdkHttpClient httpClient, RoutingScope routingScope) {
     return liveNodes(
@@ -855,8 +1116,13 @@ public class AlternatorLiveNodesNodeHealthTest {
 
   private static void markNodeDown(AlternatorLiveNodes liveNodes, URI node) {
     for (int i = 0; i < NodeHealthConfig.DEFAULT_CONSECUTIVE_FAILURE_THRESHOLD; i++) {
-      liveNodes.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+      reportCurrentTraffic(liveNodes, node, NodeHealthObservation.TRAFFIC_FAILURE);
     }
+  }
+
+  private static void reportCurrentTraffic(
+      AlternatorLiveNodes liveNodes, URI node, NodeHealthObservation observation) {
+    liveNodes.reportNodeResult(node, observation, liveNodes.getNodeHealthGeneration(node));
   }
 
   private static List<URI> collectNodes(LazyQueryPlan plan) {
@@ -871,6 +1137,13 @@ public class AlternatorLiveNodesNodeHealthTest {
     Field field = AlternatorLiveNodes.class.getDeclaredField("lastActivityTime");
     field.setAccessible(true);
     return (AtomicLong) field.get(liveNodes);
+  }
+
+  private static void publishDiscoveredNodes(AlternatorLiveNodes liveNodes, List<URI> nodes)
+      throws Exception {
+    Method method = AlternatorLiveNodes.class.getDeclaredMethod("setDiscoveredNodes", List.class);
+    method.setAccessible(true);
+    method.invoke(liveNodes, nodes);
   }
 
   private static final class LocalNodesHttpClient implements SdkHttpClient {
@@ -950,6 +1223,97 @@ public class AlternatorLiveNodesNodeHealthTest {
     @Override
     public String clientName() {
       return "localnodes";
+    }
+  }
+
+  private static final class BlockingLocalNodesHttpClient implements SdkHttpClient {
+    private final String responseBody;
+    private final long blockedCallNumber;
+    private final AtomicLong callNumber = new AtomicLong();
+    private final CountDownLatch blockedCallStarted = new CountDownLatch(1);
+    private final CountDownLatch releaseBlockedCall = new CountDownLatch(1);
+
+    private BlockingLocalNodesHttpClient(String responseBody, long blockedCallNumber) {
+      this.responseBody = responseBody;
+      this.blockedCallNumber = blockedCallNumber;
+    }
+
+    private boolean awaitBlockedCall() throws InterruptedException {
+      return blockedCallStarted.await(5, TimeUnit.SECONDS);
+    }
+
+    private void releaseBlockedCall() {
+      releaseBlockedCall.countDown();
+    }
+
+    @Override
+    public ExecutableHttpRequest prepareRequest(HttpExecuteRequest request) {
+      return new ExecutableHttpRequest() {
+        @Override
+        public HttpExecuteResponse call() throws IOException {
+          if (callNumber.incrementAndGet() == blockedCallNumber) {
+            blockedCallStarted.countDown();
+            try {
+              if (!releaseBlockedCall.await(5, TimeUnit.SECONDS)) {
+                throw new IOException("timed out waiting to release blocked request");
+              }
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              throw new IOException("interrupted waiting to release blocked request", e);
+            }
+          }
+          byte[] body = responseBody.getBytes(StandardCharsets.UTF_8);
+          return HttpExecuteResponse.builder()
+              .response(SdkHttpFullResponse.builder().statusCode(200).build())
+              .responseBody(AbortableInputStream.create(new ByteArrayInputStream(body)))
+              .build();
+        }
+
+        @Override
+        public void abort() {
+          releaseBlockedCall.countDown();
+        }
+      };
+    }
+
+    @Override
+    public void close() {}
+
+    @Override
+    public String clientName() {
+      return "blocking-localnodes";
+    }
+  }
+
+  private static final class SecondRequestFailureHttpClient implements SdkHttpClient {
+    private final AtomicLong callNumber = new AtomicLong();
+
+    @Override
+    public ExecutableHttpRequest prepareRequest(HttpExecuteRequest request) {
+      return new ExecutableHttpRequest() {
+        @Override
+        public HttpExecuteResponse call() throws IOException {
+          if (callNumber.incrementAndGet() == 2) {
+            throw new IOException("simulated second-request failure");
+          }
+          byte[] body = "[]".getBytes(StandardCharsets.UTF_8);
+          return HttpExecuteResponse.builder()
+              .response(SdkHttpFullResponse.builder().statusCode(200).build())
+              .responseBody(AbortableInputStream.create(new ByteArrayInputStream(body)))
+              .build();
+        }
+
+        @Override
+        public void abort() {}
+      };
+    }
+
+    @Override
+    public void close() {}
+
+    @Override
+    public String clientName() {
+      return "second-request-failure";
     }
   }
 

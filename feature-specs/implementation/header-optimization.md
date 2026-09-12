@@ -65,8 +65,10 @@ separately and are not wrapped by main-transport filtering.
   `NullPointerException`; empty entries are accepted when all required headers are present.
   Validation also uses the process default locale, so ASCII-equivalent casing can fail under locales
   such as Turkish.
-- `HEAD-REQ-004`: Per-attempt routing can change the transport URI after signing while retaining an
-  earlier `Host` and `Authorization`; see the query-plan implementation details.
+- `HEAD-REQ-004`: Retry routing now consumes invocation metadata before filtering and signs the
+  selected authority. However, filtering can still remove SDK headers covered by the generated
+  signature, such as retry metadata or `X-Amz-Content-Sha256`, without regenerating
+  `Authorization`; combined authenticated filtering therefore remains a gap.
 - `HEAD-REQ-005`, `HEAD-REQ-006`: Blocking filtering and user-agent wrappers drop the request metric
   collector. Non-blocking filtering and user-agent wrappers drop HTTP execution attributes. Direct
   tests do not exercise these fields.

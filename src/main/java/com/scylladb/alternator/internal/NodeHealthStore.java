@@ -91,11 +91,14 @@ final class NodeHealthStore {
   }
 
   boolean reportNodeResult(URI node, NodeHealthObservation observation) {
+    if (isTrafficObservation(observation)) {
+      return false;
+    }
     return applyNodeResult(node, observation, null, false);
   }
 
   boolean reportNodeResult(
-      URI node, NodeHealthObservation observation, Long expectedTrafficGeneration) {
+      URI node, NodeHealthObservation observation, long expectedTrafficGeneration) {
     return applyNodeResult(node, observation, expectedTrafficGeneration, true);
   }
 
@@ -112,10 +115,12 @@ final class NodeHealthStore {
       if (status == null || observation == null) {
         return false;
       }
-      if (expectedTrafficGeneration != null
-          && isTrafficObservation(observation)
-          && status.generation != expectedTrafficGeneration) {
-        return false;
+      if (isTrafficObservation(observation)) {
+        if (expectedTrafficGeneration == null
+            || status.state == NodeHealthState.DOWN
+            || status.generation != expectedTrafficGeneration) {
+          return false;
+        }
       }
       NodeHealthState previousState = status.state;
       switch (observation) {

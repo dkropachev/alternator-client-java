@@ -1902,7 +1902,10 @@ public class AffinityQueryPlanInterceptorTest {
     assertEquals(downNode, allHealthyOrder.get(0));
     URI expectedAfterSkip = allHealthyOrder.get(1);
 
-    liveNodes.reportNodeResult(downNode, NodeHealthObservation.TRAFFIC_FAILURE);
+    liveNodes.reportNodeResult(
+        downNode,
+        NodeHealthObservation.TRAFFIC_FAILURE,
+        liveNodes.getNodeHealthGeneration(downNode));
 
     DynamoDbClient client = createClient(buildConfig(KeyRouteAffinity.ANY_WRITE), liveNodes);
     try {

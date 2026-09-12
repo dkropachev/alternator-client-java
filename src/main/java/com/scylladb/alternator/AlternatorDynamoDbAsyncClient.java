@@ -34,9 +34,12 @@ import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.auth.signer.Aws4Signer;
 import software.amazon.awssdk.awscore.endpoints.AccountIdEndpointMode;
 import software.amazon.awssdk.core.client.config.ClientAsyncConfiguration;
 import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
+import software.amazon.awssdk.core.client.config.SdkAdvancedClientOption;
+import software.amazon.awssdk.core.signer.Signer;
 import software.amazon.awssdk.http.SdkHttpClient;
 import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
 import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
@@ -824,6 +827,18 @@ public class AlternatorDynamoDbAsyncClient {
             delegate.overrideConfiguration() != null
                 ? delegate.overrideConfiguration().toBuilder()
                 : ClientOverrideConfiguration.builder();
+        Signer configuredSigner =
+            delegate.overrideConfiguration() != null
+                ? delegate
+                    .overrideConfiguration()
+                    .advancedOption(SdkAdvancedClientOption.SIGNER)
+                    .orElse(null)
+                : null;
+        boolean legacyClientSignerRequired = BasicQueryPlanInterceptor.requiresLegacyClientSigner();
+        Signer signerForRouting =
+            legacyClientSignerRequired && configuredSigner == null
+                ? Aws4Signer.create()
+                : configuredSigner;
 
         KeyRouteAffinityConfig keyAffinityConfig = alternatorConfig.getKeyRouteAffinityConfig();
         AffinityQueryPlanInterceptor affinityInterceptor = null;
@@ -831,10 +846,17 @@ public class AlternatorDynamoDbAsyncClient {
         if (keyAffinityConfig != null
             && keyAffinityConfig.getType() != null
             && keyAffinityConfig.getType() != KeyRouteAffinity.NONE) {
-          affinityInterceptor = new AffinityQueryPlanInterceptor(keyAffinityConfig, liveNodes);
+          affinityInterceptor =
+              new AffinityQueryPlanInterceptor(
+                  keyAffinityConfig, liveNodes, null, signerForRouting);
           queryPlanInterceptor = affinityInterceptor;
         } else {
-          queryPlanInterceptor = new BasicQueryPlanInterceptor(liveNodes);
+          queryPlanInterceptor = new BasicQueryPlanInterceptor(liveNodes, signerForRouting);
+        }
+        if (legacyClientSignerRequired) {
+          overrideBuilder.putAdvancedOption(
+              SdkAdvancedClientOption.SIGNER,
+              queryPlanInterceptor.wrapClientSigner(signerForRouting));
         }
         resources = new AlternatorClientResources(liveNodes, affinityInterceptor, pollingClient);
         overrideBuilder.addExecutionInterceptor(queryPlanInterceptor);
@@ -966,9 +988,6 @@ public class AlternatorDynamoDbAsyncClient {
         AlternatorClientResources resources,
         boolean closeMainClient) {
       SdkAsyncHttpClient configuredClient = mainClient;
-      if (userAgentTransformer != null) {
-        configuredClient = new UserAgentSdkAsyncHttpClient(configuredClient, userAgentTransformer);
-      }
       if (alternatorConfig.isOptimizeHeaders()) {
         configuredClient =
             new HeadersFilteringSdkAsyncHttpClient(
@@ -976,6 +995,11 @@ public class AlternatorDynamoDbAsyncClient {
       }
       configuredClient =
           new AttemptRoutingSdkAsyncHttpClient(configuredClient, queryPlanInterceptor);
+      if (userAgentTransformer != null) {
+        // User callbacks must run before routing arms node-health attribution. Routing remains
+        // outside header filtering so it can consume the SDK invocation identifier first.
+        configuredClient = new UserAgentSdkAsyncHttpClient(configuredClient, userAgentTransformer);
+      }
       return new LifecycleSdkAsyncHttpClient(configuredClient, resources, closeMainClient);
     }
 

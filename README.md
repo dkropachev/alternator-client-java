@@ -970,7 +970,8 @@ deterministic order over all discovered nodes, including down nodes, and preserv
 both passes. If the SDK requests another attempt after every eligible endpoint has been tried, the
 plan starts another cycle: regular plans reshuffle, affinity plans reuse their deterministic order.
 If all candidates are down, the request fails locally. The SDK request endpoint is never used as a
-separate fallback.
+separate fallback. When a final health check changes an already prepared attempt's destination, the
+client updates `Host` and re-signs that attempt for the selected endpoint before transmission.
 
 While a node is quarantined, successful traffic advances promotion and clears the failure streak. A
 traffic failure resets promotion progress while leaving the node in quarantine; 3 consecutive
@@ -986,8 +987,9 @@ deprecated and no longer affect routing.
 
 Health probes use 4 concurrent workers by default and time out 5 seconds after starting. Built-in
 polling clients reserve one additional connection for topology traffic. Background cycles enqueue
-probe work without blocking topology refresh. One endpoint has at most one physical probe in flight,
-including concurrent explicit calls.
+probe work without blocking topology refresh. Explicit calls queue their complete endpoint snapshot,
+while the fixed worker count continues to bound physical concurrency. One endpoint has at most one
+physical probe in flight, including concurrent explicit calls.
 
 ```java
 import com.scylladb.alternator.NodeHealthConfig;
@@ -1022,7 +1024,13 @@ For custom integrations, `AlternatorLiveNodes` exposes `reportNodeResult(...)`,
 `TRAFFIC_SUCCESS` for received HTTP responses other than `500`, `502`, `503`, or `504`. Do not
 report an outcome for those retryable server errors. Report `TRAFFIC_FAILURE` only when no HTTP
 response was received. Report direct node-health probe outcomes with `PROBE_SUCCESS` or
-`PROBE_FAILURE`.
+`PROBE_FAILURE`; a quarantined endpoint is updated only while it remains in the discovered set.
+Capture `getNodeHealthGeneration(node)` when routing each traffic attempt and pass that token to the
+three-argument `reportNodeResult(node, observation, generation)` overload. When node health is
+enabled, the two-argument overload accepts probe outcomes only and rejects generation-less traffic
+so a late result cannot mutate a newer recovery cycle. Existing custom integrations that used the
+two-argument overload for traffic must migrate to the generation-aware overload. Disabled health
+ignores all outcome reports.
 The down-node probe period must be positive so every down node retains an automatic recovery path.
 Node health, including background probes, can be disabled with
 `AlternatorConfig.builder().withNodeHealthDisabled()`.

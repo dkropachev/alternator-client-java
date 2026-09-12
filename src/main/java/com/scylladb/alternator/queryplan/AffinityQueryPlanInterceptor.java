@@ -31,6 +31,7 @@ import java.util.Map;
 import software.amazon.awssdk.core.SdkRequest;
 import software.amazon.awssdk.core.interceptor.Context;
 import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
+import software.amazon.awssdk.core.signer.Signer;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.BatchWriteItemRequest;
@@ -70,7 +71,23 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
       KeyRouteAffinityConfig config,
       AlternatorLiveNodes liveNodes,
       DynamoDbClient clientForDiscovery) {
-    super(liveNodes);
+    this(config, liveNodes, clientForDiscovery, null);
+  }
+
+  /**
+   * Creates an interceptor with optional metadata discovery and a configured legacy signer.
+   *
+   * @param config key route affinity configuration
+   * @param liveNodes live nodes manager
+   * @param clientForDiscovery DynamoDB client for metadata discovery, or null
+   * @param configuredClientSigner client-level legacy signer override, or null
+   */
+  public AffinityQueryPlanInterceptor(
+      KeyRouteAffinityConfig config,
+      AlternatorLiveNodes liveNodes,
+      DynamoDbClient clientForDiscovery,
+      Signer configuredClientSigner) {
+    super(liveNodes, configuredClientSigner);
     this.config = config;
     this.pkResolver = new PartitionKeyResolver(config.getPkInfoPerTable());
     this.clientForDiscovery = clientForDiscovery;
@@ -87,7 +104,7 @@ public class AffinityQueryPlanInterceptor extends BasicQueryPlanInterceptor {
    */
   public AffinityQueryPlanInterceptor(
       KeyRouteAffinityConfig config, AlternatorLiveNodes liveNodes) {
-    this(config, liveNodes, null);
+    this(config, liveNodes, null, null);
   }
 
   /**

@@ -25,10 +25,12 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import software.amazon.awssdk.core.SdkRequest;
 import software.amazon.awssdk.core.interceptor.Context;
 import software.amazon.awssdk.core.interceptor.ExecutionAttribute;
 import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
 import software.amazon.awssdk.core.interceptor.ExecutionInterceptor;
+import software.amazon.awssdk.core.signer.Signer;
 import software.amazon.awssdk.http.SdkHttpRequest;
 
 /**
@@ -57,6 +59,7 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
   private static final String SDK_INVOCATION_ID_HEADER = "amz-sdk-invocation-id";
 
   protected final AlternatorLiveNodes liveNodes;
+  private final Signer configuredClientSigner;
   private final ConcurrentMap<String, ExecutionAttributes> routingExecutions =
       new ConcurrentHashMap<>();
 
@@ -66,7 +69,18 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
    * @param liveNodes the live nodes manager
    */
   public BasicQueryPlanInterceptor(AlternatorLiveNodes liveNodes) {
+    this(liveNodes, null);
+  }
+
+  /**
+   * Creates an interceptor that preserves an explicitly configured SDK legacy signer.
+   *
+   * @param liveNodes the live nodes manager
+   * @param configuredClientSigner client-level signer override, or null for SDK-selected auth
+   */
+  public BasicQueryPlanInterceptor(AlternatorLiveNodes liveNodes, Signer configuredClientSigner) {
     this.liveNodes = liveNodes;
+    this.configuredClientSigner = configuredClientSigner;
   }
 
   @Override
@@ -90,11 +104,22 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
         new RoutingState(
             affinity ? liveNodes.newAffinityQueryPlan(plan) : liveNodes.newRegularQueryPlan(plan),
             plan));
+    AttemptRequestSigner.installModernSigner(this, executionAttributes);
+  }
+
+  @Override
+  public SdkRequest modifyRequest(
+      Context.ModifyRequest context, ExecutionAttributes executionAttributes) {
+    return AttemptRequestSigner.installLegacySigner(
+        this, context.request(), executionAttributes, configuredClientSigner);
   }
 
   @Override
   public SdkHttpRequest modifyHttpRequest(
       Context.ModifyHttpRequest context, ExecutionAttributes executionAttributes) {
+    // SDK 2.21 resolves its HTTP auth scheme after beforeExecution. Retry here so every supported
+    // SDK line installs the routing signer before the first signing stage.
+    AttemptRequestSigner.installModernSigner(this, executionAttributes);
     return selectRoute(context.httpRequest(), executionAttributes);
   }
 
@@ -123,31 +148,101 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
     }
 
     // Build new request with the target node's host and port
-    return originalRequest.toBuilder()
-        .protocol(targetUri.getScheme())
-        .host(targetUri.getHost())
-        .port(targetUri.getPort())
-        .putHeader("Connection", "keep-alive")
-        .build();
+    return routeToNode(originalRequest, targetUri);
   }
 
   SdkHttpRequest routeAttempt(SdkHttpRequest request) {
+    RoutedRequest routed = routeAttemptWithContext(request);
+    armTransportAttempt(routed);
+    return routed.request;
+  }
+
+  RoutedRequest routeAttemptWithContext(SdkHttpRequest request) {
     String executionId = request.firstMatchingHeader(SDK_INVOCATION_ID_HEADER).orElse(null);
     ExecutionAttributes executionAttributes =
         executionId != null ? routingExecutions.get(executionId) : null;
     if (executionAttributes == null) {
-      return request;
+      return new RoutedRequest(request, null, false);
     }
 
-    RoutingState routingState = requireRoutingState(executionAttributes);
+    return preparePendingAttempt(
+        request, executionAttributes, requireRoutingState(executionAttributes));
+  }
+
+  RoutedRequest routeAttemptForSigning(
+      SdkHttpRequest request, ExecutionAttributes executionAttributes) {
+    return preparePendingAttempt(
+        request, executionAttributes, requireRoutingState(executionAttributes));
+  }
+
+  private RoutedRequest preparePendingAttempt(
+      SdkHttpRequest request, ExecutionAttributes executionAttributes, RoutingState routingState) {
+    InFlightNode pendingNode = routingState.pendingNode;
+    if (pendingNode != null) {
+      InFlightNode currentNode = captureEligibleInFlightNode(pendingNode.node);
+      if (currentNode != null) {
+        // The route has not reached transport yet. Reuse its authority, but refresh the generation
+        // in case the node entered DOWN and recovered while signing or another local stage retried.
+        routingState.pendingNode = currentNode;
+        SdkHttpRequest routedRequest =
+            sameAuthority(request, currentNode.node)
+                ? request
+                : routeToNode(request, currentNode.node);
+        return new RoutedRequest(
+            routedRequest,
+            executionAttributes,
+            !sameAuthority(request, routedRequest),
+            routingState,
+            currentNode);
+      }
+      // A pending route that became DOWN was never sent and must not consume another failure. Drop
+      // it and continue the same query plan at the next eligible candidate.
+      routingState.pendingNode = null;
+    }
+
     reportInFlightTransportFailure(routingState);
     RoutedAttempt routedAttempt =
         routingState.firstAttempt
             ? revalidateFirstRoute(request, executionAttributes)
             : selectFinalRoute(request, executionAttributes);
     routingState.firstAttempt = false;
-    routingState.inFlightNode = routedAttempt.inFlightNode;
-    return routedAttempt.request;
+    routingState.pendingNode = routedAttempt.inFlightNode;
+    return new RoutedRequest(
+        routedAttempt.request,
+        executionAttributes,
+        !sameAuthority(request, routedAttempt.request),
+        routingState,
+        routedAttempt.inFlightNode);
+  }
+
+  void armTransportAttempt(RoutedRequest routed) {
+    if (routed.routingState == null || routed.pendingNode == null) {
+      return;
+    }
+    RoutingState routingState = routed.routingState;
+    if (routingState.pendingNode == routed.pendingNode) {
+      routingState.pendingNode = null;
+      routingState.inFlightNode = routed.pendingNode;
+    }
+  }
+
+  private static boolean sameAuthority(SdkHttpRequest left, SdkHttpRequest right) {
+    return left.protocol().equalsIgnoreCase(right.protocol())
+        && normalizedHost(left.host()).equalsIgnoreCase(normalizedHost(right.host()))
+        && left.port() == right.port();
+  }
+
+  private static boolean sameAuthority(SdkHttpRequest request, URI node) {
+    return request.protocol().equalsIgnoreCase(node.getScheme())
+        && normalizedHost(request.host()).equalsIgnoreCase(normalizedHost(node.getHost()))
+        && request.port() == node.getPort();
+  }
+
+  private static String normalizedHost(String host) {
+    if (host != null && host.length() >= 2 && host.startsWith("[") && host.endsWith("]")) {
+      return host.substring(1, host.length() - 1);
+    }
+    return host;
   }
 
   private RoutedAttempt revalidateFirstRoute(
@@ -156,6 +251,15 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
     return inFlightNode != null
         ? new RoutedAttempt(request, inFlightNode)
         : selectFinalRoute(request, executionAttributes);
+  }
+
+  private SdkHttpRequest routeToNode(SdkHttpRequest request, URI node) {
+    return request.toBuilder()
+        .protocol(node.getScheme())
+        .host(node.getHost())
+        .port(node.getPort())
+        .putHeader("Connection", "keep-alive")
+        .build();
   }
 
   private RoutedAttempt selectFinalRoute(
@@ -172,7 +276,10 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
   }
 
   private InFlightNode captureEligibleInFlightNode(SdkHttpRequest request) {
-    URI routedNode = requestEndpoint(request);
+    return captureEligibleInFlightNode(requestEndpoint(request));
+  }
+
+  private InFlightNode captureEligibleInFlightNode(URI routedNode) {
     NodeHealthStatus status = liveNodes.getNodeHealthStatus(routedNode);
     if (status != null && status.getState() == NodeHealthState.DOWN) {
       return null;
@@ -227,6 +334,12 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
     if (executionId == null) {
       // Preserve the direct-interceptor lifecycle used by custom integrations and older tests.
       RoutingState routingState = requireRoutingState(executionAttributes);
+      if (routingState.pendingNode != null) {
+        InFlightNode pendingNode = routingState.pendingNode;
+        routingState.pendingNode = null;
+        routingState.inFlightNode = pendingNode;
+        return;
+      }
       reportInFlightTransportFailure(routingState);
       URI routedNode = requestEndpoint(context.httpRequest());
       routingState.inFlightNode =
@@ -280,9 +393,12 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
 
   private void unregisterRoutingExecution(ExecutionAttributes executionAttributes) {
     RoutingState routingState = executionAttributes.getAttribute(ROUTING_STATE);
-    if (routingState != null && routingState.executionId != null) {
-      routingExecutions.remove(routingState.executionId, executionAttributes);
-      routingState.executionId = null;
+    if (routingState != null) {
+      routingState.pendingNode = null;
+      if (routingState.executionId != null) {
+        routingExecutions.remove(routingState.executionId, executionAttributes);
+        routingState.executionId = null;
+      }
     }
   }
 
@@ -308,6 +424,25 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
     return liveNodes;
   }
 
+  /**
+   * Wraps a client-level legacy signer for SDK versions that resolve auth after user interceptors.
+   *
+   * @param signer signer selected by the client configuration
+   * @return signer that applies final attempt routing before delegation
+   */
+  public Signer wrapClientSigner(Signer signer) {
+    return AttemptRequestSigner.wrapClientSigner(this, signer);
+  }
+
+  /**
+   * Returns whether this SDK generation needs routing installed at client-signer configuration.
+   *
+   * @return true for SDK generations whose auth resolution runs after user interceptor hooks
+   */
+  public static boolean requiresLegacyClientSigner() {
+    return AttemptRequestSigner.requiresLegacyClientSigner();
+  }
+
   private static final class InFlightNode {
     private final URI node;
     private final long healthGeneration;
@@ -321,6 +456,7 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
   private static final class RoutingState {
     private NodeHealthQueryPlan healthPlan;
     private LazyQueryPlan healthPlanSource;
+    private InFlightNode pendingNode;
     private InFlightNode inFlightNode;
     private boolean firstAttempt = true;
     private String executionId;
@@ -343,6 +479,32 @@ public class BasicQueryPlanInterceptor implements ExecutionInterceptor {
     private RoutedAttempt(SdkHttpRequest request, InFlightNode inFlightNode) {
       this.request = request;
       this.inFlightNode = inFlightNode;
+    }
+  }
+
+  static final class RoutedRequest {
+    final SdkHttpRequest request;
+    final ExecutionAttributes executionAttributes;
+    final boolean authorityChanged;
+    private final RoutingState routingState;
+    private final InFlightNode pendingNode;
+
+    RoutedRequest(
+        SdkHttpRequest request, ExecutionAttributes executionAttributes, boolean authorityChanged) {
+      this(request, executionAttributes, authorityChanged, null, null);
+    }
+
+    private RoutedRequest(
+        SdkHttpRequest request,
+        ExecutionAttributes executionAttributes,
+        boolean authorityChanged,
+        RoutingState routingState,
+        InFlightNode pendingNode) {
+      this.request = request;
+      this.executionAttributes = executionAttributes;
+      this.authorityChanged = authorityChanged;
+      this.routingState = routingState;
+      this.pendingNode = pendingNode;
     }
   }
 }

@@ -22,6 +22,7 @@ import com.scylladb.alternator.CoversRequirements;
 import com.scylladb.alternator.NodeHealthConfig;
 import com.scylladb.alternator.NodeHealthObservation;
 import com.scylladb.alternator.NodeHealthState;
+import com.scylladb.alternator.NodeHealthStatus;
 import com.scylladb.alternator.routing.DatacenterScope;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -34,8 +35,12 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Test;
@@ -49,7 +54,6 @@ import software.amazon.awssdk.http.SdkHttpRequest;
 
 public class AlternatorLiveNodesConcurrentProbeTest {
   @Test
-  @CoversRequirements("HEALTH-REQ-007")
   public void explicitProbesRespectConfiguredConcurrencyAndReturnSnapshotOrder() throws Exception {
     GateHttpClient client = new GateHttpClient(2);
     AlternatorLiveNodes liveNodes =
@@ -74,6 +78,37 @@ public class AlternatorLiveNodesConcurrentProbeTest {
           result.get(5, TimeUnit.SECONDS));
       assertEquals(2, client.maximumConcurrent.get());
     } finally {
+      liveNodes.shutdownAndWait();
+    }
+  }
+
+  @Test
+  @CoversRequirements("HEALTH-REQ-007")
+  public void explicitBatchLargerThanBackgroundCapacitySettlesWithoutRejection() throws Exception {
+    List<String> hosts = new ArrayList<>();
+    List<URI> expected = new ArrayList<>();
+    for (int i = 0; i < 40; i++) {
+      String host = String.format("node-%02d.local", i);
+      hosts.add(host);
+      expected.add(node(host));
+    }
+    GateHttpClient client = new GateHttpClient(1);
+    AlternatorLiveNodes liveNodes =
+        liveNodes(
+            hosts, NodeHealthConfig.builder().withHealthProbeConcurrency(1).build(), client, null);
+    try {
+      // Fill bounded background admission before submitting an explicit snapshot larger than its
+      // seventeen-per-worker capacity.
+      liveNodes.scheduleBackgroundHealthProbes();
+      assertTrue(client.firstWaveStarted.await(5, TimeUnit.SECONDS));
+
+      CompletableFuture<List<URI>> result = liveNodes.probeQuarantinedNodesAsync();
+      client.release.countDown();
+
+      assertEquals(expected, result.get(5, TimeUnit.SECONDS));
+      assertEquals(1, client.maximumConcurrent.get());
+    } finally {
+      client.release.countDown();
       liveNodes.shutdownAndWait();
     }
   }
@@ -164,7 +199,9 @@ public class AlternatorLiveNodesConcurrentProbeTest {
       assertTrue(client.firstStarted.await(5, TimeUnit.SECONDS));
 
       liveNodes.reportNodeResult(
-          node("node-b.local"), NodeHealthObservation.TRAFFIC_SUCCESS, false);
+          node("node-b.local"),
+          NodeHealthObservation.TRAFFIC_SUCCESS,
+          liveNodes.getNodeHealthGeneration(node("node-b.local")));
       client.releaseFirst.countDown();
       waitForState(liveNodes, node("node-a.local"), NodeHealthState.ACTIVE);
       Thread.sleep(100);
@@ -204,7 +241,8 @@ public class AlternatorLiveNodesConcurrentProbeTest {
       URI node = node(hosts.get(i));
       if (i < 20) {
         liveNodes.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS, false);
-        liveNodes.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE, false);
+        liveNodes.reportNodeResult(
+            node, NodeHealthObservation.TRAFFIC_FAILURE, liveNodes.getNodeHealthGeneration(node));
         downHosts.add(hosts.get(i));
       } else {
         quarantinedHosts.add(hosts.get(i));
@@ -244,7 +282,8 @@ public class AlternatorLiveNodesConcurrentProbeTest {
     for (String host : hosts) {
       URI node = node(host);
       liveNodes.reportNodeResult(node, NodeHealthObservation.PROBE_SUCCESS, false);
-      liveNodes.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE, false);
+      liveNodes.reportNodeResult(
+          node, NodeHealthObservation.TRAFFIC_FAILURE, liveNodes.getNodeHealthGeneration(node));
     }
 
     try {
@@ -286,7 +325,9 @@ public class AlternatorLiveNodesConcurrentProbeTest {
       assertTrue(client.firstStarted.await(5, TimeUnit.SECONDS));
 
       liveNodes.reportNodeResult(
-          node("node-a.local"), NodeHealthObservation.TRAFFIC_SUCCESS, false);
+          node("node-a.local"),
+          NodeHealthObservation.TRAFFIC_SUCCESS,
+          liveNodes.getNodeHealthGeneration(node("node-a.local")));
       client.releaseFirst.countDown();
 
       waitForState(liveNodes, node("node-a.local"), NodeHealthState.ACTIVE);
@@ -309,7 +350,9 @@ public class AlternatorLiveNodesConcurrentProbeTest {
       liveNodes.scheduleBackgroundHealthProbes();
       assertTrue(client.firstStarted.await(5, TimeUnit.SECONDS));
       liveNodes.reportNodeResult(
-          node("node-b.local"), NodeHealthObservation.TRAFFIC_SUCCESS, false);
+          node("node-b.local"),
+          NodeHealthObservation.TRAFFIC_SUCCESS,
+          liveNodes.getNodeHealthGeneration(node("node-b.local")));
 
       CompletableFuture<List<URI>> explicit = liveNodes.probeQuarantinedNodesAsync();
       client.releaseFirst.countDown();
@@ -319,6 +362,97 @@ public class AlternatorLiveNodesConcurrentProbeTest {
           explicit.get(5, TimeUnit.SECONDS));
       assertTrue(client.secondStarted.await(5, TimeUnit.SECONDS));
     } finally {
+      liveNodes.shutdownAndWait();
+    }
+  }
+
+  @Test
+  public void concurrentTrafficResultOrderControlsBackgroundProbeSuppression() throws Exception {
+    int probeConcurrency = 4;
+    List<String> hosts = new ArrayList<>();
+    for (int i = 0; i < probeConcurrency; i++) {
+      hosts.add(String.format("blocker-%02d.local", i));
+    }
+    List<String> targetHosts = new ArrayList<>();
+    for (int i = 0; i < 60; i++) {
+      String host = String.format("target-%02d.local", i);
+      hosts.add(host);
+      targetHosts.add(host);
+    }
+    Set<String> sentinelHosts = new HashSet<>();
+    for (int i = 0; i < probeConcurrency; i++) {
+      String host = String.format("zz-sentinel-%02d.local", i);
+      hosts.add(host);
+      sentinelHosts.add(host);
+    }
+
+    SuppressionRaceHttpClient client =
+        new SuppressionRaceHttpClient(probeConcurrency, sentinelHosts);
+    AlternatorLiveNodes liveNodes =
+        liveNodes(
+            hosts,
+            NodeHealthConfig.builder()
+                .withHealthProbeConcurrency(probeConcurrency)
+                .withQuarantineSuccessThreshold(100)
+                .withQuarantineFailureThreshold(100)
+                .build(),
+            client,
+            null);
+    ExecutorService traffic = Executors.newFixedThreadPool(2);
+    try {
+      liveNodes.scheduleBackgroundHealthProbes();
+      assertTrue(client.blockersStarted.await(5, TimeUnit.SECONDS));
+
+      Set<String> expectedPhysicalProbes = new HashSet<>();
+      for (String host : targetHosts) {
+        URI node = node(host);
+        CountDownLatch start = new CountDownLatch(1);
+        Future<?> success =
+            traffic.submit(
+                () -> {
+                  await(start);
+                  liveNodes.reportNodeResult(
+                      node,
+                      NodeHealthObservation.TRAFFIC_SUCCESS,
+                      liveNodes.getNodeHealthGeneration(node));
+                });
+        Future<?> failure =
+            traffic.submit(
+                () -> {
+                  await(start);
+                  liveNodes.reportNodeResult(
+                      node,
+                      NodeHealthObservation.TRAFFIC_FAILURE,
+                      liveNodes.getNodeHealthGeneration(node));
+                });
+        start.countDown();
+        success.get(5, TimeUnit.SECONDS);
+        failure.get(5, TimeUnit.SECONDS);
+
+        NodeHealthStatus status = liveNodes.getNodeHealthStatus(node);
+        assertEquals(NodeHealthState.QUARANTINED, status.getState());
+        if (status.getConsecutiveFailures() == 1) {
+          assertEquals(0, status.getConsecutiveSuccesses());
+          expectedPhysicalProbes.add(host);
+        } else {
+          assertEquals(0, status.getConsecutiveFailures());
+          assertEquals(1, status.getConsecutiveSuccesses());
+        }
+      }
+
+      client.releaseBlockers.countDown();
+      // Occupying every worker with a terminal sentinel proves every earlier target job settled.
+      assertTrue(client.sentinelsStarted.await(5, TimeUnit.SECONDS));
+      for (String host : targetHosts) {
+        assertEquals(
+            "background-probe suppression must follow the final serialized traffic result for "
+                + host,
+            expectedPhysicalProbes.contains(host),
+            client.requestedHosts.contains(host));
+      }
+    } finally {
+      client.releaseBlockers.countDown();
+      traffic.shutdownNow();
       liveNodes.shutdownAndWait();
     }
   }
@@ -380,6 +514,17 @@ public class AlternatorLiveNodesConcurrentProbeTest {
       Thread.sleep(10);
     }
     assertEquals(expected, liveNodes.getNodeHealthStatus(node).getState());
+  }
+
+  private static void await(CountDownLatch latch) {
+    try {
+      if (!latch.await(5, TimeUnit.SECONDS)) {
+        throw new AssertionError("timed out waiting for concurrent traffic start");
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new AssertionError("interrupted waiting for concurrent traffic start", e);
+    }
   }
 
   private static HttpExecuteResponse okResponse() {
@@ -681,6 +826,69 @@ public class AlternatorLiveNodesConcurrentProbeTest {
     @Override
     public String clientName() {
       return "topology-and-probe";
+    }
+  }
+
+  private static final class SuppressionRaceHttpClient implements SdkHttpClient {
+    private final CountDownLatch blockersStarted;
+    private final CountDownLatch releaseBlockers = new CountDownLatch(1);
+    private final CountDownLatch sentinelsStarted;
+    private final Set<String> sentinelHosts;
+    private final Set<String> requestedHosts = ConcurrentHashMap.newKeySet();
+
+    private SuppressionRaceHttpClient(int blockerCount, Set<String> sentinelHosts) {
+      this.blockersStarted = new CountDownLatch(blockerCount);
+      this.sentinelsStarted = new CountDownLatch(sentinelHosts.size());
+      this.sentinelHosts = sentinelHosts;
+    }
+
+    @Override
+    public ExecutableHttpRequest prepareRequest(HttpExecuteRequest request) {
+      String host = request.httpRequest().host();
+      return new ExecutableHttpRequest() {
+        @Override
+        public HttpExecuteResponse call() throws IOException {
+          requestedHosts.add(host);
+          if (host.startsWith("blocker-")) {
+            blockersStarted.countDown();
+            try {
+              if (!releaseBlockers.await(5, TimeUnit.SECONDS)) {
+                throw new IOException("timed out waiting to release blocker probes");
+              }
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              throw new IOException("interrupted waiting to release blocker probes", e);
+            }
+          }
+          if (sentinelHosts.contains(host)) {
+            sentinelsStarted.countDown();
+            try {
+              if (!sentinelsStarted.await(5, TimeUnit.SECONDS)) {
+                throw new IOException("timed out waiting for terminal sentinel probes");
+              }
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              throw new IOException("interrupted waiting for terminal sentinel probes", e);
+            }
+          }
+          return HttpExecuteResponse.builder()
+              .response(SdkHttpFullResponse.builder().statusCode(503).build())
+              .build();
+        }
+
+        @Override
+        public void abort() {
+          releaseBlockers.countDown();
+        }
+      };
+    }
+
+    @Override
+    public void close() {}
+
+    @Override
+    public String clientName() {
+      return "suppression-race";
     }
   }
 }

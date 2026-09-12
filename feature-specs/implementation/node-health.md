@@ -12,9 +12,9 @@ thresholds, probe period, concurrency, timeout, and disabled configuration.
 and [`NodeHealthStatus`](../../src/main/java/com/scylladb/alternator/NodeHealthStatus.java) expose
 state, observations, counters, timestamps, and generation snapshots.
 
-Client wrappers expose discovered and health-partitioned endpoint views and blocking and
-asynchronous quarantine-probe operations. `getLiveNodes()` intentionally remains an alias for the
-raw discovered topology view.
+Client wrappers expose discovered endpoint views and blocking and asynchronous quarantine-probe
+operations. `AlternatorLiveNodes`, available from each wrapper, exposes the health-partitioned views.
+`getLiveNodes()` intentionally remains an alias for the raw discovered topology view.
 
 ## Internal architecture
 
@@ -32,17 +32,22 @@ applies final active and quarantine passes. Traffic integration belongs to
 ## Lifecycle and concurrency
 
 Initial seeds are published in quarantine. The live-node polling thread independently schedules
-topology refresh and background health cycles. Probe work uses a bounded priority executor and a
-separate timeout scheduler. Capacity, including running jobs, is seventeen times configured
-concurrency. Background admission splits available capacity across down and quarantine tiers,
-rotates starting endpoints, and alternates a sole slot.
+topology refresh and background health cycles. Probe work uses a priority executor and a separate
+timeout scheduler. Background capacity, including running jobs, is seventeen times configured
+concurrency. Explicit calls may queue their complete snapshot outside that background admission
+limit; the fixed worker count still bounds physical concurrency. Background admission splits
+available capacity across down and quarantine tiers, rotates starting endpoints, and alternates a
+sole slot.
 
 Built-in polling transports reserve one connection beyond probe concurrency. Externally supplied
-polling transports must support concurrent calls and abortion. `shutdownAndWait` shares one timeout
-across the polling thread and both probe executors.
+polling transports must support concurrent calls and abortion. `shutdown()` dispatches cleanup
+without blocking its caller. `shutdownAndWait` shares one timeout across cleanup, the polling thread,
+and both probe executors.
 
 Traffic routing captures `NodeHealthStatus.getGeneration()` at final eligibility and reports through
-the generation-aware overload. A generation-unaware overload remains for compatibility.
+the generation-aware overload. While health is enabled, the generation-unaware overload accepts
+probe outcomes only and traffic observations require the captured token. Disabled health ignores
+all reports.
 
 ## Requirement mapping
 
@@ -50,13 +55,13 @@ the generation-aware overload. A generation-unaware overload remains for compati
 | --- | --- | --- | --- |
 | `HEALTH-REQ-001` | [`NodeHealthConfig`](../../src/main/java/com/scylladb/alternator/NodeHealthConfig.java) | [`FeatureSpecDefaultsTest#nodeHealthDefaultsMatchSpecification`](../../src/test/java/com/scylladb/alternator/FeatureSpecDefaultsTest.java) | `conformant` |
 | `HEALTH-REQ-002` | [`BasicQueryPlanInterceptor`](../../src/main/java/com/scylladb/alternator/queryplan/BasicQueryPlanInterceptor.java) | [`RetryDistributionTest#testRetryableServerErrorsDoNotReportHealthResults`](../../src/test/java/com/scylladb/alternator/RetryDistributionTest.java) | `conformant` |
-| `HEALTH-REQ-003` | [`NodeHealthStore`](../../src/main/java/com/scylladb/alternator/internal/NodeHealthStore.java) | [`FeatureSpecNodeHealthTransitionsTest#stateTransitionsMatchPortableTable`](../../src/test/java/com/scylladb/alternator/internal/FeatureSpecNodeHealthTransitionsTest.java) | `conformant` |
-| `HEALTH-REQ-004` | [`NodeHealthStore`](../../src/main/java/com/scylladb/alternator/internal/NodeHealthStore.java) | [`NodeHealthStoreTest#trafficFromGenerationBeforeDownIsIgnoredAfterRecovery`](../../src/test/java/com/scylladb/alternator/internal/NodeHealthStoreTest.java) | `gap` |
+| `HEALTH-REQ-003` | [`NodeHealthStore`](../../src/main/java/com/scylladb/alternator/internal/NodeHealthStore.java) | [`NodeHealthStoreTest#downTrafficNeverChangesStateCountersOrUpdateTime`](../../src/test/java/com/scylladb/alternator/internal/NodeHealthStoreTest.java) | `conformant` |
+| `HEALTH-REQ-004` | [`NodeHealthStore`](../../src/main/java/com/scylladb/alternator/internal/NodeHealthStore.java) | [`NodeHealthStoreTest#trafficFromGenerationBeforeDownIsIgnoredAfterRecovery`](../../src/test/java/com/scylladb/alternator/internal/NodeHealthStoreTest.java) | `conformant` |
 | `HEALTH-REQ-005` | [`AlternatorLiveNodes`](../../src/main/java/com/scylladb/alternator/internal/AlternatorLiveNodes.java) | [`AlternatorLiveNodesNodeHealthTest#discoveryActivatesContactedSeedButQuarantinesNewNodesUntilDirectProbe`](../../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesNodeHealthTest.java) | `conformant` |
 | `HEALTH-REQ-006` | [`NodeHealthQueryPlan`](../../src/main/java/com/scylladb/alternator/internal/NodeHealthQueryPlan.java) | [`NodeHealthQueryPlanTest#regularPlanReturnsActiveThenQuarantineInSourceRelativeOrder`](../../src/test/java/com/scylladb/alternator/internal/NodeHealthQueryPlanTest.java) | `conformant` |
-| `HEALTH-REQ-007` | [`NodeHealthManager`](../../src/main/java/com/scylladb/alternator/internal/NodeHealthManager.java) | [`AlternatorLiveNodesConcurrentProbeTest#explicitProbesRespectConfiguredConcurrencyAndReturnSnapshotOrder`](../../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesConcurrentProbeTest.java) | `conformant` |
-| `HEALTH-REQ-008` | [`AlternatorLiveNodes`](../../src/main/java/com/scylladb/alternator/internal/AlternatorLiveNodes.java) | [`AlternatorLiveNodesNodeHealthTest#topologyRefreshUsesHealthBucketsAndDownFallbackIsHealthNeutral`](../../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesNodeHealthTest.java) | `conformant` |
-| `HEALTH-REQ-009` | [`AlternatorLiveNodes`](../../src/main/java/com/scylladb/alternator/internal/AlternatorLiveNodes.java) | [`AlternatorLiveNodesShutdownTest#testShutdownAndWaitClosesOwnedPollingClientWhenThreadNeverStarted`](../../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesShutdownTest.java) | `conformant` |
+| `HEALTH-REQ-007` | [`NodeHealthManager`](../../src/main/java/com/scylladb/alternator/internal/NodeHealthManager.java) | [`AlternatorLiveNodesConcurrentProbeTest#explicitBatchLargerThanBackgroundCapacitySettlesWithoutRejection`](../../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesConcurrentProbeTest.java) | `conformant` |
+| `HEALTH-REQ-008` | [`AlternatorLiveNodes`](../../src/main/java/com/scylladb/alternator/internal/AlternatorLiveNodes.java) | [`AlternatorLiveNodesNodeHealthTest#lateDiscoverySuccessCannotActivateRemovedQuarantinedNode`](../../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesNodeHealthTest.java) | `conformant` |
+| `HEALTH-REQ-009` | [`AlternatorLiveNodes`](../../src/main/java/com/scylladb/alternator/internal/AlternatorLiveNodes.java) | [`AlternatorLiveNodesShutdownTest#shutdownAndWaitIncludesSlowCleanupInBoundedDeadline`](../../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesShutdownTest.java) | `conformant` |
 
 ## Test coverage
 
@@ -67,19 +72,23 @@ the generation-aware overload. A generation-unaware overload remains for compati
 - [`NodeHealthConfigTest`](../../src/test/java/com/scylladb/alternator/NodeHealthConfigTest.java)
   covers defaults, normalization, and invalid probe settings.
 - [`NodeHealthStoreTest`](../../src/test/java/com/scylladb/alternator/internal/NodeHealthStoreTest.java)
-  covers transitions, counter independence, canonical identity, generations, and disabled behavior.
+  covers transitions, counter and timestamp independence, canonical identity, generations, stale
+  result rejection, and disabled behavior.
 - [`AlternatorLiveNodesNodeHealthTest`](../../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesNodeHealthTest.java)
-  covers admission, explicit probes, discovery, recovery, rediscovery, and scope behavior.
+  covers admission, explicit and custom probes, discovery snapshots, recovery, rediscovery, removal
+  races, valid empty contacts, disabled behavior, and scope behavior.
 - [`AlternatorLiveNodesConcurrentProbeTest`](../../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesConcurrentProbeTest.java)
-  covers concurrency, queue admission, timeout, suppression, topology races, and rejection.
+  covers concurrency, bounded background admission, complete explicit snapshots, timeout,
+  suppression, topology races, and shutdown rejection.
 - [`RetryDistributionTest`](../../src/test/java/com/scylladb/alternator/RetryDistributionTest.java)
-  covers per-attempt observations and health-neutral server statuses.
+  covers per-attempt observations, pre-transport failures, and health-neutral server statuses.
 - [`BasicQueryPlanInterceptorTest`](../../src/test/java/com/scylladb/alternator/queryplan/BasicQueryPlanInterceptorTest.java)
-  covers final-gate revalidation.
+  covers final-gate revalidation and pending-versus-in-flight attempt bookkeeping.
+- [`AlternatorLiveNodesShutdownTest`](../../src/test/java/com/scylladb/alternator/internal/AlternatorLiveNodesShutdownTest.java)
+  covers bounded cleanup, polling interruption, and owned-client closure.
 
 ## Known conformance gaps
 
-- `HEALTH-REQ-004`: The generation-unaware compatibility overload cannot reject a late traffic
-  result after recovery into a newer cycle. A traffic report made while an endpoint is down leaves
-  state and counters unchanged but still advances observable update time. Concurrent or late-result
-  integrations must use the generation-aware overload.
+- Control-plane requests currently serialize implicit ports and IPv6 literals incorrectly in the
+  `Host` header. This predates the node-health conformance changes, but direct discovery and health
+  probes should use a bracketed authority and omit implicit or standard ports.

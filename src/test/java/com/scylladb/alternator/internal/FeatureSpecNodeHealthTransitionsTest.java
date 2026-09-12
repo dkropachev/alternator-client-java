@@ -17,7 +17,6 @@ package com.scylladb.alternator.internal;
 
 import static org.junit.Assert.assertEquals;
 
-import com.scylladb.alternator.CoversRequirements;
 import com.scylladb.alternator.NodeHealthConfig;
 import com.scylladb.alternator.NodeHealthObservation;
 import com.scylladb.alternator.NodeHealthState;
@@ -37,7 +36,6 @@ public class FeatureSpecNodeHealthTransitionsTest {
       Paths.get("feature-specs", "vectors", "node-health-transitions.tsv");
 
   @Test
-  @CoversRequirements("HEALTH-REQ-003")
   public void stateTransitionsMatchPortableTable() throws Exception {
     for (String line : Files.readAllLines(TRANSITIONS, StandardCharsets.UTF_8)) {
       if (line.isEmpty() || line.startsWith("#")) {
@@ -66,7 +64,7 @@ public class FeatureSpecNodeHealthTransitionsTest {
     }
 
     for (String observation : fields[6].split(",")) {
-      store.reportNodeResult(NODE, NodeHealthObservation.valueOf(observation));
+      reportObservation(store, NodeHealthObservation.valueOf(observation));
     }
 
     NodeHealthStatus status = store.getNodeStatus(NODE);
@@ -74,5 +72,14 @@ public class FeatureSpecNodeHealthTransitionsTest {
     assertEquals(name, Integer.parseInt(fields[8]), status.getConsecutiveFailures());
     assertEquals(name, Integer.parseInt(fields[9]), status.getConsecutiveSuccesses());
     assertEquals(name, Long.parseLong(fields[10]), status.getGeneration());
+  }
+
+  private static void reportObservation(NodeHealthStore store, NodeHealthObservation observation) {
+    if (observation == NodeHealthObservation.TRAFFIC_SUCCESS
+        || observation == NodeHealthObservation.TRAFFIC_FAILURE) {
+      store.reportNodeResult(NODE, observation, store.getNodeStatus(NODE).getGeneration());
+    } else {
+      store.reportNodeResult(NODE, observation);
+    }
   }
 }

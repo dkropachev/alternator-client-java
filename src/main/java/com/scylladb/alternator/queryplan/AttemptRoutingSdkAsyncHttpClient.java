@@ -39,7 +39,9 @@ public final class AttemptRoutingSdkAsyncHttpClient implements SdkAsyncHttpClien
 
   @Override
   public CompletableFuture<Void> execute(AsyncExecuteRequest request) {
-    SdkHttpRequest routedRequest = router.routeAttempt(request.request());
+    BasicQueryPlanInterceptor.RoutedRequest routed =
+        router.routeAttemptWithContext(request.request());
+    SdkHttpRequest routedRequest = AttemptRequestSigner.prepareUnsignedFallback(routed);
     AsyncExecuteRequest routedExecuteRequest =
         AsyncExecuteRequest.builder()
             .request(routedRequest)
@@ -49,6 +51,7 @@ public final class AttemptRoutingSdkAsyncHttpClient implements SdkAsyncHttpClien
             .metricCollector(request.metricCollector().orElse(null))
             .httpExecutionAttributes(request.httpExecutionAttributes())
             .build();
+    router.armTransportAttempt(routed);
     return delegate.execute(routedExecuteRequest);
   }
 

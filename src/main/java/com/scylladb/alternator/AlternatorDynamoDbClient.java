@@ -33,8 +33,11 @@ import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.auth.signer.Aws4Signer;
 import software.amazon.awssdk.awscore.endpoints.AccountIdEndpointMode;
 import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
+import software.amazon.awssdk.core.client.config.SdkAdvancedClientOption;
+import software.amazon.awssdk.core.signer.Signer;
 import software.amazon.awssdk.http.SdkHttpClient;
 import software.amazon.awssdk.http.apache.ApacheHttpClient;
 import software.amazon.awssdk.http.crt.AwsCrtHttpClient;
@@ -847,6 +850,18 @@ public class AlternatorDynamoDbClient {
             delegate.overrideConfiguration() != null
                 ? delegate.overrideConfiguration().toBuilder()
                 : ClientOverrideConfiguration.builder();
+        Signer configuredSigner =
+            delegate.overrideConfiguration() != null
+                ? delegate
+                    .overrideConfiguration()
+                    .advancedOption(SdkAdvancedClientOption.SIGNER)
+                    .orElse(null)
+                : null;
+        boolean legacyClientSignerRequired = BasicQueryPlanInterceptor.requiresLegacyClientSigner();
+        Signer signerForRouting =
+            legacyClientSignerRequired && configuredSigner == null
+                ? Aws4Signer.create()
+                : configuredSigner;
 
         AffinityQueryPlanInterceptor affinityInterceptor = null;
         BasicQueryPlanInterceptor queryPlanInterceptor;
@@ -854,10 +869,17 @@ public class AlternatorDynamoDbClient {
         if (keyAffinityConfig != null
             && keyAffinityConfig.getType() != null
             && keyAffinityConfig.getType() != KeyRouteAffinity.NONE) {
-          affinityInterceptor = new AffinityQueryPlanInterceptor(keyAffinityConfig, liveNodes);
+          affinityInterceptor =
+              new AffinityQueryPlanInterceptor(
+                  keyAffinityConfig, liveNodes, null, signerForRouting);
           queryPlanInterceptor = affinityInterceptor;
         } else {
-          queryPlanInterceptor = new BasicQueryPlanInterceptor(liveNodes);
+          queryPlanInterceptor = new BasicQueryPlanInterceptor(liveNodes, signerForRouting);
+        }
+        if (legacyClientSignerRequired) {
+          overrideBuilder.putAdvancedOption(
+              SdkAdvancedClientOption.SIGNER,
+              queryPlanInterceptor.wrapClientSigner(signerForRouting));
         }
         resources = new AlternatorClientResources(liveNodes, affinityInterceptor, pollingClient);
         overrideBuilder.addExecutionInterceptor(queryPlanInterceptor);

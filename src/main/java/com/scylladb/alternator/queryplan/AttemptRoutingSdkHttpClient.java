@@ -15,8 +15,10 @@
  */
 package com.scylladb.alternator.queryplan;
 
+import java.io.IOException;
 import software.amazon.awssdk.http.ExecutableHttpRequest;
 import software.amazon.awssdk.http.HttpExecuteRequest;
+import software.amazon.awssdk.http.HttpExecuteResponse;
 import software.amazon.awssdk.http.SdkHttpClient;
 import software.amazon.awssdk.http.SdkHttpRequest;
 
@@ -38,14 +40,30 @@ public final class AttemptRoutingSdkHttpClient implements SdkHttpClient {
 
   @Override
   public ExecutableHttpRequest prepareRequest(HttpExecuteRequest request) {
-    SdkHttpRequest routedRequest = router.routeAttempt(request.httpRequest());
+    BasicQueryPlanInterceptor.RoutedRequest routed =
+        router.routeAttemptWithContext(request.httpRequest());
+    SdkHttpRequest routedRequest = AttemptRequestSigner.prepareUnsignedFallback(routed);
     HttpExecuteRequest routedExecuteRequest =
         HttpExecuteRequest.builder()
             .request(routedRequest)
             .contentStreamProvider(request.contentStreamProvider().orElse(null))
             .metricCollector(request.metricCollector().orElse(null))
             .build();
-    return delegate.prepareRequest(routedExecuteRequest);
+    ExecutableHttpRequest preparedRequest = delegate.prepareRequest(routedExecuteRequest);
+    // Preparation can include local header and user-agent decorators. Arm health only when the SDK
+    // actually calls the prepared transport request.
+    return new ExecutableHttpRequest() {
+      @Override
+      public HttpExecuteResponse call() throws IOException {
+        router.armTransportAttempt(routed);
+        return preparedRequest.call();
+      }
+
+      @Override
+      public void abort() {
+        preparedRequest.abort();
+      }
+    };
   }
 
   @Override

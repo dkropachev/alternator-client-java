@@ -50,7 +50,7 @@ import software.amazon.awssdk.http.ExecutableHttpRequest;
 
 /** Coordinates node-health state, direct probes, and probe executor lifecycle. */
 final class NodeHealthManager {
-  private static final int PROBE_QUEUE_MULTIPLIER = 16;
+  private static final int BACKGROUND_PROBE_QUEUE_MULTIPLIER = 16;
   private static final AtomicInteger PROBE_THREAD_ID = new AtomicInteger();
   private static final ThreadLocal<Boolean> PROBE_WORKER = new ThreadLocal<>();
 
@@ -63,7 +63,7 @@ final class NodeHealthManager {
   private final AtomicBoolean shutdownStarted = new AtomicBoolean(false);
   private final ThreadPoolExecutor probeExecutor;
   private final ScheduledThreadPoolExecutor timeoutExecutor;
-  private final Semaphore probeCapacity;
+  private final Semaphore backgroundProbeCapacity;
   private final ConcurrentMap<URI, ProbeJob> inFlightProbes = new ConcurrentHashMap<>();
   private final Set<URI> skipNextBackgroundQuarantineProbe = ConcurrentHashMap.newKeySet();
   private final AtomicLong probeSequence = new AtomicLong();
@@ -84,7 +84,8 @@ final class NodeHealthManager {
     this.probeTransport = probeTransport;
 
     int probeConcurrency = this.config.getHealthProbeConcurrency();
-    this.probeCapacity = new Semaphore(probeConcurrency * (PROBE_QUEUE_MULTIPLIER + 1));
+    this.backgroundProbeCapacity =
+        new Semaphore(probeConcurrency * (BACKGROUND_PROBE_QUEUE_MULTIPLIER + 1));
     this.probeExecutor =
         new ThreadPoolExecutor(
             probeConcurrency,
@@ -136,15 +137,27 @@ final class NodeHealthManager {
   }
 
   void reportNodeResult(URI node, NodeHealthObservation observation) {
-    healthStore.reportNodeResult(node, observation);
-    updateBackgroundProbeSuppression(node, observation);
+    synchronized (healthStore) {
+      healthStore.reportNodeResult(node, observation);
+      updateBackgroundProbeSuppression(node, observation);
+    }
   }
 
   void reportNodeResult(
       URI node, NodeHealthObservation observation, long expectedTrafficGeneration) {
-    if (healthStore.reportNodeResult(node, observation, expectedTrafficGeneration)) {
-      updateBackgroundProbeSuppression(node, observation);
+    synchronized (healthStore) {
+      if (healthStore.reportNodeResult(node, observation, expectedTrafficGeneration)) {
+        updateBackgroundProbeSuppression(node, observation);
+      }
     }
+  }
+
+  void reportProbeResult(URI node, NodeHealthObservation observation) {
+    if (observation != NodeHealthObservation.PROBE_SUCCESS
+        && observation != NodeHealthObservation.PROBE_FAILURE) {
+      return;
+    }
+    applyProbeObservation(node, observation);
   }
 
   List<URI> runDownNodeProbes(List<URI> candidateNodes) {
@@ -167,7 +180,7 @@ final class NodeHealthManager {
   void scheduleBackgroundProbes(List<URI> downNodes, List<URI> quarantinedNodes) {
     List<URI> down = copyCandidates(downNodes);
     List<URI> quarantined = copyCandidates(quarantinedNodes);
-    int available = probeCapacity.availablePermits();
+    int available = backgroundProbeCapacity.availablePermits();
     Set<URI> scheduledThisCycle = new HashSet<>();
 
     int quarantineBudget;
@@ -194,13 +207,13 @@ final class NodeHealthManager {
     submitBackgroundProbeBatch(
         down,
         ProbePriority.DOWN,
-        probeCapacity.availablePermits(),
+        backgroundProbeCapacity.availablePermits(),
         nextDownBackgroundProbeIndex,
         scheduledThisCycle);
     submitBackgroundProbeBatch(
         quarantined,
         ProbePriority.QUARANTINED,
-        probeCapacity.availablePermits(),
+        backgroundProbeCapacity.availablePermits(),
         nextQuarantineBackgroundProbeIndex,
         scheduledThisCycle);
   }
@@ -286,16 +299,20 @@ final class NodeHealthManager {
       if (existing != null) {
         return joinProbe(node, priority, explicit, existing);
       }
-      if (!probeCapacity.tryAcquire()) {
-        return explicit
-            ? failedFuture(new RejectedExecutionException("health-probe queue is full"))
-            : CompletableFuture.completedFuture(ProbeOutcome.SKIPPED);
+      boolean backgroundCapacityAcquired = false;
+      if (!explicit) {
+        backgroundCapacityAcquired = backgroundProbeCapacity.tryAcquire();
+        if (!backgroundCapacityAcquired) {
+          return CompletableFuture.completedFuture(ProbeOutcome.SKIPPED);
+        }
       }
 
-      ProbeJob created = new ProbeJob(node, key, priority, explicit);
+      ProbeJob created = new ProbeJob(node, key, priority, explicit, backgroundCapacityAcquired);
       existing = inFlightProbes.putIfAbsent(key, created);
       if (existing != null) {
-        probeCapacity.release();
+        if (backgroundCapacityAcquired) {
+          backgroundProbeCapacity.release();
+        }
         return joinProbe(node, priority, explicit, existing);
       }
       if (shutdownRequested.get()) {
@@ -369,23 +386,45 @@ final class NodeHealthManager {
   }
 
   private void applyProbeObservation(URI node, NodeHealthObservation observation) {
-    NodeHealthStatus status = healthStore.getNodeStatus(node);
-    if (status == null || status.getState() == NodeHealthState.ACTIVE) {
+    URI key = NodeHealthStore.canonicalNodeKey(node);
+    if (key == null) {
       return;
     }
-    if (status.getState() == NodeHealthState.QUARANTINED) {
-      URI key = NodeHealthStore.canonicalNodeKey(node);
-      synchronized (topologyHealthLock) {
-        status = healthStore.getNodeStatus(node);
-        if (status != null
-            && status.getState() == NodeHealthState.QUARANTINED
-            && isCurrentlyDiscoveredLocked(key)) {
-          reportNodeResult(node, observation);
+
+    synchronized (topologyHealthLock) {
+      synchronized (healthStore) {
+        NodeHealthStatus status = healthStore.getNodeStatus(node);
+        if (status == null || status.getState() == NodeHealthState.ACTIVE) {
+          return;
         }
+        if (status.getState() == NodeHealthState.QUARANTINED && !isCurrentlyDiscoveredLocked(key)) {
+          return;
+        }
+        reportNodeResult(node, observation);
       }
+    }
+  }
+
+  void reportControlPlaneResult(
+      URI node, NodeHealthObservation observation, boolean requireCurrentMembership) {
+    URI key = NodeHealthStore.canonicalNodeKey(node);
+    if (key == null) {
       return;
     }
-    reportNodeResult(node, observation);
+    synchronized (topologyHealthLock) {
+      synchronized (healthStore) {
+        NodeHealthStatus status = healthStore.getNodeStatus(node);
+        if (status == null || status.getState() == NodeHealthState.DOWN) {
+          return;
+        }
+        if (status.getState() == NodeHealthState.QUARANTINED
+            && requireCurrentMembership
+            && !isCurrentlyDiscoveredLocked(key)) {
+          return;
+        }
+        reportNodeResult(node, observation);
+      }
+    }
   }
 
   private boolean isCurrentlyDiscoveredLocked(URI key) {
@@ -424,7 +463,7 @@ final class NodeHealthManager {
   }
 
   void shutdown() {
-    shutdownRequested.set(true);
+    requestShutdown();
     if (!shutdownStarted.compareAndSet(false, true)) {
       return;
     }
@@ -433,6 +472,10 @@ final class NodeHealthManager {
     }
     probeExecutor.shutdownNow();
     timeoutExecutor.shutdownNow();
+  }
+
+  void requestShutdown() {
+    shutdownRequested.set(true);
   }
 
   boolean isProbeWorkerThread() {
@@ -520,17 +563,24 @@ final class NodeHealthManager {
     private final CompletableFuture<Void> physicalCompletion = new CompletableFuture<>();
     private final AtomicBoolean completed = new AtomicBoolean();
     private final AtomicBoolean capacityReleased = new AtomicBoolean();
+    private final boolean backgroundCapacityAcquired;
     private volatile ProbePriority priority;
     private volatile boolean explicit;
     private volatile boolean running;
     private volatile ExecutableHttpRequest request;
     private volatile ScheduledFuture<?> timeoutTask;
 
-    private ProbeJob(URI node, URI key, ProbePriority priority, boolean explicit) {
+    private ProbeJob(
+        URI node,
+        URI key,
+        ProbePriority priority,
+        boolean explicit,
+        boolean backgroundCapacityAcquired) {
       this.node = node;
       this.key = key;
       this.priority = priority;
       this.explicit = explicit;
+      this.backgroundCapacityAcquired = backgroundCapacityAcquired;
     }
 
     @Override
@@ -680,8 +730,8 @@ final class NodeHealthManager {
     }
 
     private void releaseCapacity() {
-      if (capacityReleased.compareAndSet(false, true)) {
-        probeCapacity.release();
+      if (backgroundCapacityAcquired && capacityReleased.compareAndSet(false, true)) {
+        backgroundProbeCapacity.release();
       }
     }
   }

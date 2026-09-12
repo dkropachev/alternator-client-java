@@ -25,8 +25,14 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import org.junit.Test;
 import org.reactivestreams.Publisher;
@@ -34,23 +40,34 @@ import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.auth.signer.Aws4Signer;
+import software.amazon.awssdk.auth.signer.params.Aws4SignerParams;
 import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
 import software.amazon.awssdk.core.SdkRequest;
 import software.amazon.awssdk.core.SdkResponse;
+import software.amazon.awssdk.core.async.AsyncRequestBody;
 import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
+import software.amazon.awssdk.core.client.config.SdkAdvancedClientOption;
+import software.amazon.awssdk.core.exception.RetryableException;
 import software.amazon.awssdk.core.interceptor.Context;
 import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
+import software.amazon.awssdk.core.interceptor.ExecutionInterceptor;
 import software.amazon.awssdk.core.retry.RetryPolicy;
+import software.amazon.awssdk.core.signer.AsyncRequestBodySigner;
+import software.amazon.awssdk.core.signer.Signer;
 import software.amazon.awssdk.http.AbortableInputStream;
+import software.amazon.awssdk.http.ContentStreamProvider;
 import software.amazon.awssdk.http.ExecutableHttpRequest;
 import software.amazon.awssdk.http.HttpExecuteRequest;
 import software.amazon.awssdk.http.HttpExecuteResponse;
 import software.amazon.awssdk.http.SdkHttpClient;
+import software.amazon.awssdk.http.SdkHttpFullRequest;
 import software.amazon.awssdk.http.SdkHttpFullResponse;
 import software.amazon.awssdk.http.SdkHttpRequest;
 import software.amazon.awssdk.http.SdkHttpResponse;
 import software.amazon.awssdk.http.async.AsyncExecuteRequest;
 import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
+import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.dynamodb.model.DynamoDbException;
 import software.amazon.awssdk.services.dynamodb.model.ListTablesRequest;
 
@@ -95,7 +112,7 @@ public class RetryDistributionTest {
       client.getClient().listTables(ListTablesRequest.builder().build());
     }
 
-    assertRetryWasRerouted(httpClient.requests);
+    assertRetryWasRerouted(httpClient.requests, httpClient.requestBodies);
   }
 
   @Test
@@ -119,21 +136,547 @@ public class RetryDistributionTest {
       client.getClient().listTables(ListTablesRequest.builder().build()).join();
     }
 
-    assertRetryWasRerouted(httpClient.requests);
+    assertRetryWasRerouted(httpClient.requests, httpClient.requestBodies);
+  }
+
+  @Test
+  public void testSyncFailureBeforeTransportDoesNotChangeNodeHealth() throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkHttpClient httpClient = new RetryingSdkHttpClient();
+
+    try (AlternatorDynamoDbClientWrapper client =
+        AlternatorDynamoDbClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthConfig(failOnFirstTrafficFailure())
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(localFailureBeforeTransport())
+            .buildWithAlternatorAPI()) {
+      assertThrows(
+          RuntimeException.class,
+          () -> client.getClient().listTables(ListTablesRequest.builder().build()));
+
+      assertTrue(httpClient.requests.isEmpty());
+      assertNoDownNodes(client.getAlternatorLiveNodes(), nodes);
+    }
+  }
+
+  @Test
+  public void testAsyncFailureBeforeTransportDoesNotChangeNodeHealth() throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkAsyncHttpClient httpClient = new RetryingSdkAsyncHttpClient();
+
+    try (AlternatorDynamoDbAsyncClientWrapper client =
+        AlternatorDynamoDbAsyncClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthConfig(failOnFirstTrafficFailure())
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(localFailureBeforeTransport())
+            .buildWithAlternatorAPI()) {
+      assertThrows(
+          RuntimeException.class,
+          () -> client.getClient().listTables(ListTablesRequest.builder().build()).join());
+
+      assertTrue(httpClient.requests.isEmpty());
+      assertNoDownNodes(client.getAlternatorLiveNodes(), nodes);
+    }
+  }
+
+  @Test
+  public void testSyncUserAgentFailureBeforeTransportDoesNotChangeNodeHealth() throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkHttpClient httpClient = new RetryingSdkHttpClient();
+
+    try (AlternatorDynamoDbClientWrapper client =
+        AlternatorDynamoDbClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthConfig(failOnFirstTrafficFailure())
+            .withUserAgent(
+                value -> {
+                  throw new IllegalStateException("simulated user-agent failure");
+                })
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .retryPolicy(RetryPolicy.builder().numRetries(0).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      assertThrows(
+          RuntimeException.class,
+          () -> client.getClient().listTables(ListTablesRequest.builder().build()));
+
+      assertTrue(httpClient.requests.isEmpty());
+      assertNoDownNodes(client.getAlternatorLiveNodes(), nodes);
+    }
+  }
+
+  @Test
+  public void testAsyncUserAgentFailureBeforeTransportDoesNotChangeNodeHealth() throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkAsyncHttpClient httpClient = new RetryingSdkAsyncHttpClient();
+
+    try (AlternatorDynamoDbAsyncClientWrapper client =
+        AlternatorDynamoDbAsyncClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthConfig(failOnFirstTrafficFailure())
+            .withUserAgent(
+                value -> {
+                  throw new IllegalStateException("simulated user-agent failure");
+                })
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .retryPolicy(RetryPolicy.builder().numRetries(0).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      assertThrows(
+          RuntimeException.class,
+          () -> client.getClient().listTables(ListTablesRequest.builder().build()).join());
+
+      assertTrue(httpClient.requests.isEmpty());
+      assertNoDownNodes(client.getAlternatorLiveNodes(), nodes);
+    }
+  }
+
+  @Test
+  public void testSynchronousAsyncTransportFailureChangesNodeHealth() throws Exception {
+    List<URI> nodes = createNodes(1);
+    SynchronouslyFailingSdkAsyncHttpClient httpClient =
+        new SynchronouslyFailingSdkAsyncHttpClient();
+
+    try (AlternatorDynamoDbAsyncClientWrapper client =
+        AlternatorDynamoDbAsyncClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthConfig(failOnFirstTrafficFailure())
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .retryPolicy(RetryPolicy.builder().numRetries(0).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      assertThrows(
+          RuntimeException.class,
+          () -> client.getClient().listTables(ListTablesRequest.builder().build()).join());
+
+      assertEquals(1, httpClient.calls.get());
+      assertEquals(
+          NodeHealthState.DOWN,
+          client.getAlternatorLiveNodes().getNodeHealthStatus(nodes.get(0)).getState());
+    }
+  }
+
+  @Test
+  public void testSdkRetryPreservesCallerAuthorizationWithAnonymousCredentials() throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkHttpClient httpClient = new RetryingSdkHttpClient();
+    ListTablesRequest request =
+        ListTablesRequest.builder()
+            .overrideConfiguration(builder -> builder.putHeader("Authorization", "Bearer token"))
+            .build();
+
+    try (AlternatorDynamoDbClientWrapper client =
+        AlternatorDynamoDbClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthDisabled()
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .retryPolicy(RetryPolicy.builder().numRetries(1).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      client.getClient().listTables(request);
+    }
+
+    assertEquals(2, httpClient.requests.size());
+    for (SdkHttpRequest sent : httpClient.requests) {
+      assertEquals("Bearer token", sent.firstMatchingHeader("Authorization").orElse(null));
+    }
+  }
+
+  @Test
+  public void testAsyncSdkRetryPreservesCallerAuthorizationWithAnonymousCredentials()
+      throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkAsyncHttpClient httpClient = new RetryingSdkAsyncHttpClient();
+    ListTablesRequest request =
+        ListTablesRequest.builder()
+            .overrideConfiguration(builder -> builder.putHeader("Authorization", "Bearer token"))
+            .build();
+
+    try (AlternatorDynamoDbAsyncClientWrapper client =
+        AlternatorDynamoDbAsyncClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthDisabled()
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .retryPolicy(RetryPolicy.builder().numRetries(1).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      client.getClient().listTables(request).join();
+    }
+
+    assertEquals(2, httpClient.requests.size());
+    for (SdkHttpRequest sent : httpClient.requests) {
+      assertEquals("Bearer token", sent.firstMatchingHeader("Authorization").orElse(null));
+    }
+  }
+
+  @Test
+  @SuppressWarnings("deprecation")
+  public void testSdkRetryPipelinePreservesClientLegacySigner() throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkHttpClient httpClient = new RetryingSdkHttpClient();
+    LegacyAuthoritySigner signer = new LegacyAuthoritySigner();
+
+    try (AlternatorDynamoDbClientWrapper client =
+        AlternatorDynamoDbClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthDisabled()
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .putAdvancedOption(SdkAdvancedClientOption.SIGNER, signer)
+                    .retryPolicy(RetryPolicy.builder().numRetries(1).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      client.getClient().listTables(ListTablesRequest.builder().build());
+    }
+
+    assertLegacySignerUsed(httpClient.requests);
+  }
+
+  @Test
+  @SuppressWarnings("deprecation")
+  public void testRetryableLegacySignerFailureReusesUnsentRoute() throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkHttpClient httpClient = new RetryingSdkHttpClient(false);
+    FailOnceLegacySigner signer = new FailOnceLegacySigner();
+
+    try (AlternatorDynamoDbClientWrapper client =
+        AlternatorDynamoDbClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthDisabled()
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .putAdvancedOption(SdkAdvancedClientOption.SIGNER, signer)
+                    .retryPolicy(RetryPolicy.builder().numRetries(1).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      client.getClient().listTables(ListTablesRequest.builder().build());
+    }
+
+    assertEquals(2, signer.signedAuthorities.size());
+    assertEquals(1, httpClient.requests.size());
+    assertEquals(signer.signedAuthorities.get(0), signer.signedAuthorities.get(1));
+    assertEquals(signer.signedAuthorities.get(1), httpClient.requests.get(0).getUri());
+  }
+
+  @Test
+  @SuppressWarnings("deprecation")
+  public void testAsyncSdkRetryPipelinePreservesClientLegacySigner() throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkAsyncHttpClient httpClient = new RetryingSdkAsyncHttpClient();
+    LegacyAuthoritySigner signer = new LegacyAuthoritySigner();
+
+    try (AlternatorDynamoDbAsyncClientWrapper client =
+        AlternatorDynamoDbAsyncClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthDisabled()
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .putAdvancedOption(SdkAdvancedClientOption.SIGNER, signer)
+                    .retryPolicy(RetryPolicy.builder().numRetries(1).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      client.getClient().listTables(ListTablesRequest.builder().build()).join();
+    }
+
+    assertLegacySignerUsed(httpClient.requests);
+  }
+
+  @Test
+  @SuppressWarnings("deprecation")
+  public void testSdkRetryPipelinePreservesRequestLegacySigner() throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkHttpClient httpClient = new RetryingSdkHttpClient();
+    LegacyAuthoritySigner signer = new LegacyAuthoritySigner();
+    ListTablesRequest request =
+        ListTablesRequest.builder()
+            .overrideConfiguration(builder -> builder.signer(signer))
+            .build();
+
+    try (AlternatorDynamoDbClientWrapper client =
+        AlternatorDynamoDbClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthDisabled()
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .retryPolicy(RetryPolicy.builder().numRetries(1).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      client.getClient().listTables(request);
+    }
+
+    assertLegacySignerUsed(httpClient.requests);
+  }
+
+  @Test
+  @SuppressWarnings("deprecation")
+  public void testAsyncSdkRetryPipelinePreservesRequestLegacySigner() throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkAsyncHttpClient httpClient = new RetryingSdkAsyncHttpClient();
+    LegacyAuthoritySigner signer = new LegacyAuthoritySigner();
+    ListTablesRequest request =
+        ListTablesRequest.builder()
+            .overrideConfiguration(builder -> builder.signer(signer))
+            .build();
+
+    try (AlternatorDynamoDbAsyncClientWrapper client =
+        AlternatorDynamoDbAsyncClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthDisabled()
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .retryPolicy(RetryPolicy.builder().numRetries(1).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      client.getClient().listTables(request).join();
+    }
+
+    assertLegacySignerUsed(httpClient.requests);
+  }
+
+  @Test
+  @SuppressWarnings("deprecation")
+  public void testAsyncRetryTransformsLegacySignerBodyOncePerAttempt() throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkAsyncHttpClient httpClient = new RetryingSdkAsyncHttpClient();
+    LegacyAsyncBodySigner signer = new LegacyAsyncBodySigner();
+
+    try (AlternatorDynamoDbAsyncClientWrapper client =
+        AlternatorDynamoDbAsyncClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthDisabled()
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .putAdvancedOption(SdkAdvancedClientOption.SIGNER, signer)
+                    .retryPolicy(RetryPolicy.builder().numRetries(1).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      client.getClient().listTables(ListTablesRequest.builder().build()).join();
+    }
+
+    assertEquals(2, httpClient.requests.size());
+    assertEquals(2, signer.bodySignings.get());
+  }
+
+  @Test
+  @SuppressWarnings("deprecation")
+  public void testSyncRetryTransformsLegacySignerBodyOncePerAttempt() throws Exception {
+    List<URI> nodes = createNodes(2);
+    RetryingSdkHttpClient httpClient = new RetryingSdkHttpClient();
+    TransformingLegacySigner signer = new TransformingLegacySigner();
+
+    try (AlternatorDynamoDbClientWrapper client =
+        AlternatorDynamoDbClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthDisabled()
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .putAdvancedOption(SdkAdvancedClientOption.SIGNER, signer)
+                    .retryPolicy(RetryPolicy.builder().numRetries(1).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      client.getClient().listTables(ListTablesRequest.builder().build());
+    }
+
+    assertEquals(2, signer.signings.get());
+    for (byte[] body : httpClient.requestBodies) {
+      assertEquals('X', body[0]);
+      assertTrue(body.length < 2 || body[1] != 'X');
+    }
+  }
+
+  @Test
+  public void testSdkRetryPipelineSignsBracketedIpv6Authorities() throws Exception {
+    List<URI> nodes = createIpv6Nodes();
+    RetryingSdkHttpClient httpClient = new RetryingSdkHttpClient();
+
+    try (AlternatorDynamoDbClientWrapper client =
+        AlternatorDynamoDbClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthDisabled()
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .retryPolicy(RetryPolicy.builder().numRetries(1).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      client.getClient().listTables(ListTablesRequest.builder().build());
+    }
+
+    assertRetryWasRerouted(httpClient.requests, httpClient.requestBodies);
+    assertIpv6AuthoritiesAreBracketed(httpClient.requests);
+  }
+
+  @Test
+  public void testAsyncSdkRetryPipelineSignsBracketedIpv6Authorities() throws Exception {
+    List<URI> nodes = createIpv6Nodes();
+    RetryingSdkAsyncHttpClient httpClient = new RetryingSdkAsyncHttpClient();
+
+    try (AlternatorDynamoDbAsyncClientWrapper client =
+        AlternatorDynamoDbAsyncClient.builder()
+            .endpointOverride(nodes.get(0))
+            .withSeedHosts(nodes.stream().map(URI::getHost).collect(Collectors.toList()))
+            .withNodeHealthDisabled()
+            .credentialsProvider(testCredentials())
+            .httpClient(httpClient)
+            .overrideConfiguration(
+                ClientOverrideConfiguration.builder()
+                    .retryPolicy(RetryPolicy.builder().numRetries(1).build())
+                    .build())
+            .buildWithAlternatorAPI()) {
+      client.getClient().listTables(ListTablesRequest.builder().build()).join();
+    }
+
+    assertRetryWasRerouted(httpClient.requests, httpClient.requestBodies);
+    assertIpv6AuthoritiesAreBracketed(httpClient.requests);
   }
 
   private StaticCredentialsProvider testCredentials() {
     return StaticCredentialsProvider.create(AwsBasicCredentials.create("access-key", "secret-key"));
   }
 
-  private void assertRetryWasRerouted(List<SdkHttpRequest> requests) {
+  private NodeHealthConfig failOnFirstTrafficFailure() {
+    return NodeHealthConfig.builder()
+        .withConsecutiveFailureThreshold(1)
+        .withQuarantineFailureThreshold(1)
+        .build();
+  }
+
+  private ClientOverrideConfiguration localFailureBeforeTransport() {
+    ExecutionInterceptor failure =
+        new ExecutionInterceptor() {
+          @Override
+          public void beforeTransmission(
+              Context.BeforeTransmission context, ExecutionAttributes executionAttributes) {
+            throw new IllegalStateException("simulated local interceptor failure");
+          }
+        };
+    return ClientOverrideConfiguration.builder()
+        .addExecutionInterceptor(failure)
+        .retryPolicy(RetryPolicy.builder().numRetries(0).build())
+        .build();
+  }
+
+  private void assertNoDownNodes(AlternatorLiveNodes liveNodes, List<URI> nodes) {
+    for (URI node : nodes) {
+      assertNotEquals(NodeHealthState.DOWN, liveNodes.getNodeHealthStatus(node).getState());
+    }
+  }
+
+  private void assertIpv6AuthoritiesAreBracketed(List<SdkHttpRequest> requests) {
+    for (SdkHttpRequest request : requests) {
+      String host = request.firstMatchingHeader("Host").get();
+      assertTrue(host, host.startsWith("[") && host.contains("]:"));
+    }
+  }
+
+  private void assertRetryWasRerouted(List<SdkHttpRequest> requests, List<byte[]> requestBodies) {
     assertEquals(2, requests.size());
+    assertEquals(requests.size(), requestBodies.size());
     assertNotEquals(requests.get(0).getUri(), requests.get(1).getUri());
     assertTrue(requests.get(0).firstMatchingHeader("Authorization").isPresent());
     assertTrue(requests.get(1).firstMatchingHeader("Authorization").isPresent());
     assertTrue(requests.get(0).firstMatchingHeader("Host").isPresent());
-    assertEquals(
-        requests.get(0).firstMatchingHeader("Host"), requests.get(1).firstMatchingHeader("Host"));
+    for (SdkHttpRequest request : requests) {
+      assertEquals(request.getUri().getRawAuthority(), request.firstMatchingHeader("Host").get());
+    }
+    assertNotEquals(
+        requests.get(0).firstMatchingHeader("Authorization"),
+        requests.get(1).firstMatchingHeader("Authorization"));
+    for (int i = 0; i < requests.size(); i++) {
+      assertValidSignature(requests.get(i), requestBodies.get(i));
+    }
+  }
+
+  private void assertLegacySignerUsed(List<SdkHttpRequest> requests) {
+    assertEquals(2, requests.size());
+    assertNotEquals(requests.get(0).getUri(), requests.get(1).getUri());
+    for (SdkHttpRequest request : requests) {
+      assertEquals(
+          "Legacy " + request.getUri().getRawAuthority(),
+          request.firstMatchingHeader("Authorization").orElse(null));
+      assertEquals(Arrays.asList("once"), request.matchingHeaders("X-Legacy-Signer"));
+      assertEquals(
+          Arrays.asList("once"), request.firstMatchingRawQueryParameters("legacy-signature"));
+    }
+  }
+
+  @SuppressWarnings("deprecation")
+  private static void assertValidSignature(SdkHttpRequest request, byte[] body) {
+    String authorization = request.firstMatchingHeader("Authorization").get();
+    String scope = authorization.substring(authorization.indexOf("Credential=") + 11);
+    scope = scope.substring(scope.indexOf('/') + 1, scope.indexOf(','));
+    String[] scopeParts = scope.split("/");
+    String date = request.firstMatchingHeader("X-Amz-Date").get();
+    Instant signingInstant =
+        LocalDateTime.parse(date, DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'"))
+            .toInstant(ZoneOffset.UTC);
+    SdkHttpFullRequest fullRequest =
+        ((SdkHttpFullRequest) request)
+            .toBuilder()
+                .removeHeader("Authorization")
+                .contentStreamProvider(() -> new ByteArrayInputStream(body))
+                .build();
+    SdkHttpFullRequest expected =
+        Aws4Signer.create()
+            .sign(
+                fullRequest,
+                Aws4SignerParams.builder()
+                    .awsCredentials(AwsBasicCredentials.create("access-key", "secret-key"))
+                    .signingRegion(Region.of(scopeParts[1]))
+                    .signingName(scopeParts[2])
+                    .doubleUrlEncode(true)
+                    .normalizePath(true)
+                    .signingClockOverride(Clock.fixed(signingInstant, ZoneOffset.UTC))
+                    .build());
+
+    assertEquals(expected.firstMatchingHeader("Authorization").get(), authorization);
   }
 
   /**
@@ -193,6 +736,12 @@ public class RetryDistributionTest {
       nodes.add(new URI("http://127.0.0." + i + ":8000"));
     }
     return nodes;
+  }
+
+  private List<URI> createIpv6Nodes() throws Exception {
+    return Arrays.asList(
+        new URI("http", null, "::1", 8000, null, null, null),
+        new URI("http", null, "::2", 8000, null, null, null));
   }
 
   @Test
@@ -481,7 +1030,7 @@ public class RetryDistributionTest {
             nodes, NodeHealthConfig.builder().withConsecutiveFailureThreshold(2).build());
     BasicQueryPlanInterceptor interceptor = new BasicQueryPlanInterceptor(liveNodes);
 
-    liveNodes.reportNodeResult(node, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportCurrentTraffic(liveNodes, node, NodeHealthObservation.TRAFFIC_FAILURE);
     liveNodes.reports.clear();
 
     ExecutionAttributes attrs = ExecutionAttributes.builder().build();
@@ -574,7 +1123,7 @@ public class RetryDistributionTest {
     MockAlternatorLiveNodes liveNodes =
         new MockAlternatorLiveNodes(
             nodes, NodeHealthConfig.builder().withConsecutiveFailureThreshold(1).build());
-    liveNodes.reportNodeResult(down, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportCurrentTraffic(liveNodes, down, NodeHealthObservation.TRAFFIC_FAILURE);
     liveNodes.reports.clear();
     TestableBasicQueryPlanInterceptor interceptor =
         new TestableBasicQueryPlanInterceptor(liveNodes);
@@ -596,7 +1145,7 @@ public class RetryDistributionTest {
     MockAlternatorLiveNodes liveNodes =
         new MockAlternatorLiveNodes(
             nodes, NodeHealthConfig.builder().withConsecutiveFailureThreshold(1).build());
-    liveNodes.reportNodeResult(down, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportCurrentTraffic(liveNodes, down, NodeHealthObservation.TRAFFIC_FAILURE);
     TestableBasicQueryPlanInterceptor interceptor =
         new TestableBasicQueryPlanInterceptor(liveNodes);
 
@@ -629,8 +1178,8 @@ public class RetryDistributionTest {
     MockAlternatorLiveNodes liveNodes =
         new MockAlternatorLiveNodes(
             nodes, NodeHealthConfig.builder().withConsecutiveFailureThreshold(1).build());
-    liveNodes.reportNodeResult(nodes.get(0), NodeHealthObservation.TRAFFIC_FAILURE);
-    liveNodes.reportNodeResult(nodes.get(1), NodeHealthObservation.TRAFFIC_FAILURE);
+    reportCurrentTraffic(liveNodes, nodes.get(0), NodeHealthObservation.TRAFFIC_FAILURE);
+    reportCurrentTraffic(liveNodes, nodes.get(1), NodeHealthObservation.TRAFFIC_FAILURE);
     TestableBasicQueryPlanInterceptor interceptor =
         new TestableBasicQueryPlanInterceptor(liveNodes);
 
@@ -659,7 +1208,7 @@ public class RetryDistributionTest {
                 .withConsecutiveFailureThreshold(1)
                 .withDownNodeRecoverySuccessThreshold(1)
                 .build());
-    liveNodes.reportNodeResult(recovering, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportCurrentTraffic(liveNodes, recovering, NodeHealthObservation.TRAFFIC_FAILURE);
     liveNodes.reportNodeResult(recovering, NodeHealthObservation.PROBE_SUCCESS);
     liveNodes.reports.clear();
     long seed = seedWhereFirstNodeIs(nodes, recovering);
@@ -690,7 +1239,7 @@ public class RetryDistributionTest {
                 .withConsecutiveFailureThreshold(1)
                 .withDownNodeRecoverySuccessThreshold(1)
                 .build());
-    liveNodes.reportNodeResult(recovering, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportCurrentTraffic(liveNodes, recovering, NodeHealthObservation.TRAFFIC_FAILURE);
     liveNodes.reportNodeResult(recovering, NodeHealthObservation.PROBE_SUCCESS);
     liveNodes.reports.clear();
     long seed = seedWhereFirstNodeIs(nodes, active);
@@ -721,7 +1270,7 @@ public class RetryDistributionTest {
                 .withDownNodeRecoverySuccessThreshold(1)
                 .withQuarantineFailureThreshold(1)
                 .build());
-    liveNodes.reportNodeResult(recovering, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportCurrentTraffic(liveNodes, recovering, NodeHealthObservation.TRAFFIC_FAILURE);
     liveNodes.reportNodeResult(recovering, NodeHealthObservation.PROBE_SUCCESS);
     liveNodes.reports.clear();
     long seed = seedWhereFirstNodeIs(nodes, active);
@@ -733,7 +1282,7 @@ public class RetryDistributionTest {
     MockModifyHttpRequestContext context = new MockModifyHttpRequestContext(baseRequest());
 
     SdkHttpRequest first = interceptor.modifyHttpRequest(context, attrs);
-    liveNodes.reportNodeResult(recovering, NodeHealthObservation.TRAFFIC_FAILURE);
+    reportCurrentTraffic(liveNodes, recovering, NodeHealthObservation.TRAFFIC_FAILURE);
 
     assertEquals(active, endpoint(first));
     assertEquals(active, endpoint(interceptor.modifyHttpRequest(context, attrs)));
@@ -753,6 +1302,11 @@ public class RetryDistributionTest {
 
   private URI endpoint(SdkHttpRequest request) throws Exception {
     return new URI(request.protocol(), null, request.host(), request.port(), null, null, null);
+  }
+
+  private void reportCurrentTraffic(
+      AlternatorLiveNodes liveNodes, URI node, NodeHealthObservation observation) {
+    liveNodes.reportNodeResult(node, observation, liveNodes.getNodeHealthGeneration(node));
   }
 
   private long seedWhereFirstNodeIs(List<URI> candidates, URI expected) throws Exception {
@@ -841,19 +1395,38 @@ public class RetryDistributionTest {
 
   private static class RetryingSdkHttpClient implements SdkHttpClient {
     private final List<SdkHttpRequest> requests = new ArrayList<>();
+    private final List<byte[]> requestBodies = new ArrayList<>();
+    private final boolean retryFirstResponse;
+
+    private RetryingSdkHttpClient() {
+      this(true);
+    }
+
+    private RetryingSdkHttpClient(boolean retryFirstResponse) {
+      this.retryFirstResponse = retryFirstResponse;
+    }
 
     @Override
     public ExecutableHttpRequest prepareRequest(HttpExecuteRequest request) {
       requests.add(request.httpRequest());
+      try {
+        requestBodies.add(
+            request.contentStreamProvider().isPresent()
+                ? readAll(request.contentStreamProvider().get().newStream())
+                : new byte[0]);
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
       int attempt = requests.size();
       return new ExecutableHttpRequest() {
         @Override
         public HttpExecuteResponse call() throws IOException {
-          String responseBody = attempt == 1 ? "{\"message\":\"retry\"}" : "{}";
+          boolean retry = retryFirstResponse && attempt == 1;
+          String responseBody = retry ? "{\"message\":\"retry\"}" : "{}";
           byte[] body = responseBody.getBytes(StandardCharsets.UTF_8);
           SdkHttpFullResponse response =
               SdkHttpFullResponse.builder()
-                  .statusCode(attempt == 1 ? 500 : 200)
+                  .statusCode(retry ? 500 : 200)
                   .putHeader("Content-Type", "application/x-amz-json-1.0")
                   .putHeader("Content-Length", String.valueOf(body.length))
                   .build();
@@ -877,24 +1450,152 @@ public class RetryDistributionTest {
     }
   }
 
+  @SuppressWarnings("deprecation")
+  private static final class LegacyAuthoritySigner implements Signer {
+    @Override
+    public SdkHttpFullRequest sign(
+        SdkHttpFullRequest request, ExecutionAttributes executionAttributes) {
+      return request.toBuilder()
+          .putHeader("Authorization", "Legacy " + request.getUri().getRawAuthority())
+          .appendHeader("X-Legacy-Signer", "once")
+          .appendRawQueryParameter("legacy-signature", "once")
+          .build();
+    }
+  }
+
+  @SuppressWarnings("deprecation")
+  private static final class FailOnceLegacySigner implements Signer {
+    private final List<URI> signedAuthorities = new ArrayList<>();
+
+    @Override
+    public SdkHttpFullRequest sign(
+        SdkHttpFullRequest request, ExecutionAttributes executionAttributes) {
+      signedAuthorities.add(request.getUri());
+      if (signedAuthorities.size() == 1) {
+        throw RetryableException.create("simulated retryable signing failure");
+      }
+      return request.toBuilder()
+          .putHeader("Authorization", "Legacy " + request.getUri().getRawAuthority())
+          .build();
+    }
+  }
+
+  @SuppressWarnings("deprecation")
+  private static final class TransformingLegacySigner implements Signer {
+    private final AtomicInteger signings = new AtomicInteger();
+
+    @Override
+    public SdkHttpFullRequest sign(
+        SdkHttpFullRequest request, ExecutionAttributes executionAttributes) {
+      signings.incrementAndGet();
+      ContentStreamProvider original = request.contentStreamProvider().orElse(null);
+      ContentStreamProvider transformed =
+          original == null
+              ? null
+              : () ->
+                  new java.io.SequenceInputStream(
+                      new ByteArrayInputStream(new byte[] {'X'}), original.newStream());
+      SdkHttpFullRequest.Builder signed =
+          request.toBuilder()
+              .putHeader("Authorization", "Legacy " + request.getUri().getRawAuthority())
+              .contentStreamProvider(transformed);
+      request
+          .firstMatchingHeader("Content-Length")
+          .map(Long::parseLong)
+          .ifPresent(length -> signed.putHeader("Content-Length", Long.toString(length + 1)));
+      return signed.build();
+    }
+  }
+
+  @SuppressWarnings("deprecation")
+  private static final class LegacyAsyncBodySigner implements Signer, AsyncRequestBodySigner {
+    private final AtomicInteger bodySignings = new AtomicInteger();
+
+    @Override
+    public SdkHttpFullRequest sign(
+        SdkHttpFullRequest request, ExecutionAttributes executionAttributes) {
+      return request.toBuilder()
+          .putHeader("Authorization", "Legacy " + request.getUri().getRawAuthority())
+          .build();
+    }
+
+    @Override
+    public AsyncRequestBody signAsyncRequestBody(
+        SdkHttpFullRequest request,
+        AsyncRequestBody requestBody,
+        ExecutionAttributes executionAttributes) {
+      bodySignings.incrementAndGet();
+      if (requestBody == null) {
+        return null;
+      }
+      return new AsyncRequestBody() {
+        @Override
+        public Optional<Long> contentLength() {
+          return requestBody.contentLength().map(length -> length + 1);
+        }
+
+        @Override
+        public void subscribe(Subscriber<? super ByteBuffer> subscriber) {
+          requestBody.subscribe(
+              new Subscriber<ByteBuffer>() {
+                private boolean first = true;
+
+                @Override
+                public void onSubscribe(Subscription subscription) {
+                  subscriber.onSubscribe(subscription);
+                }
+
+                @Override
+                public void onNext(ByteBuffer item) {
+                  if (!first) {
+                    subscriber.onNext(item);
+                    return;
+                  }
+                  first = false;
+                  ByteBuffer source = item.asReadOnlyBuffer();
+                  ByteBuffer prefixed = ByteBuffer.allocate(source.remaining() + 1);
+                  prefixed.put((byte) 'X').put(source).flip();
+                  subscriber.onNext(prefixed);
+                }
+
+                @Override
+                public void onError(Throwable failure) {
+                  subscriber.onError(failure);
+                }
+
+                @Override
+                public void onComplete() {
+                  subscriber.onComplete();
+                }
+              });
+        }
+      };
+    }
+  }
+
   private static class RetryingSdkAsyncHttpClient implements SdkAsyncHttpClient {
     private final List<SdkHttpRequest> requests = new ArrayList<>();
+    private final List<byte[]> requestBodies = new ArrayList<>();
 
     @Override
     public CompletableFuture<Void> execute(AsyncExecuteRequest request) {
       requests.add(request.request());
       int attempt = requests.size();
-      String responseBody = attempt == 1 ? "{\"message\":\"retry\"}" : "{}";
-      byte[] body = responseBody.getBytes(StandardCharsets.UTF_8);
-      SdkHttpFullResponse response =
-          SdkHttpFullResponse.builder()
-              .statusCode(attempt == 1 ? 500 : 200)
-              .putHeader("Content-Type", "application/x-amz-json-1.0")
-              .putHeader("Content-Length", String.valueOf(body.length))
-              .build();
-      request.responseHandler().onHeaders(response);
-      request.responseHandler().onStream(new ByteArrayPublisher(body));
-      return CompletableFuture.completedFuture(null);
+      return readAll(request.requestContentPublisher())
+          .thenAccept(
+              requestBody -> {
+                requestBodies.add(requestBody);
+                String responseBody = attempt == 1 ? "{\"message\":\"retry\"}" : "{}";
+                byte[] body = responseBody.getBytes(StandardCharsets.UTF_8);
+                SdkHttpFullResponse response =
+                    SdkHttpFullResponse.builder()
+                        .statusCode(attempt == 1 ? 500 : 200)
+                        .putHeader("Content-Type", "application/x-amz-json-1.0")
+                        .putHeader("Content-Length", String.valueOf(body.length))
+                        .build();
+                request.responseHandler().onHeaders(response);
+                request.responseHandler().onStream(new ByteArrayPublisher(body));
+              });
     }
 
     @Override
@@ -904,6 +1605,65 @@ public class RetryDistributionTest {
     public String clientName() {
       return "RetryingSdkAsyncHttpClient";
     }
+  }
+
+  private static final class SynchronouslyFailingSdkAsyncHttpClient implements SdkAsyncHttpClient {
+    private final AtomicInteger calls = new AtomicInteger();
+
+    @Override
+    public CompletableFuture<Void> execute(AsyncExecuteRequest request) {
+      calls.incrementAndGet();
+      throw new IllegalStateException("simulated synchronous transport failure");
+    }
+
+    @Override
+    public void close() {}
+
+    @Override
+    public String clientName() {
+      return "SynchronouslyFailingSdkAsyncHttpClient";
+    }
+  }
+
+  private static byte[] readAll(java.io.InputStream input) throws IOException {
+    java.io.ByteArrayOutputStream output = new java.io.ByteArrayOutputStream();
+    byte[] buffer = new byte[1024];
+    int read;
+    while ((read = input.read(buffer)) != -1) {
+      output.write(buffer, 0, read);
+    }
+    return output.toByteArray();
+  }
+
+  private static CompletableFuture<byte[]> readAll(Publisher<ByteBuffer> publisher) {
+    CompletableFuture<byte[]> result = new CompletableFuture<>();
+    java.io.ByteArrayOutputStream output = new java.io.ByteArrayOutputStream();
+    publisher.subscribe(
+        new Subscriber<ByteBuffer>() {
+          @Override
+          public void onSubscribe(Subscription subscription) {
+            subscription.request(Long.MAX_VALUE);
+          }
+
+          @Override
+          public void onNext(ByteBuffer buffer) {
+            ByteBuffer copy = buffer.duplicate();
+            byte[] bytes = new byte[copy.remaining()];
+            copy.get(bytes);
+            output.write(bytes, 0, bytes.length);
+          }
+
+          @Override
+          public void onError(Throwable failure) {
+            result.completeExceptionally(failure);
+          }
+
+          @Override
+          public void onComplete() {
+            result.complete(output.toByteArray());
+          }
+        });
+    return result;
   }
 
   private static class ByteArrayPublisher implements Publisher<ByteBuffer> {
